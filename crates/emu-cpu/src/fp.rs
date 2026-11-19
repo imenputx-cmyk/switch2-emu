@@ -659,7 +659,7 @@ impl Fp {
         }
         let sign = x & self.ty.sign();
         let exp_mask = self.ty.exp_mask();
-        let lsb = exp_mask & exp_mask.wrapping_neg();
+        let lsb = 1u64 << exp_mask.trailing_zeros();
         if x & exp_mask == 0 {
             // Zeros and denormals: the largest finite exponent.
             sign | (exp_mask - lsb)

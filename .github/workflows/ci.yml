@@ -11,11 +11,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The toolchain version comes from rust-toolchain.toml.
+      - run: rustup toolchain install && rustup show active-toolchain
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
@@ -23,9 +23,10 @@ jobs:
   difftest:
     # Cross-checks the interpreter against Unicorn on random instructions.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install && rustup show active-toolchain
       - run: sudo apt-get install -y llvm
       - run: pip install unicorn==2.1.4
       - run: cargo build --release --example difftest_runner

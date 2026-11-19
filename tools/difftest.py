@@ -308,8 +308,15 @@ def run_unicorn_isolated(*case):
         os.write(w, data)
         os._exit(0)
     os.close(w)
+    import select
+    import signal
     chunks = []
     while True:
+        # A child that hangs is killed after a few seconds.
+        ready, _, _ = select.select([r], [], [], 5.0)
+        if not ready:
+            os.kill(pid, signal.SIGKILL)
+            break
         chunk = os.read(r, 65536)
         if not chunk:
             break
