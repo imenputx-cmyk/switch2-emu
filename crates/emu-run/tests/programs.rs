@@ -174,6 +174,7 @@ fn libnx_application_startup_and_sd_card() {
     let config = emu_horizon::services::Config {
         sdmc_root: Some(sd.clone()),
         boot_time: Some(1_800_000_000),
+        ..Default::default()
     };
     let r =
         emu_run::run_nro_with(&program("hb_libnx.nro"), 10_000_000, false, config).expect("boots");
@@ -237,4 +238,39 @@ condvar timeout rc: 59905
 mutex held again: 1
 "
     );
+}
+
+#[test]
+fn framebuffer_reaches_the_display() {
+    // tests/programs/libnx_compat/hb_gfx.c draws three 1280x720 frames
+    // with libnx's framebuffer API: vi (display, managed layer), the
+    // binder buffer queue, nvdrv/nvmap memory, and libnx's block-linear
+    // swizzle, which the emulator undoes when presenting.
+    let r = emu_run::run_nro(&program("hb_gfx.nro"), 1_000_000_000, false).expect("boots");
+    assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0));
+    let out = String::from_utf8(r.debug_output).unwrap();
+    assert!(out.ends_with("presented frame 0x2\n"), "{out}");
+    assert!(
+        !out.lines()
+            .any(|l| l.contains("= 0x") && !l.ends_with("= 0x0")),
+        "{out}"
+    );
+    assert_eq!(r.frames.len(), 3);
+    let (w, h) = (1280u32, 720u32);
+    for (frame, f) in r.frames.iter().enumerate() {
+        let frame = frame as u32;
+        assert_eq!((f.width, f.height), (w, h));
+        for y in 0..h {
+            for x in 0..w {
+                // The pattern hb_gfx.c draws.
+                let mut b = frame * 100;
+                if ((x + frame * 64) / 80 + y / 80).is_multiple_of(2) {
+                    b = 255;
+                }
+                let expected = [(x * 255 / w) as u8, (y * 255 / h) as u8, b as u8, 0xFF];
+                let at = ((y * w + x) * 4) as usize;
+                assert_eq!(f.rgba[at..at + 4], expected, "frame {frame} at ({x}, {y})");
+            }
+        }
+    }
 }

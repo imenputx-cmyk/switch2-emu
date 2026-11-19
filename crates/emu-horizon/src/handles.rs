@@ -26,6 +26,10 @@ pub enum KObject {
     SharedMemory {
         id: usize,
     },
+    TransferMemory {
+        addr: u64,
+        size: u64,
+    },
 }
 
 #[derive(Debug, Default)]

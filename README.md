@@ -13,7 +13,7 @@ This project does not include, distribute, or require any copyrighted Nintendo f
    - Half precision (FP16) in scalar and vector forms, and the Cryptographic Extension (AES, SHA-1, SHA-256, 64-bit PMULL), checked against the FIPS test vectors. System instructions used from user code: DC ZVA, cache maintenance by address, IC IVAU, and the EL0 counters (CNTVCT/CNTPCT).
    - To do: FPCR rounding modes other than round-to-nearest, flush-to-zero, and the FPSR exception flags. Not targeted, because the Cortex-A78C does not have them: FCMLA/FCADD, FRINT32/64, BF16, LSE2.
 4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory, ELF and NRO loaders done; NSO to come)*
-5. **Kernel and services (HLE):** Emulation of Horizon's SVCs and IPC services. *(in progress: homebrew boots through the homebrew ABI; memory, info, debug output and single-thread synchronization SVCs work; CMIF IPC with domains works; events, shared memory and waits; a libnx application's whole startup succeeds against HLE `sm:`, `set:sys`, `apm`, `appletOE`, `hid`, `time:u` and `fsp-srv`; the SD card is a host directory (`--sdmc=DIR`) with files and directories working; guest threads with a round-robin scheduler, mutexes, condition variables and the address arbiter — input state and graphics are next)*
+5. **Kernel and services (HLE):** Emulation of Horizon's SVCs and IPC services. *(in progress: homebrew boots through the homebrew ABI; memory, info, debug output and single-thread synchronization SVCs work; CMIF IPC with domains works; events, shared memory and waits; a libnx application's whole startup succeeds against HLE `sm:`, `set:sys`, `apm`, `appletOE`, `hid`, `time:u` and `fsp-srv`; the SD card is a host directory (`--sdmc=DIR`) with files and directories working; guest threads with a round-robin scheduler, mutexes, condition variables and the address arbiter; the display path (vi, binder buffer queue, nvdrv/nvmap) presents libnx framebuffers, shown in a window or saved as PNG — GPU command processing and input are next)*
 6. **JIT:** Dynamic translation from AArch64 to x86-64 after the interpreter is correct.
 7. **GPU:** Parse the command stream and translate it to Vulkan.
 8. **Audio, input, and performance.**
@@ -50,6 +50,8 @@ cargo run --release -p emu-run -- tests/programs/hb_hello.nro   # homebrew, real
 cargo run --release -p emu-run -- tests/programs/hb_ipc.nro     # IPC with libnx's client code
 cargo run --release -p emu-run -- --sdmc=/tmp/sd tests/programs/hb_libnx.nro   # libnx app startup + SD card files
 cargo run --release -p emu-run -- tests/programs/hb_threads.nro  # threads, mutex, condvar, semaphore
+cargo run --release -p emu-run -- --frames=/tmp/frames tests/programs/hb_gfx.nro  # framebuffer -> PNGs
+cargo run --release -p emu-run --features window -- tests/programs/hb_gfx.nro  # framebuffer in a window
 ```
 
 ### How correctness is checked

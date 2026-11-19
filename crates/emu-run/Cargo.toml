@@ -10,3 +10,10 @@ emu-cpu = { path = "../emu-cpu" }
 emu-memory = { path = "../emu-memory" }
 emu-loader = { path = "../emu-loader" }
 emu-horizon = { path = "../emu-horizon" }
+png = "0.17"
+minifb = { version = "0.28", optional = true }
+
+[features]
+# Show presented frames in a window (minifb). Off by default so headless
+# builds (CI, servers) need no windowing libraries.
+window = ["dep:minifb"]

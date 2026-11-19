@@ -62,3 +62,28 @@ LIBNX_SRC="services/sm.c services/applet.c services/hid.c services/time.c \
     python3 ../../../tools/elf2nro.py hb_threads.elf ../hb_threads.nro
     rm hb_threads.elf
 )
+
+# Graphics: libnx's display stack (vi, binder buffer queue, nvdrv/nvmap)
+# and framebuffer API. buffer_producer.c uses a GCC-only variable-length
+# array inside a struct; a fixed-size copy is made for clang.
+GFX_SRC="services/sm.c services/applet.c services/vi.c services/nv.c \
+    services/set.c services/apm.c sf/sessionmgr.c kernel/random.c runtime/alloc.c \
+    kernel/mutex.c kernel/condvar.c kernel/event.c kernel/shmem.c kernel/tmem.c \
+    kernel/wait.c kernel/virtmem.c kernel/uevent.c kernel/utimer.c kernel/levent.c \
+    runtime/hosversion.c runtime/env.c kernel/svc.s arm/cache.s display/binder.c \
+    display/framebuffer.c display/native_window.c display/parcel.c nvidia/map.c \
+    nvidia/fence.c nvidia/ioctl/nvhost-ctrl.c nvidia/ioctl/nvmap.c"
+(
+    cd libnx_compat
+    sed -e 's/u32 ints\[input->native_handle->num_ints\];/u32 ints[0x80];/' \
+        -e 's/memcpy(buf.ints, input->native_handle+1, sizeof(buf.ints));/memcpy(buf.ints, input->native_handle+1, buf.numInts * 4);/' \
+        -e 's/parcelWriteFlattenedObject(&parcel, &buf, sizeof(buf));/parcelWriteFlattenedObject(\&parcel, \&buf, sizeof(buf) - sizeof(buf.ints) + buf.numInts * 4);/' \
+        "$L/source/display/buffer_producer.c" > buffer_producer_clang.c
+    clang $(echo "$hb" | sed 's|homebrew/link.ld|../homebrew/link.ld|') \
+        -Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
+        -Iinclude -I"$L/include" -I"$L/include/switch" -I"$L/source" -I"$L/source/display" \
+        -o hb_gfx.elf crt_libnx.S ../homebrew/hb_relocate.c glue.c hb_gfx.c buffer_producer_clang.c \
+        $(for f in $GFX_SRC; do echo "$L/source/$f"; done)
+    python3 ../../../tools/elf2nro.py hb_gfx.elf ../hb_gfx.nro
+    rm hb_gfx.elf buffer_producer_clang.c
+)

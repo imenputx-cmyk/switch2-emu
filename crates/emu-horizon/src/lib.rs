@@ -10,6 +10,7 @@
 //! Only one thread is emulated so far, so synchronization SVCs are
 //! simplified (documented at each SVC).
 
+pub mod display;
 pub mod handles;
 pub mod ipc;
 pub mod kobjects;
@@ -93,6 +94,8 @@ pub enum Stop {
         pc: u64,
         error: ipc::ParseError,
     },
+    /// The host stopped the emulation (window closed).
+    HostQuit,
     /// The only thread waits forever on objects nothing can signal.
     Deadlock {
         pc: u64,
@@ -150,6 +153,7 @@ pub struct Horizon {
     /// Events and shared memory created by services.
     pub kobjects: kobjects::KernelObjects,
     pub config: services::Config,
+    pub system: services::System,
     /// Log of SVC calls, for diagnostics.
     pub trace_svcs: bool,
 }
@@ -181,6 +185,7 @@ impl Horizon {
             sessions: Vec::new(),
             kobjects: kobjects::KernelObjects::default(),
             config: services::Config::default(),
+            system: services::System::default(),
             trace_svcs: false,
         }
     }
@@ -336,6 +341,9 @@ impl Horizon {
                     if let Err(stop) = self.svc(id) {
                         return stop;
                     }
+                    if self.system.quit {
+                        return Stop::HostQuit;
+                    }
                     let blocked =
                         self.threads[self.current].state != threads::ThreadState::Runnable;
                     if blocked || std::mem::take(&mut self.yield_requested) {
@@ -446,6 +454,22 @@ impl Horizon {
             0x13 => self.svc_map_shared_memory(),
             0x14 => self.svc_unmap_shared_memory(),
             0x18 => self.svc_wait_synchronization(),
+            0x15 => {
+                // CreateTransferMemory(addr X1, size X2, perm W3). The
+                // memory stays usable: no service maps it yet.
+                let (addr, size) = (self.x(1), self.x(2));
+                if let Some(err) = Self::page_range_ok(addr, size) {
+                    self.ret(err);
+                    return Ok(());
+                }
+                match self.handles.insert(KObject::TransferMemory { addr, size }) {
+                    Some(h) => {
+                        self.ret(SUCCESS);
+                        self.set_x(1, u64::from(h));
+                    }
+                    None => self.ret(OUT_OF_HANDLES),
+                }
+            }
             0x16 => {
                 let ok = self.handles.close(self.x(0) as u32);
                 self.ret(if ok { SUCCESS } else { INVALID_HANDLE });
@@ -845,6 +869,7 @@ impl Horizon {
             kernel: &mut self.kobjects,
             tick: self.cpu.counter,
             config: &self.config,
+            system: &mut self.system,
         };
         let outcome = object.borrow_mut().call(req.command, &mut ctx);
         let services::Ctx {

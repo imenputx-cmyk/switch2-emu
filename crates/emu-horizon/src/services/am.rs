@@ -3,7 +3,7 @@
 //! `applet.c` uses during `appletInitialize` (command ids from there and
 //! the switchbrew "Applet Manager services" page).
 
-use super::{obj, CallError, Ctx, Service};
+use super::{obj, vi, CallError, Ctx, Service};
 
 /// AM's "no message" result (module 128, description 3).
 const RESULT_NO_MESSAGE: u32 = 128 | (3 << 9);
@@ -105,6 +105,7 @@ impl Service for SelfController {
             // SetFocusHandlingMode, SetRestartMessageEnabled,
             // SetOutOfFocusSuspendingEnabled: accepted.
             1 | 2 | 10 | 11 | 12 | 13 | 14 | 16 => {}
+            40 => ctx.push_u64(vi::MANAGED_LAYER_ID), // CreateManagedDisplayLayer
             91 => ctx.push_event(&mut self.suspended_tick_event, false),
             _ => return Err(CallError::Unimplemented),
         }

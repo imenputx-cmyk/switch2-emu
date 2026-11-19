@@ -8,9 +8,11 @@ pub mod am;
 pub mod apm;
 pub mod fs;
 pub mod hid;
+pub mod nv;
 pub mod set;
 pub mod sm;
 pub mod time;
+pub mod vi;
 
 use crate::handles::KObject;
 use crate::ipc::{Buffer, Request};
@@ -52,6 +54,50 @@ pub struct Ctx<'a> {
     /// The current system tick (19.2 MHz), for clocks.
     pub tick: u64,
     pub config: &'a Config,
+    /// State shared between services (GPU memory, display).
+    pub system: &'a mut System,
+}
+
+/// A presented frame, RGBA8, `width * height * 4` bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Receives presented frames; returns false to stop the emulation.
+pub type Presenter = Box<dyn FnMut(&Frame) -> bool>;
+
+/// State shared between services.
+#[derive(Default)]
+pub struct System {
+    /// nvmap objects by handle (== id).
+    pub nvmap: std::collections::HashMap<u32, nv::NvMapObject>,
+    /// Buffer queues by binder id.
+    pub buffer_queues: std::collections::HashMap<u32, vi::BufferQueue>,
+    /// Called for each presented frame; without it frames are kept in
+    /// `frames`. Returning false asks the emulator to stop (e.g. the
+    /// window was closed).
+    pub on_present: Option<Presenter>,
+    /// The host asked to stop.
+    pub quit: bool,
+    pub frames: Vec<Frame>,
+    pub frames_presented: u64,
+}
+
+impl System {
+    pub fn present(&mut self, frame: Frame) {
+        self.frames_presented += 1;
+        match self.on_present.as_mut() {
+            Some(f) => {
+                if !f(&frame) {
+                    self.quit = true;
+                }
+            }
+            None => self.frames.push(frame),
+        }
+    }
 }
 
 /// Host-side settings that services need.
@@ -62,6 +108,8 @@ pub struct Config {
     pub sdmc_root: Option<std::path::PathBuf>,
     /// POSIX time at boot for the clocks; `None` uses the host clock.
     pub boot_time: Option<i64>,
+    /// Log commands and ioctls services do not implement.
+    pub trace_unimplemented: bool,
 }
 
 impl Ctx<'_> {
@@ -120,6 +168,26 @@ impl Ctx<'_> {
             .or_else(|| self.req.b.get(index).copied().filter(|b| b.size > 0))
     }
 
+    /// The `index`-th input buffer: an X pointer with a size, otherwise
+    /// an A buffer ("auto select").
+    pub fn in_buffer(&self, index: usize) -> Option<Buffer> {
+        self.req
+            .x
+            .get(index)
+            .copied()
+            .filter(|b| b.size > 0)
+            .or_else(|| self.req.a.get(index).copied().filter(|b| b.size > 0))
+    }
+
+    /// Reads the `index`-th input buffer (empty if absent).
+    pub fn read_in_buffer(&self, index: usize) -> Result<Vec<u8>, CallError> {
+        match self.in_buffer(index) {
+            Some(b) => crate::ipc::read_buffer(self.mem, b)
+                .map_err(|_| CallError::Result(crate::result::INVALID_ADDRESS)),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Writes `bytes` (truncated to the buffer size) to an output buffer.
     pub fn write_out_buffer(&mut self, index: usize, bytes: &[u8]) -> Result<(), CallError> {
         let b = self
@@ -149,6 +217,8 @@ pub fn create(name: &str, config: &Config) -> Option<ServiceRef> {
         "set:sys" => Rc::new(RefCell::new(set::SystemSettings)),
         "apm" | "apm:p" => Rc::new(RefCell::new(apm::Manager)),
         "appletOE" => Rc::new(RefCell::new(am::AppletOE)),
+        "vi:u" => Rc::new(RefCell::new(vi::RootService)),
+        "nvdrv" | "nvdrv:a" => Rc::new(RefCell::new(nv::NvDrv::default())),
         "hid" => Rc::new(RefCell::new(hid::Hid::default())),
         "time:u" | "time:a" | "time:s" => Rc::new(RefCell::new(match config.boot_time {
             Some(t) => time::StaticService::with_boot_time(t),

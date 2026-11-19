@@ -18,7 +18,11 @@ jobs:
       - run: rustup toolchain install && rustup show active-toolchain
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # Release: the graphics test runs ~10^8 guest instructions.
+      - run: cargo test --release
+      - name: Build with the window front end
+        if: runner.os == 'Windows'
+        run: cargo clippy --release -p emu-run --features window -- -D warnings
 
   difftest:
     # Cross-checks the interpreter against Unicorn on random instructions.

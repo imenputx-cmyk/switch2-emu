@@ -126,7 +126,12 @@ pub struct HomebrewResult {
     /// Text the program wrote with svcOutputDebugString.
     pub debug_output: Vec<u8>,
     pub instructions: u64,
+    /// Frames the program presented on the display.
+    pub frames: Vec<emu_horizon::services::Frame>,
 }
+
+#[cfg(feature = "window")]
+pub mod window;
 
 pub fn run_nro(nro: &[u8], max_steps: u64, trace_svcs: bool) -> Result<HomebrewResult, RunError> {
     run_nro_with(
@@ -144,7 +149,20 @@ pub fn run_nro_with(
     trace_svcs: bool,
     config: emu_horizon::services::Config,
 ) -> Result<HomebrewResult, RunError> {
+    run_nro_presenting(nro, max_steps, trace_svcs, config, None)
+}
+
+/// Like [`run_nro_with`], handing each presented frame to `on_present`
+/// (e.g. a window) instead of collecting it.
+pub fn run_nro_presenting(
+    nro: &[u8],
+    max_steps: u64,
+    trace_svcs: bool,
+    config: emu_horizon::services::Config,
+    on_present: Option<emu_horizon::services::Presenter>,
+) -> Result<HomebrewResult, RunError> {
     let mut hos = emu_horizon::Horizon::new();
+    hos.system.on_present = on_present;
     hos.trace_svcs = trace_svcs;
     hos.config = config;
     hos.boot_homebrew(nro).map_err(RunError::Load)?;
@@ -153,5 +171,20 @@ pub fn run_nro_with(
         stop,
         debug_output: hos.debug_output,
         instructions: hos.cpu.counter,
+        frames: std::mem::take(&mut hos.system.frames),
     })
+}
+
+/// Writes a frame as an RGBA PNG.
+pub fn write_png(
+    frame: &emu_horizon::services::Frame,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut enc = png::Encoder::new(file, frame.width, frame.height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().map_err(std::io::Error::other)?;
+    w.write_image_data(&frame.rgba)
+        .map_err(std::io::Error::other)
 }

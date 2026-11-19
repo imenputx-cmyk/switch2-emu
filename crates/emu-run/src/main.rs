@@ -6,7 +6,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let trace = args.iter().any(|a| a == "--trace-svc");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
-        eprintln!("usage: emu-run [--trace-svc] [--sdmc=DIR] <program.elf | homebrew.nro>");
+        eprintln!(
+            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] <program.elf | homebrew.nro>\n\
+             (built with --features window, frames are shown in a window unless --frames is given)"
+        );
         return ExitCode::from(2);
     };
     let elf = match std::fs::read(&path) {
@@ -24,10 +27,39 @@ fn main() -> ExitCode {
                 .find_map(|a| a.strip_prefix("--sdmc="))
                 .map(Into::into),
             boot_time: None,
+            trace_unimplemented: trace,
         };
-        return match emu_run::run_nro_with(&elf, 1_000_000_000, trace, config) {
+        let dump_frames = args.iter().any(|a| a.starts_with("--frames="));
+        #[cfg(feature = "window")]
+        let presenter = (!dump_frames).then(|| emu_run::window::presenter(&path));
+        #[cfg(not(feature = "window"))]
+        let presenter = None;
+        let _ = dump_frames;
+        // With a window the program runs until it exits or the window
+        // closes; otherwise stop after 10^10 instructions.
+        let limit = if presenter.is_some() {
+            u64::MAX
+        } else {
+            10_000_000_000
+        };
+        return match emu_run::run_nro_presenting(&elf, limit, trace, config, presenter) {
             Ok(r) => {
                 std::io::stdout().write_all(&r.debug_output).unwrap();
+                if let Some(dir) = args.iter().find_map(|a| a.strip_prefix("--frames=")) {
+                    let dir = std::path::Path::new(dir);
+                    std::fs::create_dir_all(dir).ok();
+                    for (i, f) in r.frames.iter().enumerate() {
+                        let path = dir.join(format!("frame{i:04}.png"));
+                        if let Err(e) = emu_run::write_png(f, &path) {
+                            eprintln!("[emu-run] cannot write {}: {e}", path.display());
+                        }
+                    }
+                    eprintln!(
+                        "[emu-run] wrote {} frames to {}",
+                        r.frames.len(),
+                        dir.display()
+                    );
+                }
                 let secs = start.elapsed().as_secs_f64();
                 eprintln!(
                     "[emu-run] homebrew stopped: {:?}, {} instructions in {:.3}s",
