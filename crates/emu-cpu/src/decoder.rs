@@ -719,6 +719,9 @@ pub enum Instr {
         rd: u8,
     },
 
+    /// Other Advanced SIMD data processing, see [`crate::simd`].
+    Simd(crate::simd::Simd),
+
     /// Not yet implemented or unallocated.
     Unknown(u32),
 }
@@ -1671,7 +1674,8 @@ fn decode_simd_fp(insn: u32) -> Option<Instr> {
     }
 
     // Advanced SIMD scalar two-register miscellaneous: FP <-> integer
-    // conversions that keep the integer in a SIMD&FP register.
+    // conversions that keep the integer in a SIMD&FP register. Other ops of
+    // this group are handled in `simd.rs`.
     if insn & 0xDF3E_0C00 == 0x5E20_0800 {
         let unsigned = bit(insn, 29);
         let o2 = bit(insn, 23);
@@ -1680,23 +1684,25 @@ fn decode_simd_fp(insn: u32) -> Option<Instr> {
         } else {
             FpType::Single
         };
-        let (to_int, rounding) = match (o2, bits(insn, 16, 12)) {
-            (false, 0b11010) => (true, Rounding::TieEven),
-            (false, 0b11011) => (true, Rounding::NegInf),
-            (false, 0b11100) => (true, Rounding::TieAway),
-            (false, 0b11101) => (false, Rounding::TieEven),
-            (true, 0b11010) => (true, Rounding::PosInf),
-            (true, 0b11011) => (true, Rounding::Zero),
-            _ => return None,
+        let conv = match (o2, bits(insn, 16, 12)) {
+            (false, 0b11010) => Some((true, Rounding::TieEven)),
+            (false, 0b11011) => Some((true, Rounding::NegInf)),
+            (false, 0b11100) => Some((true, Rounding::TieAway)),
+            (false, 0b11101) => Some((false, Rounding::TieEven)),
+            (true, 0b11010) => Some((true, Rounding::PosInf)),
+            (true, 0b11011) => Some((true, Rounding::Zero)),
+            _ => None,
         };
-        return Some(Instr::FpIntInVec {
-            ty,
-            to_int,
-            signed: !unsigned,
-            rounding,
-            rn,
-            rd,
-        });
+        if let Some((to_int, rounding)) = conv {
+            return Some(Instr::FpIntInVec {
+                ty,
+                to_int,
+                signed: !unsigned,
+                rounding,
+                rn,
+                rd,
+            });
+        }
     }
 
     // Advanced SIMD scalar copy: DUP (element), alias MOV.
@@ -1798,7 +1804,7 @@ fn decode_simd_fp(insn: u32) -> Option<Instr> {
         });
     }
 
-    None
+    crate::simd::decode(insn).map(Instr::Simd)
 }
 
 fn decode_fp_scalar(insn: u32) -> Option<Instr> {

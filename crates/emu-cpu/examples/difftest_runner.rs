@@ -3,7 +3,8 @@
 //! Reads one case per line on stdin:
 //!     insn pc nzcv fpcr x0 .. x30 sp v0 .. v31          (all hex)
 //! and writes one result per line:
-//!     status pc nzcv x0 .. x30 sp v0 .. v31 | addr=byte addr=byte ...
+//!     status pc nzcv qc x0 .. x30 sp v0 .. v31 | addr=byte addr=byte ...
+//! where `qc` is FPSR.QC (the other FPSR flags are not modelled yet).
 //! where the memory part lists bytes that differ from the initial pattern.
 //! `status` is ok, fault, align, unimpl, svc, brk or skip (the instruction
 //! is architecturally UNPREDICTABLE for these operands).
@@ -142,7 +143,15 @@ fn main() {
             Err(Exit::Brk(_)) => "brk",
         };
 
-        write!(out, "{status} {:x} {:x}", cpu.pc(), cpu.nzcv.to_bits()).unwrap();
+        let qc = cpu.fpsr & emu_cpu::simd::FPSR_QC != 0;
+        write!(
+            out,
+            "{status} {:x} {:x} {:x}",
+            cpu.pc(),
+            cpu.nzcv.to_bits(),
+            u8::from(qc)
+        )
+        .unwrap();
         for r in 0..31u8 {
             write!(out, " {:x}", cpu.read_xzr(r)).unwrap();
         }

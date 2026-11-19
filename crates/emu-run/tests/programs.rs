@@ -48,3 +48,24 @@ special: 1/0 > 1e308 is true, 0/0 is nan
     assert_eq!(rows[6].trim_start().chars().next(), Some('@'), "{out}");
     assert_eq!(result.exit_code, 0);
 }
+
+#[test]
+fn simd_program_runs_to_completion() {
+    // NEON intrinsics and auto-vectorized loops built for the Cortex-A78C.
+    // Output is identical to a full run in Unicorn; sum_bytes, the
+    // saturating add, the table lookup and the dot product were also
+    // checked by hand.
+    let result = emu_run::run_elf(&program("simd.elf"), 10_000_000).expect("program runs");
+    let expected = "\
+saxpy checksum   = 0xdacce6e5ee0dfec5
+sum_bytes        = 127572
+grayscale        = 0xf7a16afd6521da21
+vqaddq_s16       = 32767 -32768 200 -200 32767 -32768 0 2
+normalize4       = 0xe836c9497104989e
+first normal x*1000 = 599
+tbl              = svool_zlyoxnqk_t
+vdotq_u32        = 1030 1078 1126 1174
+";
+    assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
+    assert_eq!(result.exit_code, 0);
+}

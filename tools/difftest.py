@@ -23,7 +23,7 @@ from unicorn import (UC_ARCH_ARM64, UC_HOOK_INTR, UC_MODE_ARM, UC_PROT_ALL,
                      Uc, UcError)
 from unicorn import arm64_const
 from unicorn import unicorn_const as uc_const
-from unicorn.arm64_const import (UC_ARM64_REG_FPCR, UC_ARM64_REG_NZCV,
+from unicorn.arm64_const import (UC_ARM64_REG_FPCR, UC_ARM64_REG_FPSR, UC_ARM64_REG_NZCV,
                                  UC_ARM64_REG_PC, UC_ARM64_REG_Q0,
                                  UC_ARM64_REG_SP, UC_ARM64_REG_X0,
                                  UC_ARM64_REG_X29, UC_ARM64_REG_X30)
@@ -83,6 +83,21 @@ CLASSES = [
     ("simd_scalar_2misc", 0xDF3E0C00, 0x5E200800),
     ("simd_logical", 0x9F20FC00, 0x0E201C00),
     ("simd_addsub", 0x9F20FC00, 0x0E208400),
+    ("simd_3same", 0x9F200400, 0x0E200400),
+    ("simd_3same_scalar", 0xDF200400, 0x5E200400),
+    ("simd_3same_extra", 0x9F208400, 0x0E008400),
+    ("simd_3diff", 0x9F200C00, 0x0E200000),
+    ("simd_3diff_scalar", 0xDF200C00, 0x5E200000),
+    ("simd_2misc", 0x9F3E0C00, 0x0E200800),
+    ("simd_across", 0x9F3E0C00, 0x0E300800),
+    ("simd_scalar_pairwise", 0xDF3E0C00, 0x5E300800),
+    ("simd_permute", 0xBF208C00, 0x0E000800),
+    ("simd_ext", 0xBFE08400, 0x2E000000),
+    ("simd_tbl", 0xBFE08C00, 0x0E000000),
+    ("simd_shift_imm", 0x9F800400, 0x0F000400),
+    ("simd_shift_imm_scalar", 0xDF800400, 0x5F000400),
+    ("simd_elem", 0x9F000400, 0x0F000000),
+    ("simd_elem_scalar", 0xDF000400, 0x5F000000),
 ]
 
 # Interesting floating-point bit patterns (single, double).
@@ -170,6 +185,7 @@ def run_unicorn(insn, pc, nzcv, fpcr, regs, sp, vregs):
     uc.reg_write(UC_ARM64_REG_SP, sp)
     uc.reg_write(UC_ARM64_REG_NZCV, nzcv)
     uc.reg_write(UC_ARM64_REG_FPCR, fpcr)
+    uc.reg_write(UC_ARM64_REG_FPSR, 0)
     for i in range(32):
         uc.reg_write(UC_ARM64_REG_Q0 + i, vregs[i])
     uc.reg_write(UC_ARM64_REG_PC, pc)
@@ -216,8 +232,9 @@ def run_unicorn(insn, pc, nzcv, fpcr, regs, sp, vregs):
         if now != init:
             mem_diff += [f"{base + i:x}={now[i]:x}" for i in range(size) if now[i] != init[i]]
     v_out = [uc.reg_read(UC_ARM64_REG_Q0 + i) for i in range(32)]
+    qc = (uc.reg_read(UC_ARM64_REG_FPSR) >> 27) & 1
     return status, uc.reg_read(UC_ARM64_REG_PC), uc.reg_read(UC_ARM64_REG_NZCV), regs_out, \
-        uc.reg_read(UC_ARM64_REG_SP), v_out, mem_diff
+        uc.reg_read(UC_ARM64_REG_SP), v_out, mem_diff, qc
 
 
 def check_smax_smin(insn, regs, sp, ours):
@@ -256,7 +273,7 @@ def parse_ours(line):
     head, _, mem = line.partition("|")
     parts = head.split()
     vals = [int(x, 16) for x in parts[1:]]
-    return parts[0], vals[0], vals[1], vals[2:33], vals[33], vals[34:66], mem.split()
+    return parts[0], vals[0], vals[1], vals[3:34], vals[34], vals[35:67], mem.split(), vals[2]
 
 
 def main():
@@ -361,6 +378,8 @@ def main():
                           f"\n          in  ={vregs[i]:032x}")
             if ours[6] != theirs[6]:
                 print(f"     mem ours={ours[6][:8]} unicorn={theirs[6][:8]}")
+            if ours[7] != theirs[7]:
+                print(f"     FPSR.QC ours={ours[7]} unicorn={theirs[7]}")
             if fpcr:
                 print("     (FPCR.DN set)")
 

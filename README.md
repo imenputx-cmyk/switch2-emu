@@ -9,8 +9,8 @@ This project does not include, distribute, or require any copyrighted Nintendo f
 1. **Foundation:** Cargo workspace, CI, and test setup. *(done)*
 2. **Guest CPU state:** AArch64 register file and NZCV flags. *(done)*
 3. **Decoder and interpreter:** Decode A64 instructions against the ARM Architecture Reference Manual, one instruction class at a time, cross-checked against Unicorn.
-   - Done: integer instructions; scalar single/double floating point with ARM NaN rules; SIMD&FP loads and stores; common Advanced SIMD moves, logical ops and ADD/SUB.
-   - To do: most Advanced SIMD arithmetic, half precision (FP16), LSE atomics, CRC32. Also FPCR rounding modes other than round-to-nearest, flush-to-zero, and FPSR exception flags.
+   - Done: the integer instruction set (including LSE atomics, CAS/CASP, LDXP/STXP, LDAPR, CRC32); scalar single/double floating point with ARM NaN rules; SIMD&FP loads and stores including LD1-LD4/ST1-ST4; Advanced SIMD integer and single/double floating-point arithmetic, widening/narrowing, saturating (with FPSR.QC), shifts, permutes, TBL/TBX, reductions, by-element forms, dot product, and the ARM reciprocal (square root) estimates.
+   - To do: half precision (FP16); FPCR rounding modes other than round-to-nearest, flush-to-zero, and the FPSR exception flags. Not targeted, because the Cortex-A78C does not have them: FCMLA/FCADD, FRINT32/64, BF16, LSE2.
 4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory and ELF loader done; NSO/NRO to come)*
 5. **Service layer (HLE):** Simple emulation of OS calls.
 6. **JIT:** Dynamic translation from AArch64 to x86-64 after the interpreter is correct.
@@ -40,6 +40,7 @@ tools/
 cargo test
 cargo run --release -p emu-run -- tests/programs/hello.elf
 cargo run --release -p emu-run -- tests/programs/float.elf
+cargo run --release -p emu-run -- tests/programs/simd.elf
 ```
 
 ### How correctness is checked
@@ -52,6 +53,8 @@ cargo run --release -p emu-run -- tests/programs/float.elf
    cargo build --release --example difftest_runner
    python3 tools/difftest.py --cases 20000
    ```
+   The target CPU is the Switch 2's Cortex-A78C. Where Unicorn's "max" model differs (it has FEAT_LSE2), where the architecture leaves a choice to the implementation, or where Unicorn has a known bug (signed atomic min/max on narrow sizes, checked against a reference model instead), the harness reports the case in its own named category instead of hiding it.
+
    Floating-point registers start from a pool of hard cases (signed zeros, infinities, quiet and signalling NaNs with payloads, denormals, boundary values), with FPCR.DN on in a quarter of the cases.
 3. **Whole programs:** C programs in `tests/programs` are compiled with clang, run to completion, and their output is compared with expected values and with a full run in Unicorn (`tools/run_unicorn.py`).
 

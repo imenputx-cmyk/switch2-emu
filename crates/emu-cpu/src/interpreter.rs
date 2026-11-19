@@ -1139,6 +1139,8 @@ impl Cpu {
                 self.post_index(rn, addr, post, total as u64);
             }
 
+            Instr::Simd(simd) => self.exec_simd(simd),
+
             Instr::Unknown(raw) => return Err(Exit::Unimplemented { pc, insn: raw }),
         }
 

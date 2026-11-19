@@ -427,6 +427,312 @@ impl Fp {
     }
 }
 
+impl Fp {
+    fn two(self) -> u64 {
+        match self.ty {
+            FpType::Single => u64::from(2f32.to_bits()),
+            FpType::Double => 2f64.to_bits(),
+        }
+    }
+
+    fn encode_f64(self, v: f64) -> u64 {
+        match self.ty {
+            FpType::Single => u64::from((v as f32).to_bits()),
+            FpType::Double => v.to_bits(),
+        }
+    }
+
+    /// FMULX: like FMUL, but infinity times zero gives +/-2.0.
+    pub fn mulx(self, a: u64, b: u64) -> u64 {
+        let (a, b) = (a & self.ty.mask(), b & self.ty.mask());
+        if let Some(nan) = self.process_nans(&[a, b]) {
+            return nan;
+        }
+        if (self.is_inf(a) && self.is_zero(b)) || (self.is_zero(a) && self.is_inf(b)) {
+            let sign = (a ^ b) & self.ty.sign();
+            return self.two() | sign;
+        }
+        self.binop(BinOp::Mul, a, b)
+    }
+
+    /// FRECPS (`FPRecipStepFused`): `2 - a * b`, fused.
+    pub fn recip_step(self, a: u64, b: u64) -> u64 {
+        let (a, b) = (self.neg(a & self.ty.mask()), b & self.ty.mask());
+        if let Some(nan) = self.process_nans(&[a, b]) {
+            return nan;
+        }
+        if (self.is_inf(a) && self.is_zero(b)) || (self.is_zero(a) && self.is_inf(b)) {
+            return self.two();
+        }
+        self.mul_add(self.two(), a, b)
+    }
+
+    /// FRSQRTS (`FPRSqrtStepFused`): `(3 - a * b) / 2`, fused.
+    pub fn rsqrt_step(self, a: u64, b: u64) -> u64 {
+        let (a, b) = (self.neg(a & self.ty.mask()), b & self.ty.mask());
+        if let Some(nan) = self.process_nans(&[a, b]) {
+            return nan;
+        }
+        if (self.is_inf(a) && self.is_zero(b)) || (self.is_zero(a) && self.is_inf(b)) {
+            return self.encode_f64(1.5);
+        }
+        // (3 + a*b) / 2 with one rounding: 1.5 + a * (b/2), halving
+        // whichever operand halves exactly so that no precision is lost.
+        let half = |x: u64| -> Option<u64> {
+            let h = self.binop(BinOp::Div, x, self.two());
+            (self.binop(BinOp::Mul, h, self.two()) == x).then_some(h)
+        };
+        let one_and_half = self.encode_f64(1.5);
+        match (half(b), half(a)) {
+            (Some(hb), _) => self.mul_add(one_and_half, a, hb),
+            (None, Some(ha)) => self.mul_add(one_and_half, ha, b),
+            // Both are tiny denormals: the product cannot affect 1.5.
+            (None, None) => one_and_half,
+        }
+    }
+
+    /// Splits into (sign, biased exponent, fraction widened to 52 bits).
+    fn unpack52(self, x: u64) -> (u64, i64, u64) {
+        match self.ty {
+            FpType::Single => (
+                (x >> 31) & 1,
+                ((x >> 23) & 0xFF) as i64,
+                (x & 0x7F_FFFF) << 29,
+            ),
+            FpType::Double => (
+                (x >> 63) & 1,
+                ((x >> 52) & 0x7FF) as i64,
+                x & ((1 << 52) - 1),
+            ),
+        }
+    }
+
+    /// FRECPE (`FPRecipEstimate`): 8-bit reciprocal estimate.
+    pub fn recip_estimate(self, x: u64) -> u64 {
+        let x = x & self.ty.mask();
+        if let Some(nan) = self.process_nans(&[x]) {
+            return nan;
+        }
+        let negative = self.is_negative(x);
+        let sign_bit = if negative { self.ty.sign() } else { 0 };
+        if self.is_inf(x) {
+            return sign_bit;
+        }
+        if self.is_zero(x) {
+            return self.ty.infinity(negative);
+        }
+        let tiny = match self.ty {
+            FpType::Single => f64::from(f32::from_bits(x as u32)).abs() < 2f64.powi(-128),
+            FpType::Double => f64::from_bits(x).abs() < 2f64.powi(-1024),
+        };
+        if tiny {
+            return self.ty.infinity(negative);
+        }
+        let (sign, mut exp, mut fraction) = self.unpack52(x);
+        if exp == 0 {
+            if fraction >> 51 & 1 == 0 {
+                exp = -1;
+                fraction = (fraction & ((1 << 50) - 1)) << 2;
+            } else {
+                fraction = (fraction & ((1 << 51) - 1)) << 1;
+            }
+        }
+        let scaled = 0x100 | ((fraction >> 44) & 0xFF);
+        let mut result_exp = match self.ty {
+            FpType::Single => 253 - exp,
+            FpType::Double => 2045 - exp,
+        };
+        let estimate = recip_estimate_int(scaled);
+        let mut fraction = (estimate & 0xFF) << 44;
+        if result_exp == 0 {
+            fraction = (1 << 51) | (fraction >> 1);
+        } else if result_exp == -1 {
+            fraction = (1 << 50) | (fraction >> 2);
+            result_exp = 0;
+        }
+        match self.ty {
+            FpType::Single => {
+                (sign << 31) | (((result_exp as u64) & 0xFF) << 23) | (fraction >> 29)
+            }
+            FpType::Double => (sign << 63) | (((result_exp as u64) & 0x7FF) << 52) | fraction,
+        }
+    }
+
+    /// FRSQRTE (`FPRSqrtEstimate`): 8-bit reciprocal square root estimate.
+    pub fn rsqrt_estimate(self, x: u64) -> u64 {
+        let x = x & self.ty.mask();
+        if let Some(nan) = self.process_nans(&[x]) {
+            return nan;
+        }
+        if self.is_zero(x) {
+            return self.ty.infinity(self.is_negative(x));
+        }
+        if self.is_negative(x) {
+            return self.ty.default_nan();
+        }
+        if self.is_inf(x) {
+            return 0;
+        }
+        let (_, mut exp, mut fraction) = self.unpack52(x);
+        let mask52 = (1u64 << 52) - 1;
+        if exp == 0 {
+            while fraction >> 51 & 1 == 0 {
+                fraction = (fraction << 1) & mask52;
+                exp -= 1;
+            }
+            fraction = (fraction << 1) & mask52;
+        }
+        let scaled = if exp & 1 == 0 {
+            0x100 | ((fraction >> 44) & 0xFF)
+        } else {
+            0x80 | ((fraction >> 45) & 0x7F)
+        };
+        let result_exp = match self.ty {
+            FpType::Single => (380 - exp).div_euclid(2),
+            FpType::Double => (3068 - exp).div_euclid(2),
+        } as u64;
+        let estimate = rsqrt_estimate_int(scaled);
+        match self.ty {
+            FpType::Single => ((result_exp & 0xFF) << 23) | ((estimate & 0xFF) << 15),
+            FpType::Double => ((result_exp & 0x7FF) << 52) | ((estimate & 0xFF) << 44),
+        }
+    }
+
+    /// FRECPX: reciprocal exponent.
+    pub fn recpx(self, x: u64) -> u64 {
+        let x = x & self.ty.mask();
+        if let Some(nan) = self.process_nans(&[x]) {
+            return nan;
+        }
+        let sign = x & self.ty.sign();
+        let exp_mask = self.ty.exp_mask();
+        let lsb = exp_mask & exp_mask.wrapping_neg();
+        if x & exp_mask == 0 {
+            // Zeros and denormals: the largest finite exponent.
+            sign | (exp_mask - lsb)
+        } else {
+            sign | (!x & exp_mask)
+        }
+    }
+
+    /// FCVTXN: double to single with round-to-odd (`self.ty` is Double).
+    pub fn convert_round_odd(self, x: u64) -> u64 {
+        let x = x & self.ty.mask();
+        if self.is_nan(x) {
+            return self.convert(x, FpType::Single);
+        }
+        let d = f64::from_bits(x);
+        let mut r = d as f32;
+        if f64::from(r) != d && r.is_finite() || (r.is_infinite() && d.is_finite()) {
+            // Truncate towards zero, then set the lowest bit (sticky).
+            if f64::from(r).abs() > d.abs() {
+                r = f32::from_bits(r.to_bits() - 1);
+            }
+            r = f32::from_bits(r.to_bits() | 1);
+        }
+        u64::from(r.to_bits())
+    }
+}
+
+/// `RecipEstimate()` on a 9-bit fixed-point input in [256, 511].
+pub(crate) fn recip_estimate_int(a: u64) -> u64 {
+    let a = a * 2 + 1;
+    let b = (1u64 << 19) / a;
+    b.div_ceil(2)
+}
+
+/// `RecipSqrtEstimate()` on a 9-bit fixed-point input in [128, 511].
+pub(crate) fn rsqrt_estimate_int(a: u64) -> u64 {
+    let a = if a < 256 {
+        a * 2 + 1
+    } else {
+        ((a >> 1) << 1) * 2 + 2
+    };
+    let mut b = 512u64;
+    while a * (b + 1) * (b + 1) < (1 << 28) {
+        b += 1;
+    }
+    b.div_ceil(2)
+}
+
+/// Converts a non-NaN double to half precision, rounding to nearest even.
+pub fn f64_to_half(x: f64) -> u16 {
+    let sign = ((x.to_bits() >> 63) as u16) << 15;
+    let a = x.abs();
+    if a.is_infinite() || a >= 65520.0 {
+        return sign | 0x7C00;
+    }
+    if a < 2f64.powi(-14) {
+        // Subnormal range: units of 2^-24, ties to even.
+        let m = (a * 2f64.powi(24)).round_ties_even() as u16;
+        return sign | m;
+    }
+    let mut exp = ((a.to_bits() >> 52) & 0x7FF) as i32 - 1023;
+    let mant = a / 2f64.powi(exp);
+    let mut m = ((mant - 1.0) * 1024.0).round_ties_even() as u16;
+    if m == 1024 {
+        m = 0;
+        exp += 1;
+    }
+    if exp > 15 {
+        return sign | 0x7C00;
+    }
+    sign | (((exp + 15) as u16) << 10) | m
+}
+
+/// Converts a non-NaN half-precision value to double (exact).
+pub fn half_to_f64(h: u16) -> f64 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = (h >> 10) & 0x1F;
+    let mant = f64::from(h & 0x3FF);
+    sign * match exp {
+        0 => mant * 2f64.powi(-24),
+        31 => f64::INFINITY,
+        e => (1.0 + mant / 1024.0) * 2f64.powi(i32::from(e) - 15),
+    }
+}
+
+/// FCVT/FCVTL from half precision.
+pub fn half_to(h: u16, to: FpType, default_nan: bool) -> u64 {
+    let is_nan = h & 0x7C00 == 0x7C00 && h & 0x3FF != 0;
+    if is_nan {
+        if default_nan {
+            return to.default_nan();
+        }
+        let sign = u64::from(h >> 15);
+        let payload = u64::from(h & 0x1FF);
+        return match to {
+            FpType::Single => (sign << 31) | 0x7FC0_0000 | (payload << 13),
+            FpType::Double => (sign << 63) | 0x7FF8_0000_0000_0000 | (payload << 42),
+        };
+    }
+    let v = half_to_f64(h);
+    match to {
+        FpType::Single => u64::from((v as f32).to_bits()),
+        FpType::Double => v.to_bits(),
+    }
+}
+
+/// FCVT/FCVTN to half precision (`from` is the source precision).
+pub fn to_half(x: u64, from: FpType, default_nan: bool) -> u16 {
+    let fp = Fp {
+        ty: from,
+        default_nan,
+    };
+    let x = x & from.mask();
+    if fp.is_nan(x) {
+        if default_nan {
+            return 0x7E00;
+        }
+        let (sign, top) = match from {
+            FpType::Single => ((x >> 31) as u16, ((x >> 13) & 0x1FF) as u16),
+            FpType::Double => ((x >> 63) as u16, ((x >> 42) & 0x1FF) as u16),
+        };
+        return (sign << 15) | 0x7E00 | top;
+    }
+    f64_to_half(fp.to_f64(x))
+}
+
 /// `VFPExpandImm`: the 8-bit immediate of FMOV (scalar, immediate).
 pub fn expand_imm(imm8: u8, ty: FpType) -> u64 {
     let sign = u64::from(imm8 >> 7);

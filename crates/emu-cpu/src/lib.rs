@@ -6,6 +6,7 @@
 pub mod decoder;
 pub mod fp;
 pub mod interpreter;
+pub mod simd;
 
 pub use emu_memory::{Fault, Memory, Perm};
 pub use interpreter::Exit;
