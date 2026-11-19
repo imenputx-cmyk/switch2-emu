@@ -510,6 +510,13 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
+    fn draw(&mut self, g: &mut GuestMemory, d: &emu_gpu::draw::Draw) -> Result<(), String> {
+        // Shaders are not translated to SPIR-V yet: draw in software on
+        // up-to-date guest memory.
+        self.flush(g)?;
+        self.software.draw(g, d)
+    }
+
     fn flush(&mut self, g: &mut GuestMemory) -> Result<(), String> {
         // SAFETY: see `clear`.
         unsafe { self.flush_images(g) }

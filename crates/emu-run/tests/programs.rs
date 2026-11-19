@@ -407,25 +407,72 @@ fn gpu_frames_match_on_vulkan() {
         eprintln!("skipping: {e}");
         return;
     }
-    let nro = program("hb_gpu.nro");
-    let soft = emu_run::run_nro(&nro, 200_000_000, false).expect("boots");
-    let config = emu_horizon::services::Config {
-        gpu_backend: emu_horizon::services::GpuBackend::Vulkan,
-        ..Default::default()
-    };
-    let vk = emu_run::run_nro_with(&nro, 200_000_000, false, config).expect("boots");
-    assert_eq!(vk.stop, emu_horizon::Stop::ReturnedToLoader(0));
-    assert_eq!(vk.debug_output, soft.debug_output);
-    assert_eq!(vk.frames.len(), soft.frames.len());
-    for (a, b) in soft.frames.iter().zip(&vk.frames) {
-        assert_eq!((a.width, a.height), (b.width, b.height));
-        let worst = a
-            .rgba
-            .iter()
-            .zip(&b.rgba)
-            .map(|(x, y)| x.abs_diff(*y))
-            .max()
-            .unwrap();
-        assert!(worst <= 1, "frames differ by {worst}");
+    for name in ["hb_gpu.nro", "hb_triangle.nro"] {
+        let nro = program(name);
+        let soft = emu_run::run_nro(&nro, 200_000_000, false).expect("boots");
+        let config = emu_horizon::services::Config {
+            gpu_backend: emu_horizon::services::GpuBackend::Vulkan,
+            ..Default::default()
+        };
+        let vk = emu_run::run_nro_with(&nro, 200_000_000, false, config).expect("boots");
+        assert_eq!(vk.stop, emu_horizon::Stop::ReturnedToLoader(0), "{name}");
+        assert_eq!(vk.debug_output, soft.debug_output, "{name}");
+        assert_eq!(vk.frames.len(), soft.frames.len(), "{name}");
+        for (a, b) in soft.frames.iter().zip(&vk.frames) {
+            assert_eq!((a.width, a.height), (b.width, b.height));
+            let worst = a
+                .rgba
+                .iter()
+                .zip(&b.rgba)
+                .map(|(x, y)| x.abs_diff(*y))
+                .max()
+                .unwrap();
+            assert!(worst <= 1, "{name}: frames differ by {worst}");
+        }
     }
+}
+
+#[test]
+fn shaded_triangles() {
+    // tests/programs/libnx_compat/hb_triangle.c draws with Maxwell vertex
+    // and pixel shaders (triangle_shaders.h) from a vertex buffer: a
+    // triangle with red/green/blue corners, then (frame 1) moved right
+    // plus a strip quad drawn with the single-method draw.
+    let r = emu_run::run_nro(&program("hb_triangle.nro"), 200_000_000, false).expect("boots");
+    assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0));
+    assert!(String::from_utf8(r.debug_output)
+        .unwrap()
+        .ends_with("triangle frame 0x1\n"));
+    assert_eq!(r.frames.len(), 2);
+    let px = |f: &emu_horizon::services::Frame, x: u32, y: u32| {
+        let at = ((y * f.width + x) * 4) as usize;
+        [f.rgba[at], f.rgba[at + 1], f.rgba[at + 2], f.rgba[at + 3]]
+    };
+    let near = |got: [u8; 4], want: [u8; 4], tol: u8| {
+        got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= tol)
+    };
+    let bg = [26, 26, 31, 255];
+    for (frame, dx) in [(0usize, 0u32), (1, 160)] {
+        let f = &r.frames[frame];
+        assert_eq!(px(f, 5, 700), bg);
+        // Centroid: an even mix of the three corners.
+        let c = px(f, 640 + dx, 408);
+        assert!(
+            near(c, [85, 85, 85, 255], 2),
+            "frame {frame} centroid {c:?}"
+        );
+        // Near the corners: mostly red, green, blue.
+        let top = px(f, 640 + dx, 80);
+        assert!(top[0] > 240 && top[1] < 15 && top[2] < 15, "{top:?}");
+        let left = px(f, 200 + dx, 572);
+        assert!(left[1] > 200 && left[0] < 40, "{left:?}");
+        let right = px(f, 1080 + dx, 572);
+        assert!(right[2] > 200 && right[0] < 40, "{right:?}");
+        // Outside the triangle, beside its apex.
+        assert_eq!(px(f, 560 + dx, 80), bg);
+    }
+    // The strip quad (frame 1 only): yellow on the left, magenta on the right.
+    assert_eq!(px(&r.frames[0], 40, 70), bg);
+    assert!(near(px(&r.frames[1], 33, 70), [255, 255, 0, 255], 3));
+    assert!(near(px(&r.frames[1], 286, 70), [255, 0, 255, 255], 3));
 }

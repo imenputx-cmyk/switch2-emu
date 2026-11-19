@@ -14,8 +14,10 @@
 
 pub mod backend;
 pub mod blocklinear;
+pub mod draw;
 pub mod engines;
 pub mod mmu;
+pub mod shader;
 pub mod surface;
 
 use emu_memory::Memory;

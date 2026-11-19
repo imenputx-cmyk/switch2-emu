@@ -154,6 +154,9 @@ pub trait Backend {
         mask: [bool; 4],
     ) -> Result<(), String>;
 
+    /// Executes a draw.
+    fn draw(&mut self, g: &mut GuestMemory, d: &crate::draw::Draw) -> Result<(), String>;
+
     /// Makes all results visible in guest memory (end of a submission).
     fn flush(&mut self, g: &mut GuestMemory) -> Result<(), String>;
 }
@@ -218,6 +221,10 @@ impl Backend for SoftwareBackend {
             }
         }
         Ok(())
+    }
+
+    fn draw(&mut self, g: &mut GuestMemory, d: &crate::draw::Draw) -> Result<(), String> {
+        crate::draw::draw_software(g, d)
     }
 
     fn flush(&mut self, _g: &mut GuestMemory) -> Result<(), String> {

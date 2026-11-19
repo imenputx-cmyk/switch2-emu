@@ -8,6 +8,9 @@ use super::inline::InlineToMemory;
 use super::mme::{self, MacroTarget};
 use super::{bits, EngineCtx};
 use crate::backend::{Layout, Rect, Surface};
+use crate::draw::{Draw, VertexAttribute, VertexStream, Viewport};
+use crate::shader::decode::{decode_program, Inst};
+use crate::shader::{Header, Stage, HEADER_SIZE};
 use crate::surface::ColorFormat;
 
 /// Register file size in words: methods 0x0000..0x3800 (bytes).
@@ -34,12 +37,26 @@ mod reg {
     pub const REPORT_SEMAPHORE_C: u32 = 0x1B08;
     pub const REPORT_SEMAPHORE_D: u32 = 0x1B0C;
     pub const MACRO_CALLS: u32 = 0x3800;
+    pub const VIEWPORT_SCALE_X: u32 = 0xA00; // scale x, y, z, offset x, y, z
+    pub const VERTEX_ARRAY_START: u32 = 0xD74;
+    pub const DRAW_VERTEX_ARRAY: u32 = 0xD78;
+    pub const VERTEX_ATTRIBUTE: u32 = 0x1160; // + 4 * i
+    pub const DRAW_ARRAY_FIRST: u32 = 0x1214;
+    pub const DRAW_ARRAY_SUBSEQUENT: u32 = 0x1218;
+    pub const CT_SELECT: u32 = 0x121C;
+    pub const PROGRAM_REGION_A: u32 = 0x1608;
+    pub const END: u32 = 0x1614;
+    pub const BEGIN: u32 = 0x1618;
+    pub const VERTEX_STREAM: u32 = 0x1C00; // + 16 * j: format, location a, b
+    pub const PIPELINE: u32 = 0x2000; // + 64 * j: shader, program
 }
 
-/// Methods that start work this backend cannot do yet (draws).
-const DRAW_TRIGGERS: [u32; 9] = [
-    0x304, 0x1214, 0x1218, 0x123C, 0x1304, 0x15E8, 0x15F0, 0x1614, 0x1618,
-];
+/// Draws that are not emulated yet (indexed, auto, inline indices).
+const DRAW_TRIGGERS: [u32; 5] = [0x304, 0x123C, 0x1304, 0x15E8, 0x15F0];
+
+/// Pipeline slots: 0 vertex A, 1 vertex B, 2-4 tessellation/geometry,
+/// 5 pixel.
+const PIPELINE_SLOTS: usize = 6;
 
 pub struct Maxwell3D {
     regs: Vec<u32>,
@@ -53,6 +70,13 @@ pub struct Maxwell3D {
     pending_call: Option<(usize, Vec<u32>)>,
     /// Macros run (for diagnostics and tests).
     pub macro_calls: u64,
+    /// Topology from BEGIN and vertex runs queued until END.
+    topology: u32,
+    ranges: Vec<(u32, u32)>,
+    /// Decoded programs by GPU address.
+    programs: std::collections::HashMap<u64, (Header, Vec<Inst>)>,
+    /// Draws executed (for diagnostics and tests).
+    pub draws: u64,
 }
 
 /// Lets a running macro write methods into the engine.
@@ -85,6 +109,10 @@ impl Default for Maxwell3D {
             clears: 0,
             pending_call: None,
             macro_calls: 0,
+            topology: 0,
+            ranges: Vec::new(),
+            programs: Default::default(),
+            draws: 0,
         }
     }
 }
@@ -184,10 +212,187 @@ impl Maxwell3D {
             reg::INCREMENT_SYNC_POINT => ctx.increment_syncpoint(bits(value, 11, 0)),
             reg::CLEAR_SURFACE => self.clear(value, ctx),
             reg::REPORT_SEMAPHORE_D => self.report_semaphore(value, ctx),
+            reg::BEGIN => {
+                self.topology = value & 0xFFFF;
+                self.ranges.clear();
+            }
+            reg::DRAW_VERTEX_ARRAY => self.ranges.push((self.reg(reg::VERTEX_ARRAY_START), value)),
+            reg::END => {
+                let ranges = std::mem::take(&mut self.ranges);
+                if !ranges.is_empty() {
+                    self.draw(self.topology, ranges, ctx);
+                }
+            }
+            reg::DRAW_ARRAY_FIRST | reg::DRAW_ARRAY_SUBSEQUENT => {
+                self.draw(
+                    value >> 28,
+                    vec![(value & 0xFFFF, (value >> 16) & 0xFFF)],
+                    ctx,
+                );
+            }
             o if DRAW_TRIGGERS.contains(&o) => return false,
             _ => {}
         }
         true
+    }
+
+    /// The decoded program at `addr` (header and instructions).
+    fn program(&mut self, addr: u64, ctx: &mut EngineCtx) -> Result<(Header, Vec<Inst>), String> {
+        if let Some(p) = self.programs.get(&addr) {
+            return Ok(p.clone());
+        }
+        // Read in growing chunks until the program's EXIT is decoded.
+        let mut len = 0x400usize;
+        loop {
+            let mut code = vec![0u8; len];
+            ctx.guest
+                .read(addr, &mut code)
+                .map_err(|f| format!("shader at {addr:#x}: {f:?}"))?;
+            let insts = decode_program(&code[HEADER_SIZE..])
+                .map_err(|e| format!("shader at {addr:#x}: {e:x?}"))?;
+            if insts.last() == Some(&Inst::Exit) {
+                let p = (Header::parse(&code[..HEADER_SIZE]), insts);
+                self.programs.insert(addr, p.clone());
+                return Ok(p);
+            }
+            if len >= 1 << 20 {
+                return Err(format!("shader at {addr:#x}: no EXIT"));
+            }
+            len *= 4;
+        }
+    }
+
+    /// The program in a pipeline slot, if enabled.
+    fn pipeline(
+        &mut self,
+        slot: usize,
+        ctx: &mut EngineCtx,
+    ) -> Result<Option<(Header, Vec<Inst>)>, String> {
+        let base = reg::PIPELINE + 64 * slot as u32;
+        if self.reg(base) & 1 == 0 {
+            return Ok(None);
+        }
+        let region = u64::from(self.reg(reg::PROGRAM_REGION_A) & 0xFF) << 32
+            | u64::from(self.reg(reg::PROGRAM_REGION_A + 4));
+        self.program(region + u64::from(self.reg(base + 4)), ctx)
+            .map(Some)
+    }
+
+    /// Color target `index` as a surface.
+    fn color_target(&self, index: u32) -> Option<Surface> {
+        let rt = reg::COLOR_TARGET + 64 * index;
+        let format = ColorFormat::from_raw(self.reg(rt + 0x10))?;
+        let memory = self.reg(rt + 0x14);
+        let pitch_layout = memory & (1 << 12) != 0;
+        let bpp = format.bytes_per_pixel();
+        let w = self.reg(rt + 8);
+        Some(Surface {
+            addr: u64::from(self.reg(rt) & 0xFF) << 32 | u64::from(self.reg(rt + 4)),
+            width: if pitch_layout { w / bpp } else { w },
+            height: self.reg(rt + 0xC),
+            format,
+            layout: if pitch_layout {
+                Layout::Pitch { pitch: w }
+            } else {
+                Layout::BlockLinear {
+                    block_height_log2: bits(memory, 7, 4),
+                }
+            },
+        })
+    }
+
+    fn draw(&mut self, topology: u32, ranges: Vec<(u32, u32)>, ctx: &mut EngineCtx) {
+        if let Err(e) = self.try_draw(topology, ranges, ctx) {
+            ctx.faults.push(format!("draw: {e}"));
+        }
+    }
+
+    fn try_draw(
+        &mut self,
+        topology: u32,
+        ranges: Vec<(u32, u32)>,
+        ctx: &mut EngineCtx,
+    ) -> Result<(), String> {
+        let mut vs = None;
+        let mut ps = None;
+        for slot in 0..PIPELINE_SLOTS {
+            if let Some((h, insts)) = self.pipeline(slot, ctx)? {
+                match h.stage {
+                    Stage::Vertex => vs = Some(insts),
+                    Stage::Pixel => ps = Some((h, insts)),
+                    Stage::Other(t) => return Err(format!("shader stage {t} not supported")),
+                }
+            }
+        }
+        let vs = vs.ok_or("no vertex shader")?;
+        let (ps_header, ps) = ps.ok_or("no pixel shader")?;
+        let ct = self.reg(reg::CT_SELECT);
+        let target = if ct & 0xF == 0 {
+            None
+        } else {
+            self.color_target(bits(ct, 6, 4))
+        };
+        let attributes = (0..32)
+            .map(|i| {
+                let v = self.reg(reg::VERTEX_ATTRIBUTE + 4 * i);
+                VertexAttribute {
+                    stream: bits(v, 4, 0),
+                    constant: v & (1 << 6) != 0,
+                    offset: bits(v, 20, 7),
+                    widths: bits(v, 26, 21),
+                    kind: bits(v, 29, 27),
+                    swap_rb: v & (1 << 31) != 0,
+                }
+            })
+            .collect();
+        let streams = (0..32)
+            .map(|j| {
+                let base = reg::VERTEX_STREAM + 16 * j;
+                let format = self.reg(base);
+                VertexStream {
+                    enabled: format & (1 << 12) != 0,
+                    stride: format & 0xFFF,
+                    addr: u64::from(self.reg(base + 4) & 0xFF) << 32
+                        | u64::from(self.reg(base + 8)),
+                }
+            })
+            .collect();
+        let f = |o: u32| f32::from_bits(self.reg(o));
+        let v = reg::VIEWPORT_SCALE_X;
+        let viewport = Viewport {
+            scale: [f(v), f(v + 4), f(v + 8)],
+            offset: [f(v + 12), f(v + 16), f(v + 20)],
+        };
+        let (mut x0, mut y0, mut x1, mut y1) = (0, 0, u32::MAX, u32::MAX);
+        let ch = self.reg(reg::SURFACE_CLIP_HORIZONTAL);
+        let cv = self.reg(reg::SURFACE_CLIP_VERTICAL);
+        if ch >> 16 != 0 && cv >> 16 != 0 {
+            (x0, x1) = (ch & 0xFFFF, (ch & 0xFFFF) + (ch >> 16));
+            (y0, y1) = (cv & 0xFFFF, (cv & 0xFFFF) + (cv >> 16));
+        }
+        if self.reg(reg::SCISSOR_ENABLE) & 1 != 0 {
+            let (h, vv) = (
+                self.reg(reg::SCISSOR_HORIZONTAL),
+                self.reg(reg::SCISSOR_VERTICAL),
+            );
+            (x0, x1) = (x0.max(h & 0xFFFF), x1.min(h >> 16));
+            (y0, y1) = (y0.max(vv & 0xFFFF), y1.min(vv >> 16));
+        }
+        let d = Draw {
+            target,
+            vs,
+            ps,
+            ps_header,
+            topology,
+            ranges,
+            attributes,
+            streams,
+            viewport,
+            clip: Rect { x0, y0, x1, y1 },
+        };
+        ctx.backend.draw(&mut ctx.guest, &d)?;
+        self.draws += 1;
+        Ok(())
     }
 
     fn report_semaphore(&mut self, d: u32, ctx: &mut EngineCtx) {
