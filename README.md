@@ -8,7 +8,9 @@ This project does not include, distribute, or require any copyrighted Nintendo f
 
 1. **Foundation:** Cargo workspace, CI, and test setup. *(done)*
 2. **Guest CPU state:** AArch64 register file and NZCV flags. *(done)*
-3. **Decoder and interpreter:** Decode A64 instructions against the ARM Architecture Reference Manual, one instruction class at a time. *(integer instructions done and cross-checked against Unicorn; SIMD/FP, LSE atomics and CRC32 to come)*
+3. **Decoder and interpreter:** Decode A64 instructions against the ARM Architecture Reference Manual, one instruction class at a time, cross-checked against Unicorn.
+   - Done: integer instructions; scalar single/double floating point with ARM NaN rules; SIMD&FP loads and stores; common Advanced SIMD moves, logical ops and ADD/SUB.
+   - To do: most Advanced SIMD arithmetic, half precision (FP16), LSE atomics, CRC32. Also FPCR rounding modes other than round-to-nearest, flush-to-zero, and FPSR exception flags.
 4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory and ELF loader done; NSO/NRO to come)*
 5. **Service layer (HLE):** Simple emulation of OS calls.
 6. **JIT:** Dynamic translation from AArch64 to x86-64 after the interpreter is correct.
@@ -22,13 +24,14 @@ Accuracy comes before speed. The interpreter is the reference that the JIT and G
 ```
 crates/
   emu-memory/  Guest virtual memory: 4 KiB pages, permissions, faults
-  emu-cpu/     AArch64 CPU: register state, decoder, reference interpreter
+  emu-cpu/     AArch64 CPU: register state, decoder, reference interpreter, FP rules
   emu-loader/  ELF loader (NSO/NRO later)
   emu-run/     Runs freestanding test programs (CLI: emu-run file.elf)
 tests/programs/  C test programs, built with clang (ELF files are committed)
 tools/
   asm.py       Assemble instructions with llvm-mc and print encodings
   difftest.py  Differential test against Unicorn on random instructions
+  run_unicorn.py  Run a test program in Unicorn, to compare whole-program output
 ```
 
 ## Build and test
@@ -36,6 +39,7 @@ tools/
 ```sh
 cargo test
 cargo run --release -p emu-run -- tests/programs/hello.elf
+cargo run --release -p emu-run -- tests/programs/float.elf
 ```
 
 ### How correctness is checked
@@ -48,7 +52,8 @@ cargo run --release -p emu-run -- tests/programs/hello.elf
    cargo build --release --example difftest_runner
    python3 tools/difftest.py --cases 20000
    ```
-3. **Whole programs:** C programs in `tests/programs` are compiled with clang, run to completion, and their output is compared with expected values.
+   Floating-point registers start from a pool of hard cases (signed zeros, infinities, quiet and signalling NaNs with payloads, denormals, boundary values), with FPCR.DN on in a quarter of the cases.
+3. **Whole programs:** C programs in `tests/programs` are compiled with clang, run to completion, and their output is compared with expected values and with a full run in Unicorn (`tools/run_unicorn.py`).
 
 ## References
 

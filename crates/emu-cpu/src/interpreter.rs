@@ -6,9 +6,10 @@
 
 use crate::decoder::{
     decode, ones, ror, AddrMode, BitfieldOp, BranchRegOp, CondOperand, CondSelectOp, DataProc1Op,
-    DataProc2Op, DataProc3Op, ExclusiveOp, Extend, Instr, LoadKind, LogicOp, MoveWideOp, PairMode,
-    Shift, SysReg,
+    DataProc2Op, DataProc3Op, ElemSrc, ExclusiveOp, Extend, FpUnaryOp, Instr, LoadKind, LogicOp,
+    MoveWideOp, PairMode, Shift, SysReg, VecImmOp, VecLogicOp,
 };
+use crate::fp::Fp;
 use crate::{Cpu, Nzcv};
 use emu_memory::{Fault, Memory};
 
@@ -558,6 +559,7 @@ impl Cpu {
             }
 
             Instr::LoadStore {
+                simd,
                 size,
                 kind,
                 mode,
@@ -565,15 +567,26 @@ impl Cpu {
             } => {
                 let (addr, writeback) = self.address(mode, pc);
                 let bytes = 1usize << size;
-                match kind {
-                    LoadKind::Prefetch => {}
-                    LoadKind::Store => {
-                        mem.write_uint(addr, bytes, self.read_xzr(rt))
-                            .map_err(fault)?;
+                if simd {
+                    let mut buf = [0u8; 16];
+                    if kind == LoadKind::Store {
+                        buf.copy_from_slice(&self.read_v(rt).to_le_bytes());
+                        mem.write(addr, &buf[..bytes]).map_err(fault)?;
+                    } else {
+                        mem.read(addr, &mut buf[..bytes]).map_err(fault)?;
+                        self.write_v(rt, u128::from_le_bytes(buf));
                     }
-                    _ => {
-                        let raw = mem.read_uint(addr, bytes).map_err(fault)?;
-                        self.write_xzr(rt, extend_load(raw, size, kind));
+                } else {
+                    match kind {
+                        LoadKind::Prefetch => {}
+                        LoadKind::Store => {
+                            mem.write_uint(addr, bytes, self.read_xzr(rt))
+                                .map_err(fault)?;
+                        }
+                        _ => {
+                            let raw = mem.read_uint(addr, bytes).map_err(fault)?;
+                            self.write_xzr(rt, extend_load(raw, size, kind));
+                        }
                     }
                 }
                 if let Some((rn, value)) = writeback {
@@ -582,6 +595,7 @@ impl Cpu {
             }
 
             Instr::LoadStorePair {
+                simd,
                 size,
                 load,
                 signed,
@@ -597,26 +611,38 @@ impl Cpu {
                     _ => base.wrapping_add_signed(imm),
                 };
                 let bytes = 1usize << size;
-                let mut buf = [0u8; 16];
+                let mut buf = [0u8; 32];
                 if load {
                     mem.read(addr, &mut buf[..bytes * 2]).map_err(fault)?;
-                    let kind = if signed {
-                        LoadKind::LoadSigned64
-                    } else {
-                        LoadKind::Load
-                    };
-                    let mut word = [0u8; 8];
+                    let mut word = [0u8; 16];
                     word[..bytes].copy_from_slice(&buf[..bytes]);
-                    let first = extend_load(u64::from_le_bytes(word), size, kind);
-                    word = [0; 8];
+                    let first = u128::from_le_bytes(word);
+                    word = [0; 16];
                     word[..bytes].copy_from_slice(&buf[bytes..bytes * 2]);
-                    let second = extend_load(u64::from_le_bytes(word), size, kind);
-                    self.write_xzr(rt, first);
-                    self.write_xzr(rt2, second);
+                    let second = u128::from_le_bytes(word);
+                    if simd {
+                        self.write_v(rt, first);
+                        self.write_v(rt2, second);
+                    } else {
+                        let kind = if signed {
+                            LoadKind::LoadSigned64
+                        } else {
+                            LoadKind::Load
+                        };
+                        self.write_xzr(rt, extend_load(first as u64, size, kind));
+                        self.write_xzr(rt2, extend_load(second as u64, size, kind));
+                    }
                 } else {
-                    buf[..bytes].copy_from_slice(&self.read_xzr(rt).to_le_bytes()[..bytes]);
-                    buf[bytes..bytes * 2]
-                        .copy_from_slice(&self.read_xzr(rt2).to_le_bytes()[..bytes]);
+                    let (a, b) = if simd {
+                        (self.read_v(rt), self.read_v(rt2))
+                    } else {
+                        (
+                            u128::from(self.read_xzr(rt)),
+                            u128::from(self.read_xzr(rt2)),
+                        )
+                    };
+                    buf[..bytes].copy_from_slice(&a.to_le_bytes()[..bytes]);
+                    buf[bytes..bytes * 2].copy_from_slice(&b.to_le_bytes()[..bytes]);
                     mem.write(addr, &buf[..bytes * 2]).map_err(fault)?;
                 }
                 if mode != PairMode::Offset {
@@ -656,11 +682,255 @@ impl Cpu {
                 }
             }
 
+            Instr::FpUnary { ty, op, rn, rd } => {
+                let fp = Fp::new(ty, self.fpcr);
+                let x = self.read_d(rn);
+                let (result, out_ty) = match op {
+                    FpUnaryOp::Mov => (x, ty),
+                    FpUnaryOp::Abs => (fp.abs(x), ty),
+                    FpUnaryOp::Neg => (fp.neg(x), ty),
+                    FpUnaryOp::Sqrt => (fp.sqrt(x), ty),
+                    FpUnaryOp::Round(mode) => (fp.round_int(x, mode), ty),
+                    FpUnaryOp::Convert(to) => (fp.convert(x, to), to),
+                };
+                self.write_scalar(rd, result, out_ty.bytes());
+            }
+
+            Instr::FpBinary { ty, op, rm, rn, rd } => {
+                let fp = Fp::new(ty, self.fpcr);
+                let result = fp.binop(op, self.read_d(rn), self.read_d(rm));
+                self.write_scalar(rd, result, ty.bytes());
+            }
+
+            Instr::FpMulAdd {
+                ty,
+                neg_addend,
+                neg_product,
+                rm,
+                ra,
+                rn,
+                rd,
+            } => {
+                let fp = Fp::new(ty, self.fpcr);
+                let mut a = self.read_d(ra) & ty.mask();
+                let mut n = self.read_d(rn) & ty.mask();
+                if neg_addend {
+                    a = fp.neg(a);
+                }
+                if neg_product {
+                    n = fp.neg(n);
+                }
+                let result = fp.mul_add(a, n, self.read_d(rm));
+                self.write_scalar(rd, result, ty.bytes());
+            }
+
+            Instr::FpCompare { ty, rn, rm } => {
+                let fp = Fp::new(ty, self.fpcr);
+                let b = rm.map_or(0, |rm| self.read_d(rm));
+                self.nzcv = fp.compare_flags(self.read_d(rn), b);
+            }
+
+            Instr::FpCondCompare {
+                ty,
+                rn,
+                rm,
+                cond,
+                nzcv,
+            } => {
+                self.nzcv = if condition_holds(cond, self.nzcv) {
+                    Fp::new(ty, self.fpcr).compare_flags(self.read_d(rn), self.read_d(rm))
+                } else {
+                    Nzcv::from_nibble(nzcv)
+                };
+            }
+
+            Instr::FpCondSelect {
+                ty,
+                rm,
+                rn,
+                cond,
+                rd,
+            } => {
+                let src = if condition_holds(cond, self.nzcv) {
+                    rn
+                } else {
+                    rm
+                };
+                self.write_scalar(rd, self.read_d(src), ty.bytes());
+            }
+
+            Instr::FpMovImm { ty, imm, rd } => self.write_scalar(rd, imm, ty.bytes()),
+
+            Instr::FpToInt {
+                sf,
+                ty,
+                signed,
+                rounding,
+                fbits,
+                rn,
+                rd,
+            } => {
+                let fp = Fp::new(ty, self.fpcr);
+                let result = fp.to_int(self.read_d(rn), signed, datasize(sf), fbits, rounding);
+                self.write_xzr(rd, result);
+            }
+
+            Instr::IntToFp {
+                sf,
+                ty,
+                signed,
+                fbits,
+                rn,
+                rd,
+            } => {
+                let fp = Fp::new(ty, self.fpcr);
+                let value = truncate(self.read_xzr(rn), sf);
+                let result = fp.from_int(value, signed, datasize(sf), fbits);
+                self.write_scalar(rd, result, ty.bytes());
+            }
+
+            Instr::FpIntInVec {
+                ty,
+                to_int,
+                signed,
+                rounding,
+                rn,
+                rd,
+            } => {
+                let fp = Fp::new(ty, self.fpcr);
+                let width = ty.bytes() as u32 * 8;
+                let x = self.read_d(rn) & ty.mask();
+                let result = if to_int {
+                    fp.to_int(x, signed, width, 0, rounding)
+                } else {
+                    fp.from_int(x, signed, width, 0)
+                };
+                self.write_scalar(rd, result, ty.bytes());
+            }
+
+            Instr::FmovToGp { sf, top, rn, rd } => {
+                let v = self.read_v(rn);
+                let value = if top { (v >> 64) as u64 } else { v as u64 };
+                self.write_xzr(rd, truncate(value, sf));
+            }
+
+            Instr::FmovFromGp { sf, top, rn, rd } => {
+                let value = truncate(self.read_xzr(rn), sf);
+                if top {
+                    let low = self.read_v(rd) & u128::from(u64::MAX);
+                    self.write_v(rd, low | (u128::from(value) << 64));
+                } else {
+                    self.write_scalar(rd, value, if sf { 8 } else { 4 });
+                }
+            }
+
+            Instr::VecMoveImm { q, op, imm, rd } => {
+                let imm = u128::from(imm) | (u128::from(imm) << 64);
+                let old = self.read_v(rd);
+                let result = match op {
+                    VecImmOp::Movi => imm,
+                    VecImmOp::Mvni => !imm,
+                    VecImmOp::Orr => old | imm,
+                    VecImmOp::Bic => old & !imm,
+                };
+                self.write_v(rd, vec_width(result, q));
+            }
+
+            Instr::VecDup { q, esize, src, rd } => {
+                let elem = self.element_source(src, esize);
+                let lanes = (if q { 16 } else { 8 }) >> esize;
+                let mut result = 0u128;
+                for i in 0..lanes {
+                    result |= u128::from(elem) << (i * (8 << esize));
+                }
+                self.write_v(rd, result);
+            }
+
+            Instr::VecIns {
+                esize,
+                index,
+                src,
+                rd,
+            } => {
+                let elem = self.element_source(src, esize);
+                let v = set_element(self.read_v(rd), esize, index, elem);
+                self.write_v(rd, v);
+            }
+
+            Instr::VecToGp {
+                signed,
+                sf,
+                esize,
+                index,
+                rn,
+                rd,
+            } => {
+                let elem = get_element(self.read_v(rn), esize, index);
+                let value = if signed { sext(elem, 8 << esize) } else { elem };
+                self.write_xzr(rd, truncate(value, sf));
+            }
+
+            Instr::ScalarDup {
+                esize,
+                index,
+                rn,
+                rd,
+            } => {
+                let elem = get_element(self.read_v(rn), esize, index);
+                self.write_scalar(rd, elem, 1 << esize);
+            }
+
+            Instr::VecLogical { q, op, rm, rn, rd } => {
+                let (n, m, d) = (self.read_v(rn), self.read_v(rm), self.read_v(rd));
+                let result = match op {
+                    VecLogicOp::And => n & m,
+                    VecLogicOp::Bic => n & !m,
+                    VecLogicOp::Orr => n | m,
+                    VecLogicOp::Orn => n | !m,
+                    VecLogicOp::Eor => n ^ m,
+                    VecLogicOp::Bsl => (n & d) | (m & !d),
+                    VecLogicOp::Bit => (d & !m) | (n & m),
+                    VecLogicOp::Bif => (d & m) | (n & !m),
+                };
+                self.write_v(rd, vec_width(result, q));
+            }
+
+            Instr::VecAddSub {
+                q,
+                sub,
+                esize,
+                rm,
+                rn,
+                rd,
+            } => {
+                let (n, m) = (self.read_v(rn), self.read_v(rm));
+                let lanes = 16 >> esize;
+                let mut result = 0u128;
+                for i in 0..lanes {
+                    let (a, b) = (get_element(n, esize, i), get_element(m, esize, i));
+                    let r = if sub {
+                        a.wrapping_sub(b)
+                    } else {
+                        a.wrapping_add(b)
+                    };
+                    result = set_element(result, esize, i, r);
+                }
+                self.write_v(rd, vec_width(result, q));
+            }
+
             Instr::Unknown(raw) => return Err(Exit::Unimplemented { pc, insn: raw }),
         }
 
         self.set_pc(next_pc);
         Ok(())
+    }
+
+    /// Reads the element feeding DUP or INS.
+    fn element_source(&self, src: ElemSrc, esize: u8) -> u64 {
+        match src {
+            ElemSrc::Gp(rn) => self.read_xzr(rn) & ones(8 << esize),
+            ElemSrc::Element { rn, index } => get_element(self.read_v(rn), esize, index),
+        }
     }
 
     /// Shared ADD/SUB core: `x + y` or `x - y`, returning result and flags.
@@ -697,6 +967,27 @@ impl Cpu {
             AddrMode::Literal { offset } => (pc.wrapping_add_signed(offset), None),
         }
     }
+}
+
+/// Clears the upper 64 bits of a vector result when Q = 0.
+fn vec_width(v: u128, q: bool) -> u128 {
+    if q {
+        v
+    } else {
+        v & u128::from(u64::MAX)
+    }
+}
+
+/// Element `index` of a vector, each `1 << esize` bytes wide.
+fn get_element(v: u128, esize: u8, index: u32) -> u64 {
+    let bits = 8u32 << esize;
+    ((v >> (index * bits)) as u64) & ones(bits)
+}
+
+fn set_element(v: u128, esize: u8, index: u32, value: u64) -> u128 {
+    let bits = 8u32 << esize;
+    let mask = u128::from(ones(bits)) << (index * bits);
+    (v & !mask) | (u128::from(value & ones(bits)) << (index * bits))
 }
 
 fn logic(op: LogicOp, a: u64, b: u64) -> u64 {

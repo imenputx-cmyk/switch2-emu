@@ -6,8 +6,12 @@
 //! -show-encoding`, and semantics are cross-checked against Unicorn by
 //! `tools/difftest.py`.
 //!
-//! Only general-purpose (integer) instructions are covered so far. SIMD and
-//! floating point decode as [`Instr::Unknown`].
+//! Covered: the general-purpose (integer) instructions, scalar single and
+//! double precision floating point, SIMD&FP loads and stores, and the most
+//! common Advanced SIMD moves and lane-wise operations. Everything else
+//! decodes as [`Instr::Unknown`].
+
+pub use crate::fp::{BinOp as FpBinOp, FpType, Rounding};
 
 /// Operation of a move-wide instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +217,48 @@ impl SysReg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpUnaryOp {
+    Mov,
+    Abs,
+    Neg,
+    Sqrt,
+    /// FCVT to the given precision.
+    Convert(FpType),
+    /// FRINTx. FRINTX and FRINTI use the FPCR mode, which is always
+    /// round-to-nearest here.
+    Round(Rounding),
+}
+
+/// Operation of an Advanced SIMD modified-immediate instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VecImmOp {
+    /// MOVI and FMOV (vector, immediate).
+    Movi,
+    Mvni,
+    Orr,
+    Bic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VecLogicOp {
+    And,
+    Bic,
+    Orr,
+    Orn,
+    Eor,
+    Bsl,
+    Bit,
+    Bif,
+}
+
+/// Source of DUP and INS: a general register or a vector element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElemSrc {
+    Gp(u8),
+    Element { rn: u8, index: u32 },
+}
+
 /// A decoded A64 instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instr {
@@ -320,8 +366,10 @@ pub enum Instr {
     },
 
     /// Single-register loads and stores. `size` is log2 of the access
-    /// width in bytes (0 = byte ... 3 = doubleword).
+    /// width in bytes (0 = byte ... 3 = doubleword, 4 = quadword for SIMD).
+    /// With `simd`, `rt` names a SIMD&FP register.
     LoadStore {
+        simd: bool,
         size: u8,
         kind: LoadKind,
         mode: AddrMode,
@@ -329,6 +377,7 @@ pub enum Instr {
     },
     /// LDP, STP, LDPSW, LDNP, STNP. `size` is log2 bytes per register.
     LoadStorePair {
+        simd: bool,
         size: u8,
         load: bool,
         signed: bool,
@@ -425,6 +474,159 @@ pub enum Instr {
         op: DataProc3Op,
         rm: u8,
         ra: u8,
+        rn: u8,
+        rd: u8,
+    },
+
+    /// FMOV (register), FABS, FNEG, FSQRT, FCVT, FRINTx.
+    FpUnary {
+        ty: FpType,
+        op: FpUnaryOp,
+        rn: u8,
+        rd: u8,
+    },
+    /// FADD, FSUB, FMUL, FDIV, FMAX, FMIN, FMAXNM, FMINNM, FNMUL.
+    FpBinary {
+        ty: FpType,
+        op: FpBinOp,
+        rm: u8,
+        rn: u8,
+        rd: u8,
+    },
+    /// FMADD, FMSUB, FNMADD, FNMSUB: `(+/-)ra + (+/-)(rn * rm)`.
+    FpMulAdd {
+        ty: FpType,
+        neg_addend: bool,
+        neg_product: bool,
+        rm: u8,
+        ra: u8,
+        rn: u8,
+        rd: u8,
+    },
+    /// FCMP, FCMPE. `rm` is `None` for the compare-with-zero form.
+    FpCompare {
+        ty: FpType,
+        rn: u8,
+        rm: Option<u8>,
+    },
+    /// FCCMP, FCCMPE.
+    FpCondCompare {
+        ty: FpType,
+        rn: u8,
+        rm: u8,
+        cond: u8,
+        nzcv: u8,
+    },
+    FpCondSelect {
+        ty: FpType,
+        rm: u8,
+        rn: u8,
+        cond: u8,
+        rd: u8,
+    },
+    /// FMOV (scalar, immediate). `imm` holds the expanded bits.
+    FpMovImm {
+        ty: FpType,
+        imm: u64,
+        rd: u8,
+    },
+    /// FCVTxS, FCVTxU, including fixed-point forms (`fbits` > 0).
+    FpToInt {
+        sf: bool,
+        ty: FpType,
+        signed: bool,
+        rounding: Rounding,
+        fbits: u32,
+        rn: u8,
+        rd: u8,
+    },
+    /// SCVTF, UCVTF, including fixed-point forms.
+    IntToFp {
+        sf: bool,
+        ty: FpType,
+        signed: bool,
+        fbits: u32,
+        rn: u8,
+        rd: u8,
+    },
+    /// FCVTxS/FCVTxU/SCVTF/UCVTF (Advanced SIMD scalar): the integer
+    /// stays in a SIMD&FP register of the same width as `ty`.
+    FpIntInVec {
+        ty: FpType,
+        to_int: bool,
+        signed: bool,
+        rounding: Rounding,
+        rn: u8,
+        rd: u8,
+    },
+    /// FMOV from a SIMD&FP register to a general register. `top` reads
+    /// V.D[1].
+    FmovToGp {
+        sf: bool,
+        top: bool,
+        rn: u8,
+        rd: u8,
+    },
+    /// FMOV from a general register. `top` writes V.D[1] only.
+    FmovFromGp {
+        sf: bool,
+        top: bool,
+        rn: u8,
+        rd: u8,
+    },
+
+    /// MOVI, MVNI, ORR/BIC (vector, immediate), FMOV (vector, immediate).
+    /// `imm` is the 64-bit pattern, replicated to 128 bits when `q`.
+    VecMoveImm {
+        q: bool,
+        op: VecImmOp,
+        imm: u64,
+        rd: u8,
+    },
+    /// DUP. `esize` is log2 of the element size in bytes.
+    VecDup {
+        q: bool,
+        esize: u8,
+        src: ElemSrc,
+        rd: u8,
+    },
+    /// INS (general or element), alias MOV.
+    VecIns {
+        esize: u8,
+        index: u32,
+        src: ElemSrc,
+        rd: u8,
+    },
+    /// UMOV, SMOV. `sf` selects a 64-bit destination.
+    VecToGp {
+        signed: bool,
+        sf: bool,
+        esize: u8,
+        index: u32,
+        rn: u8,
+        rd: u8,
+    },
+    /// DUP (element, scalar), alias MOV: copies one element to a scalar.
+    ScalarDup {
+        esize: u8,
+        index: u32,
+        rn: u8,
+        rd: u8,
+    },
+    /// AND, BIC, ORR, ORN, EOR, BSL, BIT, BIF (vector).
+    VecLogical {
+        q: bool,
+        op: VecLogicOp,
+        rm: u8,
+        rn: u8,
+        rd: u8,
+    },
+    /// ADD, SUB (vector).
+    VecAddSub {
+        q: bool,
+        sub: bool,
+        esize: u8,
+        rm: u8,
         rn: u8,
         rd: u8,
     },
@@ -532,6 +734,7 @@ pub fn decode(insn: u32) -> Instr {
         0b1010 | 0b1011 => decode_branch_sys(insn),
         0b0100 | 0b0110 | 0b1100 | 0b1110 => decode_load_store(insn),
         0b0101 | 0b1101 => decode_dp_reg(insn),
+        0b0111 | 0b1111 => decode_simd_fp(insn),
         _ => None,
     };
     result.unwrap_or(Instr::Unknown(insn))
@@ -744,16 +947,28 @@ fn load_kind(size: u32, opc: u32) -> Option<LoadKind> {
     })
 }
 
-fn decode_load_store(insn: u32) -> Option<Instr> {
-    // SIMD&FP loads and stores are not implemented yet.
-    if bit(insn, 26) {
+/// Size (log2 bytes) and direction of a SIMD&FP single-register access:
+/// the opc high bit extends `size` up to 128 bits.
+fn simd_size_kind(size: u32, opc: u32) -> Option<(u32, LoadKind)> {
+    let scale = ((opc >> 1) << 2) | size;
+    if scale > 4 {
         return None;
     }
+    let kind = if opc & 1 == 1 {
+        LoadKind::Load
+    } else {
+        LoadKind::Store
+    };
+    Some((scale, kind))
+}
+
+fn decode_load_store(insn: u32) -> Option<Instr> {
+    let simd = bit(insn, 26);
     let size = bits(insn, 31, 30);
     let rn = reg(insn, 5);
     let rt = reg(insn, 0);
 
-    // Load/store exclusive and acquire/release.
+    // Load/store exclusive and acquire/release (integer only).
     if insn & 0x3F00_0000 == 0x0800_0000 {
         let o2 = bit(insn, 23);
         let l = bit(insn, 22);
@@ -784,13 +999,18 @@ fn decode_load_store(insn: u32) -> Option<Instr> {
     // Load register (literal).
     if insn & 0x3B00_0000 == 0x1800_0000 {
         let offset = sign_extend(bits(insn, 23, 5), 19) * 4;
-        let (size, kind) = match bits(insn, 31, 30) {
-            0 => (2, LoadKind::Load),
-            1 => (3, LoadKind::Load),
-            2 => (2, LoadKind::LoadSigned64),
-            _ => (3, LoadKind::Prefetch),
+        let (size, kind) = match (simd, bits(insn, 31, 30)) {
+            (false, 0) => (2, LoadKind::Load),
+            (false, 1) => (3, LoadKind::Load),
+            (false, 2) => (2, LoadKind::LoadSigned64),
+            (false, _) => (3, LoadKind::Prefetch),
+            (true, 0) => (2, LoadKind::Load),
+            (true, 1) => (3, LoadKind::Load),
+            (true, 2) => (4, LoadKind::Load),
+            (true, _) => return None,
         };
         return Some(Instr::LoadStore {
+            simd,
             size,
             kind,
             mode: AddrMode::Literal { offset },
@@ -807,14 +1027,18 @@ fn decode_load_store(insn: u32) -> Option<Instr> {
             1 => PairMode::PostIndex,
             _ => PairMode::PreIndex,
         };
-        let (size, signed) = match opc {
-            0 => (2, false),
-            1 if load && bits(insn, 24, 23) != 0 => (2, true), // LDPSW
-            2 => (3, false),
+        let (size, signed) = match (simd, opc) {
+            (false, 0) => (2, false),
+            (false, 1) if load && bits(insn, 24, 23) != 0 => (2, true), // LDPSW
+            (false, 2) => (3, false),
+            (true, 0) => (2, false),
+            (true, 1) => (3, false),
+            (true, 2) => (4, false),
             _ => return None,
         };
         let imm = sign_extend(bits(insn, 21, 15), 7) << size;
         return Some(Instr::LoadStorePair {
+            simd,
             size,
             load,
             signed,
@@ -827,12 +1051,20 @@ fn decode_load_store(insn: u32) -> Option<Instr> {
     }
 
     let opc = bits(insn, 23, 22);
+    let size_kind = |size: u32, opc: u32| -> Option<(u32, LoadKind)> {
+        if simd {
+            simd_size_kind(size, opc)
+        } else {
+            load_kind(size, opc).map(|k| (size, k))
+        }
+    };
 
     // Load/store register (unsigned immediate).
     if insn & 0x3B00_0000 == 0x3900_0000 {
-        let kind = load_kind(size, opc)?;
+        let (size, kind) = size_kind(size, opc)?;
         let imm = i64::from(bits(insn, 21, 10)) << size;
         return Some(Instr::LoadStore {
+            simd,
             size: size as u8,
             kind,
             mode: AddrMode::Offset { rn, imm },
@@ -842,10 +1074,14 @@ fn decode_load_store(insn: u32) -> Option<Instr> {
 
     // Load/store register (unscaled, post-index, unprivileged, pre-index).
     if insn & 0x3B20_0000 == 0x3800_0000 {
-        let kind = load_kind(size, opc)?;
+        let (size, kind) = size_kind(size, opc)?;
         let imm = sign_extend(bits(insn, 20, 12), 9);
         let form = bits(insn, 11, 10);
-        // Only the unscaled form (PRFUM) has a prefetch variant.
+        // Only the unscaled form (PRFUM) has a prefetch variant, and there
+        // are no unprivileged SIMD&FP accesses.
+        if (kind == LoadKind::Prefetch || simd) && form == 0b10 {
+            return None;
+        }
         if kind == LoadKind::Prefetch && form != 0b00 {
             return None;
         }
@@ -856,6 +1092,7 @@ fn decode_load_store(insn: u32) -> Option<Instr> {
             _ => AddrMode::Offset { rn, imm },
         };
         return Some(Instr::LoadStore {
+            simd,
             size: size as u8,
             kind,
             mode,
@@ -865,13 +1102,14 @@ fn decode_load_store(insn: u32) -> Option<Instr> {
 
     // Load/store register (register offset).
     if insn & 0x3B20_0C00 == 0x3820_0800 {
-        let kind = load_kind(size, opc)?;
+        let (size, kind) = size_kind(size, opc)?;
         let option = bits(insn, 15, 13);
         if option & 0b010 == 0 {
             return None;
         }
         let shift = if bit(insn, 12) { size } else { 0 };
         return Some(Instr::LoadStore {
+            simd,
             size: size as u8,
             kind,
             mode: AddrMode::RegOffset {
@@ -1061,6 +1299,455 @@ fn decode_dp_reg(insn: u32) -> Option<Instr> {
             rn,
             rd,
         });
+    }
+
+    None
+}
+
+fn fp_type(insn: u32) -> Option<FpType> {
+    match bits(insn, 23, 22) {
+        0b00 => Some(FpType::Single),
+        0b01 => Some(FpType::Double),
+        // Half precision (0b11) is not implemented yet.
+        _ => None,
+    }
+}
+
+/// `AdvSIMDExpandImm`: returns the 64-bit pattern for the modified
+/// immediate, or `None` for unallocated combinations.
+fn simd_expand_imm(op: bool, cmode: u32, imm8: u64, q: bool) -> Option<u64> {
+    let rep32 = |x: u64| x | (x << 32);
+    let rep16 = |x: u64| x | (x << 16) | (x << 32) | (x << 48);
+    Some(match cmode >> 1 {
+        0b000 => rep32(imm8),
+        0b001 => rep32(imm8 << 8),
+        0b010 => rep32(imm8 << 16),
+        0b011 => rep32(imm8 << 24),
+        0b100 => rep16(imm8),
+        0b101 => rep16(imm8 << 8),
+        0b110 => {
+            if cmode & 1 == 0 {
+                rep32((imm8 << 8) | 0xFF)
+            } else {
+                rep32((imm8 << 16) | 0xFFFF)
+            }
+        }
+        _ => match (cmode & 1, op) {
+            (0, false) => imm8 * 0x0101_0101_0101_0101,
+            (0, true) => (0..8).fold(0, |acc, i| {
+                acc | if (imm8 >> i) & 1 == 1 {
+                    0xFF << (8 * i)
+                } else {
+                    0
+                }
+            }),
+            (_, false) => rep32(crate::fp::expand_imm(imm8 as u8, FpType::Single)),
+            (_, true) => {
+                if !q {
+                    return None;
+                }
+                crate::fp::expand_imm(imm8 as u8, FpType::Double)
+            }
+        },
+    })
+}
+
+/// Splits an `imm5` field into (log2 element size, element index).
+fn element_of(imm5: u32) -> Option<(u8, u32)> {
+    let esize = imm5.trailing_zeros();
+    if esize > 3 {
+        return None;
+    }
+    Some((esize as u8, imm5 >> (esize + 1)))
+}
+
+fn decode_simd_fp(insn: u32) -> Option<Instr> {
+    let rn = reg(insn, 5);
+    let rd = reg(insn, 0);
+    let rm = reg(insn, 16);
+    let q = bit(insn, 30);
+
+    // Floating-point data-processing (3 source).
+    if insn & 0xFF00_0000 == 0x1F00_0000 {
+        let ty = fp_type(insn)?;
+        let (o1, o0) = (bit(insn, 21), bit(insn, 15));
+        return Some(Instr::FpMulAdd {
+            ty,
+            neg_addend: o1,
+            neg_product: o1 != o0,
+            rm,
+            ra: reg(insn, 10),
+            rn,
+            rd,
+        });
+    }
+
+    // Scalar floating point and conversions.
+    if insn & 0x7F00_0000 == 0x1E00_0000 {
+        return decode_fp_scalar(insn);
+    }
+
+    // Advanced SIMD modified immediate.
+    if insn & 0x9FF8_0400 == 0x0F00_0400 {
+        if bit(insn, 11) {
+            return None; // FMOV (vector, half precision): later.
+        }
+        let op = bit(insn, 29);
+        let cmode = bits(insn, 15, 12);
+        let imm8 = u64::from((bits(insn, 18, 16) << 5) | bits(insn, 9, 5));
+        let imm = simd_expand_imm(op, cmode, imm8, q)?;
+        let kind = match (cmode, op) {
+            (0b1110 | 0b1111, _) => VecImmOp::Movi,
+            (c, false) if c & 0b1001 == 0b0001 || c & 0b1101 == 0b1001 => VecImmOp::Orr,
+            (c, true) if c & 0b1001 == 0b0001 || c & 0b1101 == 0b1001 => VecImmOp::Bic,
+            (_, false) => VecImmOp::Movi,
+            (_, true) => VecImmOp::Mvni,
+        };
+        return Some(Instr::VecMoveImm {
+            q,
+            op: kind,
+            imm,
+            rd,
+        });
+    }
+
+    // Advanced SIMD scalar two-register miscellaneous: FP <-> integer
+    // conversions that keep the integer in a SIMD&FP register.
+    if insn & 0xDF3E_0C00 == 0x5E20_0800 {
+        let unsigned = bit(insn, 29);
+        let o2 = bit(insn, 23);
+        let ty = if bit(insn, 22) {
+            FpType::Double
+        } else {
+            FpType::Single
+        };
+        let (to_int, rounding) = match (o2, bits(insn, 16, 12)) {
+            (false, 0b11010) => (true, Rounding::TieEven),
+            (false, 0b11011) => (true, Rounding::NegInf),
+            (false, 0b11100) => (true, Rounding::TieAway),
+            (false, 0b11101) => (false, Rounding::TieEven),
+            (true, 0b11010) => (true, Rounding::PosInf),
+            (true, 0b11011) => (true, Rounding::Zero),
+            _ => return None,
+        };
+        return Some(Instr::FpIntInVec {
+            ty,
+            to_int,
+            signed: !unsigned,
+            rounding,
+            rn,
+            rd,
+        });
+    }
+
+    // Advanced SIMD scalar copy: DUP (element), alias MOV.
+    if insn & 0xFFE0_FC00 == 0x5E00_0400 {
+        let (esize, index) = element_of(bits(insn, 20, 16))?;
+        return Some(Instr::ScalarDup {
+            esize,
+            index,
+            rn,
+            rd,
+        });
+    }
+
+    // Advanced SIMD copy.
+    if insn & 0x9FE0_8400 == 0x0E00_0400 {
+        let (esize, index) = element_of(bits(insn, 20, 16))?;
+        let imm4 = bits(insn, 14, 11);
+        if bit(insn, 29) {
+            // INS (element).
+            if !q {
+                return None;
+            }
+            let src_index = imm4 >> esize;
+            return Some(Instr::VecIns {
+                esize,
+                index,
+                src: ElemSrc::Element {
+                    rn,
+                    index: src_index,
+                },
+                rd,
+            });
+        }
+        return match imm4 {
+            0b0000 if !(esize == 3 && !q) => Some(Instr::VecDup {
+                q,
+                esize,
+                src: ElemSrc::Element { rn, index },
+                rd,
+            }),
+            0b0001 if !(esize == 3 && !q) => Some(Instr::VecDup {
+                q,
+                esize,
+                src: ElemSrc::Gp(rn),
+                rd,
+            }),
+            0b0011 if q => Some(Instr::VecIns {
+                esize,
+                index,
+                src: ElemSrc::Gp(rn),
+                rd,
+            }),
+            0b0101 if esize < 2 || (esize == 2 && q) => Some(Instr::VecToGp {
+                signed: true,
+                sf: q,
+                esize,
+                index,
+                rn,
+                rd,
+            }),
+            0b0111 if (esize == 3) == q => Some(Instr::VecToGp {
+                signed: false,
+                sf: q,
+                esize,
+                index,
+                rn,
+                rd,
+            }),
+            _ => None,
+        };
+    }
+
+    // Advanced SIMD three same: logical, ADD, SUB.
+    if insn & 0x9F20_FC00 == 0x0E20_1C00 {
+        let op = match (bit(insn, 29), bits(insn, 23, 22)) {
+            (false, 0) => VecLogicOp::And,
+            (false, 1) => VecLogicOp::Bic,
+            (false, 2) => VecLogicOp::Orr,
+            (false, _) => VecLogicOp::Orn,
+            (true, 0) => VecLogicOp::Eor,
+            (true, 1) => VecLogicOp::Bsl,
+            (true, 2) => VecLogicOp::Bit,
+            (true, _) => VecLogicOp::Bif,
+        };
+        return Some(Instr::VecLogical { q, op, rm, rn, rd });
+    }
+    if insn & 0x9F20_FC00 == 0x0E20_8400 {
+        let esize = bits(insn, 23, 22) as u8;
+        if esize == 3 && !q {
+            return None;
+        }
+        return Some(Instr::VecAddSub {
+            q,
+            sub: bit(insn, 29),
+            esize,
+            rm,
+            rn,
+            rd,
+        });
+    }
+
+    None
+}
+
+fn decode_fp_scalar(insn: u32) -> Option<Instr> {
+    let sf = bit(insn, 31);
+    let rn = reg(insn, 5);
+    let rd = reg(insn, 0);
+    let rm = reg(insn, 16);
+    if bit(insn, 29) {
+        return None;
+    }
+    let rmode = bits(insn, 20, 19);
+    let opcode = bits(insn, 18, 16);
+
+    // Conversion between floating point and fixed point.
+    if !bit(insn, 21) {
+        let ty = fp_type(insn)?;
+        let scale = bits(insn, 15, 10);
+        if !sf && scale < 32 {
+            return None;
+        }
+        let fbits = 64 - scale;
+        return match (rmode, opcode) {
+            (0b00, 0b010 | 0b011) => Some(Instr::IntToFp {
+                sf,
+                ty,
+                signed: opcode == 0b010,
+                fbits,
+                rn,
+                rd,
+            }),
+            (0b11, 0b000 | 0b001) => Some(Instr::FpToInt {
+                sf,
+                ty,
+                signed: opcode == 0b000,
+                rounding: Rounding::Zero,
+                fbits,
+                rn,
+                rd,
+            }),
+            _ => None,
+        };
+    }
+
+    // Conversion between floating point and integer.
+    if bits(insn, 15, 10) == 0 {
+        // FMOV Xd, Vn.D[1] / FMOV Vd.D[1], Xn use ftype = 0b10.
+        if bits(insn, 23, 22) == 0b10 {
+            return match (sf, rmode, opcode) {
+                (true, 0b01, 0b110) => Some(Instr::FmovToGp {
+                    sf,
+                    top: true,
+                    rn,
+                    rd,
+                }),
+                (true, 0b01, 0b111) => Some(Instr::FmovFromGp {
+                    sf,
+                    top: true,
+                    rn,
+                    rd,
+                }),
+                _ => None,
+            };
+        }
+        let ty = fp_type(insn)?;
+        let rounding = match rmode {
+            0b00 => Rounding::TieEven,
+            0b01 => Rounding::PosInf,
+            0b10 => Rounding::NegInf,
+            _ => Rounding::Zero,
+        };
+        return match (rmode, opcode) {
+            (_, 0b000 | 0b001) => Some(Instr::FpToInt {
+                sf,
+                ty,
+                signed: opcode == 0b000,
+                rounding,
+                fbits: 0,
+                rn,
+                rd,
+            }),
+            (0b00, 0b100 | 0b101) => Some(Instr::FpToInt {
+                sf,
+                ty,
+                signed: opcode == 0b100,
+                rounding: Rounding::TieAway,
+                fbits: 0,
+                rn,
+                rd,
+            }),
+            (0b00, 0b010 | 0b011) => Some(Instr::IntToFp {
+                sf,
+                ty,
+                signed: opcode == 0b010,
+                fbits: 0,
+                rn,
+                rd,
+            }),
+            (0b00, 0b110 | 0b111) => {
+                // Only W<->S and X<->D are valid here.
+                if sf != (ty == FpType::Double) {
+                    return None;
+                }
+                if opcode == 0b110 {
+                    Some(Instr::FmovToGp {
+                        sf,
+                        top: false,
+                        rn,
+                        rd,
+                    })
+                } else {
+                    Some(Instr::FmovFromGp {
+                        sf,
+                        top: false,
+                        rn,
+                        rd,
+                    })
+                }
+            }
+            _ => None,
+        };
+    }
+
+    // Everything below has M (bit 31) = 0.
+    if sf {
+        return None;
+    }
+    let ty = fp_type(insn)?;
+    let cond = bits(insn, 15, 12) as u8;
+
+    match bits(insn, 11, 10) {
+        0b01 => {
+            return Some(Instr::FpCondCompare {
+                ty,
+                rn,
+                rm,
+                cond,
+                nzcv: bits(insn, 3, 0) as u8,
+            })
+        }
+        0b10 => {
+            let op = match bits(insn, 15, 12) {
+                0b0000 => FpBinOp::Mul,
+                0b0001 => FpBinOp::Div,
+                0b0010 => FpBinOp::Add,
+                0b0011 => FpBinOp::Sub,
+                0b0100 => FpBinOp::Max,
+                0b0101 => FpBinOp::Min,
+                0b0110 => FpBinOp::MaxNum,
+                0b0111 => FpBinOp::MinNum,
+                0b1000 => FpBinOp::NMul,
+                _ => return None,
+            };
+            return Some(Instr::FpBinary { ty, op, rm, rn, rd });
+        }
+        0b11 => {
+            return Some(Instr::FpCondSelect {
+                ty,
+                rm,
+                rn,
+                cond,
+                rd,
+            })
+        }
+        _ => {}
+    }
+
+    // Data-processing (1 source).
+    if bits(insn, 14, 10) == 0b10000 {
+        let op = match bits(insn, 20, 15) {
+            0b000000 => FpUnaryOp::Mov,
+            0b000001 => FpUnaryOp::Abs,
+            0b000010 => FpUnaryOp::Neg,
+            0b000011 => FpUnaryOp::Sqrt,
+            0b000100 if ty != FpType::Single => FpUnaryOp::Convert(FpType::Single),
+            0b000101 if ty != FpType::Double => FpUnaryOp::Convert(FpType::Double),
+            0b001000 => FpUnaryOp::Round(Rounding::TieEven),
+            0b001001 => FpUnaryOp::Round(Rounding::PosInf),
+            0b001010 => FpUnaryOp::Round(Rounding::NegInf),
+            0b001011 => FpUnaryOp::Round(Rounding::Zero),
+            0b001100 => FpUnaryOp::Round(Rounding::TieAway),
+            0b001110 | 0b001111 => FpUnaryOp::Round(Rounding::TieEven),
+            _ => return None,
+        };
+        return Some(Instr::FpUnary { ty, op, rn, rd });
+    }
+
+    // Compare.
+    if bits(insn, 15, 10) == 0b001000 {
+        if bits(insn, 2, 0) != 0 {
+            return None;
+        }
+        // The compare-with-zero form ignores the Rm field, like hardware
+        // and QEMU do (the ARM ARM marks it should-be-zero).
+        let with_zero = bit(insn, 3);
+        return Some(Instr::FpCompare {
+            ty,
+            rn,
+            rm: if with_zero { None } else { Some(rm) },
+        });
+    }
+
+    // Move immediate.
+    if bits(insn, 12, 10) == 0b100 {
+        if bits(insn, 9, 5) != 0 {
+            return None;
+        }
+        let imm = crate::fp::expand_imm(bits(insn, 20, 13) as u8, ty);
+        return Some(Instr::FpMovImm { ty, imm, rd });
     }
 
     None

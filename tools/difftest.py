@@ -14,6 +14,7 @@ Unicorn is a test-time oracle only; it is not part of the emulator.
 import argparse
 import collections
 import random
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +23,8 @@ from unicorn import (UC_ARCH_ARM64, UC_HOOK_INTR, UC_MODE_ARM, UC_PROT_ALL,
                      Uc, UcError)
 from unicorn import arm64_const
 from unicorn import unicorn_const as uc_const
-from unicorn.arm64_const import (UC_ARM64_REG_NZCV, UC_ARM64_REG_PC,
+from unicorn.arm64_const import (UC_ARM64_REG_FPCR, UC_ARM64_REG_NZCV,
+                                 UC_ARM64_REG_PC, UC_ARM64_REG_Q0,
                                  UC_ARM64_REG_SP, UC_ARM64_REG_X0,
                                  UC_ARM64_REG_X29, UC_ARM64_REG_X30)
 
@@ -53,7 +55,43 @@ CLASSES = [
     ("ld_literal", 0x3F000000, 0x18000000),
     ("ldst_pair", 0x3E000000, 0x28000000),
     ("exclusive", 0x3F000000, 0x08000000),
+    # SIMD&FP loads and stores (V = 1).
+    ("fp_ldst_uimm", 0x3F000000, 0x3D000000),
+    ("fp_ldst_imm9", 0x3F200000, 0x3C000000),
+    ("fp_ldst_regoff", 0x3F200C00, 0x3C200800),
+    ("fp_ld_literal", 0x3F000000, 0x1C000000),
+    ("fp_ldst_pair", 0x3E000000, 0x2C000000),
+    # Scalar floating point.
+    ("fp_3src", 0xFF000000, 0x1F000000),
+    ("fp_1src", 0xFF207C00, 0x1E204000),
+    ("fp_2src", 0xFF200C00, 0x1E200800),
+    ("fp_compare", 0xFF20FC07, 0x1E202000),
+    ("fp_ccmp", 0xFF200C00, 0x1E200400),
+    ("fp_csel", 0xFF200C00, 0x1E200C00),
+    ("fp_imm", 0xFF201FE0, 0x1E201000),
+    ("fp_int_conv", 0x7F20FC00, 0x1E200000),
+    ("fp_fixed_conv", 0x7F200000, 0x1E000000),
+    # Advanced SIMD.
+    ("simd_modimm", 0x9FF80400, 0x0F000400),
+    ("simd_copy", 0x9FE08400, 0x0E000400),
+    ("simd_scalar_copy", 0xFFE0FC00, 0x5E000400),
+    ("simd_scalar_2misc", 0xDF3E0C00, 0x5E200800),
+    ("simd_logical", 0x9F20FC00, 0x0E201C00),
+    ("simd_addsub", 0x9F20FC00, 0x0E208400),
 ]
+
+# Interesting floating-point bit patterns (single, double).
+FP32 = [0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x7F800000, 0xFF800000,
+        0x7FC00000, 0xFFC00000, 0x7FC01234, 0x7F800001, 0xFFA00042, 0x00000001,
+        0x80000001, 0x007FFFFF, 0x00800000, 0x7F7FFFFF, 0x4B000000, 0x3F000000,
+        0x40490FDB, 0x4F000000, 0xCF000000, 0x5F000000, 0x4EFFFFFF, 0x3FC00000]
+FP64 = [0x0, 0x8000000000000000, 0x3FF0000000000000, 0xBFF0000000000000,
+        0x7FF0000000000000, 0xFFF0000000000000, 0x7FF8000000000000, 0xFFF8000000000000,
+        0x7FF8000000001234, 0x7FF0000000000001, 0xFFF4000000000042, 0x1,
+        0x000FFFFFFFFFFFFF, 0x0010000000000000, 0x7FEFFFFFFFFFFFFF, 0x4330000000000000,
+        0x3FE0000000000000, 0x400921FB54442D18, 0x43E0000000000000, 0xC3E0000000000000,
+        0x41DFFFFFFFC00000, 0x3FF8000000000000, 0x3FE8000000000000]
+
 
 
 def pattern(addr):
@@ -80,17 +118,38 @@ def random_reg_value(rng):
     return rng.getrandbits(64)
 
 
+def random_fp_scalar(rng):
+    roll = rng.random()
+    if roll < 0.4:
+        return rng.choice(FP32)
+    if roll < 0.8:
+        return rng.choice(FP64)
+    if roll < 0.9:
+        # A random "ordinary" double, e.g. 123.456.
+        return struct.unpack("<Q", struct.pack("<d", rng.uniform(-1e6, 1e6)))[0]
+    return rng.getrandbits(64)
+
+
+def random_v_value(rng):
+    if rng.random() < 0.25:
+        return rng.getrandbits(128)
+    return random_fp_scalar(rng) | (rng.choice([0, rng.getrandbits(64)]) << 64)
+
+
 def make_case(rng):
     name, mask, value = rng.choice(CLASSES)
     insn = (rng.getrandbits(32) & ~mask) | value
     pc = CODE_BASE + 0x800 + 4 * rng.randrange(-0x100, 0x100)
     nzcv = rng.getrandbits(4) << 28
+    # FPCR: round-to-nearest; DN (default NaN) on in a quarter of cases.
+    fpcr = (1 << 25) if rng.random() < 0.25 else 0
     regs = [random_reg_value(rng) for _ in range(31)]
     sp = DATA_BASE + 0x8000 + 16 * rng.randrange(-0x100, 0x100)
-    return name, insn, pc, nzcv, regs, sp
+    vregs = [random_v_value(rng) for _ in range(32)]
+    return name, insn, pc, nzcv, fpcr, regs, sp, vregs
 
 
-def run_unicorn(insn, pc, nzcv, regs, sp):
+def run_unicorn(insn, pc, nzcv, fpcr, regs, sp, vregs):
     uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
     # Newest CPU model, closest to the Switch 2's ARMv8.2 Cortex-A78C.
     uc.ctl_set_cpu_model(arm64_const.UC_CPU_ARM64_MAX)
@@ -105,6 +164,9 @@ def run_unicorn(insn, pc, nzcv, regs, sp):
     uc.reg_write(UC_ARM64_REG_X30, regs[30])
     uc.reg_write(UC_ARM64_REG_SP, sp)
     uc.reg_write(UC_ARM64_REG_NZCV, nzcv)
+    uc.reg_write(UC_ARM64_REG_FPCR, fpcr)
+    for i in range(32):
+        uc.reg_write(UC_ARM64_REG_Q0 + i, vregs[i])
     uc.reg_write(UC_ARM64_REG_PC, pc)
 
     interrupts = []
@@ -148,8 +210,9 @@ def run_unicorn(insn, pc, nzcv, regs, sp):
         now = bytes(uc.mem_read(base, size))
         if now != init:
             mem_diff += [f"{base + i:x}={now[i]:x}" for i in range(size) if now[i] != init[i]]
+    v_out = [uc.reg_read(UC_ARM64_REG_Q0 + i) for i in range(32)]
     return status, uc.reg_read(UC_ARM64_REG_PC), uc.reg_read(UC_ARM64_REG_NZCV), regs_out, \
-        uc.reg_read(UC_ARM64_REG_SP), mem_diff
+        uc.reg_read(UC_ARM64_REG_SP), v_out, mem_diff
 
 
 def parse_ours(line):
@@ -158,7 +221,7 @@ def parse_ours(line):
     head, _, mem = line.partition("|")
     parts = head.split()
     vals = [int(x, 16) for x in parts[1:]]
-    return parts[0], vals[0], vals[1], vals[2:33], vals[33], mem.split()
+    return parts[0], vals[0], vals[1], vals[2:33], vals[33], vals[34:66], mem.split()
 
 
 def main():
@@ -166,13 +229,17 @@ def main():
     ap.add_argument("--cases", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--show", type=int, default=15, help="mismatches to print")
+    ap.add_argument("--only", default="", help="comma-separated class name prefixes")
     args = ap.parse_args()
+    if args.only:
+        prefixes = tuple(args.only.split(","))
+        CLASSES[:] = [c for c in CLASSES if c[0].startswith(prefixes)]
 
     rng = random.Random(args.seed)
     cases = [make_case(rng) for _ in range(args.cases)]
     stdin = "".join(
-        " ".join(f"{v:x}" for v in [insn, pc, nzcv, *regs, sp]) + "\n"
-        for _, insn, pc, nzcv, regs, sp in cases
+        " ".join(f"{v:x}" for v in [insn, pc, nzcv, fpcr, *regs, sp, *vregs]) + "\n"
+        for _, insn, pc, nzcv, fpcr, regs, sp, vregs in cases
     )
     ours_lines = subprocess.run([str(RUNNER)], input=stdin, capture_output=True,
                                 text=True, check=True).stdout.splitlines()
@@ -180,12 +247,12 @@ def main():
     stats = collections.Counter()
     gaps = collections.Counter()
     shown = 0
-    for (name, insn, pc, nzcv, regs, sp), line in zip(cases, ours_lines):
+    for (name, insn, pc, nzcv, fpcr, regs, sp, vregs), line in zip(cases, ours_lines):
         ours = parse_ours(line)
         if ours is None:
             stats["skipped (unpredictable)"] += 1
             continue
-        theirs = run_unicorn(insn, pc, nzcv, regs, sp)
+        theirs = run_unicorn(insn, pc, nzcv, fpcr, regs, sp, vregs)
         o_status, t_status = ours[0], theirs[0]
 
         if o_status == "unimpl" and t_status == "unimpl":
@@ -217,7 +284,7 @@ def main():
         if shown < args.show:
             shown += 1
             print(f"--- MISMATCH [{name}] insn={insn:08x}")
-            asm = subprocess.run(["llvm-mc", "-triple=aarch64", "-disassemble"],
+            asm = subprocess.run(["llvm-mc", "-triple=aarch64", "-mattr=+all", "-disassemble"],
                                  input=" ".join(f"0x{b:02x}" for b in insn.to_bytes(4, "little")),
                                  capture_output=True, text=True).stdout.strip().splitlines()
             print("    ", asm[-1].strip() if asm else "?")
@@ -226,8 +293,14 @@ def main():
             for i in range(31):
                 if ours[3][i] != theirs[3][i]:
                     print(f"     x{i}: ours={ours[3][i]:x} unicorn={theirs[3][i]:x} (in={regs[i]:x})")
-            if ours[5] != theirs[5]:
-                print(f"     mem ours={ours[5][:8]} unicorn={theirs[5][:8]}")
+            for i in range(32):
+                if ours[5][i] != theirs[5][i]:
+                    print(f"     v{i}: ours={ours[5][i]:032x}\n          unic={theirs[5][i]:032x}"
+                          f"\n          in  ={vregs[i]:032x}")
+            if ours[6] != theirs[6]:
+                print(f"     mem ours={ours[6][:8]} unicorn={theirs[6][:8]}")
+            if fpcr:
+                print("     (FPCR.DN set)")
 
     print()
     for k, v in sorted(stats.items()):

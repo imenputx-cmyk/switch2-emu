@@ -4,6 +4,7 @@
 //! - [`interpreter`] executes them on a [`Cpu`] (see [`Cpu::step`]).
 
 pub mod decoder;
+pub mod fp;
 pub mod interpreter;
 
 pub use emu_memory::{Fault, Memory, Perm};
@@ -55,6 +56,8 @@ pub struct Cpu {
     sp: u64,
     /// Program counter.
     pc: u64,
+    /// SIMD&FP registers V0..V31.
+    v: [u128; 32],
     /// Condition flags.
     pub nzcv: Nzcv,
     pub fpcr: u64,
@@ -78,6 +81,7 @@ impl Default for Cpu {
             x: [0; 31],
             sp: 0,
             pc: 0,
+            v: [0; 32],
             nzcv: Nzcv::default(),
             fpcr: 0,
             fpsr: 0,
@@ -144,6 +148,31 @@ impl Cpu {
 
     pub fn sp(&self) -> u64 {
         self.sp
+    }
+
+    /// Reads a whole 128-bit SIMD&FP register.
+    pub fn read_v(&self, reg: u8) -> u128 {
+        self.v[reg as usize]
+    }
+
+    pub fn write_v(&mut self, reg: u8, value: u128) {
+        self.v[reg as usize] = value;
+    }
+
+    /// Writes a scalar into the low `bytes` of a SIMD&FP register and
+    /// clears the rest, as every scalar write does on AArch64.
+    pub fn write_scalar(&mut self, reg: u8, value: u64, bytes: usize) {
+        let mask = if bytes >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (bytes * 8)) - 1
+        };
+        self.v[reg as usize] = u128::from(value & mask);
+    }
+
+    /// Reads the low 64 bits of a SIMD&FP register.
+    pub fn read_d(&self, reg: u8) -> u64 {
+        self.v[reg as usize] as u64
     }
 }
 

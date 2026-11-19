@@ -1,9 +1,9 @@
 //! Runs single instructions for `tools/difftest.py`.
 //!
 //! Reads one case per line on stdin:
-//!     insn pc nzcv x0 .. x30 sp          (all hex)
+//!     insn pc nzcv fpcr x0 .. x30 sp v0 .. v31          (all hex)
 //! and writes one result per line:
-//!     status pc nzcv x0 .. x30 sp | off=byte off=byte ...
+//!     status pc nzcv x0 .. x30 sp v0 .. v31 | addr=byte addr=byte ...
 //! where the memory part lists bytes that differ from the initial pattern.
 //! `status` is ok, fault, align, unimpl, svc, brk or skip (the instruction
 //! is architecturally UNPREDICTABLE for these operands).
@@ -71,11 +71,11 @@ fn main() {
 
     for line in stdin.lock().lines() {
         let line = line.unwrap();
-        let v: Vec<u64> = line
+        let v: Vec<u128> = line
             .split_whitespace()
-            .map(|s| u64::from_str_radix(s, 16).unwrap())
+            .map(|s| u128::from_str_radix(s, 16).unwrap())
             .collect();
-        assert_eq!(v.len(), 3 + 31 + 1, "bad input line");
+        assert_eq!(v.len(), 4 + 31 + 1 + 32, "bad input line");
         let insn = v[0] as u32;
 
         if unpredictable(decode(insn)) {
@@ -84,15 +84,19 @@ fn main() {
         }
 
         let mut mem = fresh_memory();
-        let pc = v[1];
+        let pc = v[1] as u64;
         mem.write_privileged(pc, &insn.to_le_bytes()).unwrap();
         let mut cpu = Cpu::new();
         cpu.set_pc(pc);
-        cpu.nzcv = Nzcv::from_bits(v[2]);
+        cpu.nzcv = Nzcv::from_bits(v[2] as u64);
+        cpu.fpcr = v[3] as u64;
         for r in 0..31u8 {
-            cpu.write_xzr(r, v[3 + r as usize]);
+            cpu.write_xzr(r, v[4 + r as usize] as u64);
         }
-        cpu.write_sp(31, v[34]);
+        cpu.write_sp(31, v[35] as u64);
+        for r in 0..32u8 {
+            cpu.write_v(r, v[36 + r as usize]);
+        }
 
         let status = match cpu.step(&mut mem) {
             Ok(()) => "ok",
@@ -107,7 +111,11 @@ fn main() {
         for r in 0..31u8 {
             write!(out, " {:x}", cpu.read_xzr(r)).unwrap();
         }
-        write!(out, " {:x} |", cpu.sp()).unwrap();
+        write!(out, " {:x}", cpu.sp()).unwrap();
+        for r in 0..32u8 {
+            write!(out, " {:x}", cpu.read_v(r)).unwrap();
+        }
+        write!(out, " |").unwrap();
 
         // Report bytes that differ from the initial pattern. The instruction
         // word itself is part of the initial state on both sides.
