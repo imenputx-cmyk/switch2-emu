@@ -67,7 +67,7 @@ pub struct Frame {
 }
 
 /// Receives presented frames; returns false to stop the emulation.
-pub type Presenter = Box<dyn FnMut(&Frame) -> bool>;
+pub type Presenter = Box<dyn FnMut(&Frame, &mut hid::InputState) -> bool>;
 
 /// State shared between services.
 #[derive(Default)]
@@ -82,6 +82,11 @@ pub struct System {
     pub on_present: Option<Presenter>,
     /// The host asked to stop.
     pub quit: bool,
+    /// Controller state from the host, sampled into hid shared memory.
+    pub input: hid::InputState,
+    /// The hid shared memory object, once created.
+    pub hid_shared_memory: Option<usize>,
+    pub hid_sampling: u64,
     pub frames: Vec<Frame>,
     pub frames_presented: u64,
 }
@@ -91,7 +96,7 @@ impl System {
         self.frames_presented += 1;
         match self.on_present.as_mut() {
             Some(f) => {
-                if !f(&frame) {
+                if !f(&frame, &mut self.input) {
                     self.quit = true;
                 }
             }

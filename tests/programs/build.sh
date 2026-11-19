@@ -85,5 +85,13 @@ GFX_SRC="services/sm.c services/applet.c services/vi.c services/nv.c \
         -o hb_gfx.elf crt_libnx.S ../homebrew/hb_relocate.c glue.c hb_gfx.c buffer_producer_clang.c \
         $(for f in $GFX_SRC; do echo "$L/source/$f"; done)
     python3 ../../../tools/elf2nro.py hb_gfx.elf ../hb_gfx.nro
-    rm hb_gfx.elf buffer_producer_clang.c
+    # Breakout: the same display stack plus hid and libnx's pad API.
+    clang $(echo "$hb" | sed 's|homebrew/link.ld|../homebrew/link.ld|') \
+        -Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
+        -Iinclude -I"$L/include" -I"$L/include/switch" -I"$L/source" -I"$L/source/display" \
+        -o hb_breakout.elf crt_libnx.S ../homebrew/hb_relocate.c glue.c hb_breakout.c \
+        buffer_producer_clang.c "$L/source/services/hid.c" "$L/source/runtime/pad.c" \
+        $(for f in $GFX_SRC; do echo "$L/source/$f"; done)
+    python3 ../../../tools/elf2nro.py hb_breakout.elf ../hb_breakout.nro
+    rm hb_gfx.elf hb_breakout.elf buffer_producer_clang.c
 )

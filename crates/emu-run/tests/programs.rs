@@ -274,3 +274,69 @@ fn framebuffer_reaches_the_display() {
         }
     }
 }
+
+#[test]
+fn breakout_game_with_input() {
+    // tests/programs/libnx_compat/hb_breakout.c: a small game on the
+    // display path and hid input (libnx pad API). The test is the player:
+    // it holds Right for a while (which also ends the demo mode), then
+    // presses Plus to quit, and checks that the paddle followed.
+    use emu_horizon::services::hid::{button, InputState};
+    use emu_horizon::services::Frame;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const W: usize = 320;
+    const PADDLE_Y: usize = 180 - 180 / 12;
+    // Centre of the white paddle on its row.
+    fn paddle_x(f: &Frame) -> f64 {
+        let row = &f.rgba[PADDLE_Y * W * 4..(PADDLE_Y + 1) * W * 4];
+        let xs: Vec<usize> = (0..W)
+            .filter(|&x| row[x * 4] >= 230 && row[x * 4 + 2] >= 230)
+            .collect();
+        assert!(!xs.is_empty(), "no paddle");
+        xs.iter().sum::<usize>() as f64 / xs.len() as f64
+    }
+    let positions = Rc::new(RefCell::new(Vec::new()));
+    let seen = positions.clone();
+    let player = Box::new(move |f: &Frame, input: &mut InputState| {
+        assert_eq!((f.width, f.height), (320, 180));
+        let mut seen = seen.borrow_mut();
+        seen.push(paddle_x(f));
+        *input = InputState {
+            buttons: match seen.len() {
+                20..=79 => button::RIGHT,
+                120.. => button::PLUS,
+                _ => 0,
+            },
+            ..Default::default()
+        };
+        true
+    });
+    let r = emu_run::run_nro_presenting(
+        &program("hb_breakout.nro"),
+        500_000_000,
+        false,
+        Default::default(),
+        Some(player),
+    )
+    .expect("boots");
+    assert_eq!(
+        r.stop,
+        emu_horizon::Stop::ReturnedToLoader(0),
+        "{:?}",
+        String::from_utf8_lossy(&r.debug_output)
+    );
+    let out = String::from_utf8(r.debug_output).unwrap();
+    assert!(out.starts_with("breakout: score "), "{out}");
+    let p = positions.borrow();
+    assert!(
+        (120..130).contains(&p.len()),
+        "quit after {} frames",
+        p.len()
+    );
+    // Holding Right drives the paddle to the right wall.
+    let right_wall = (W - 320 / 7 / 2) as f64;
+    assert!(p[18] < right_wall - 40.0, "{}", p[18]);
+    assert!((p[85] - right_wall).abs() < 2.0, "{}", p[85]);
+}

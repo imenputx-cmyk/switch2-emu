@@ -529,6 +529,7 @@ impl Horizon {
     /// Picks the next thread to run (round-robin after the current one)
     /// and makes it current. Advances the clock if all threads sleep.
     pub(crate) fn schedule(&mut self, pc: u64) -> Result<(), Stop> {
+        self.sample_input();
         loop {
             self.expire_timeouts();
             let n = self.threads.len();
@@ -558,6 +559,28 @@ impl Horizon {
                 Some(d) => self.cpu.counter = self.cpu.counter.max(d),
                 None => return Err(Stop::Deadlock { pc }),
             }
+        }
+    }
+
+    /// Writes a new controller sample to hid shared memory every 4 ms of
+    /// guest time, like the hid sysmodule.
+    fn sample_input(&mut self) {
+        const PERIOD: u64 = 19_200_000 / 250;
+        let Some(id) = self.system.hid_shared_memory else {
+            return;
+        };
+        let Some(base) = self.kobjects.shared_memory[id].mapped_at else {
+            return;
+        };
+        let due = self.cpu.counter / PERIOD;
+        if due <= self.last_input_sample {
+            return;
+        }
+        self.last_input_sample = due;
+        let sampling = self.system.hid_sampling;
+        self.system.hid_sampling += 1;
+        for (off, bytes) in crate::services::hid::sample_writes(sampling, &self.system.input) {
+            let _ = self.mem.write_privileged(base + off as u64, &bytes);
         }
     }
 

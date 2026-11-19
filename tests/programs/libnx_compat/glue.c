@@ -40,7 +40,7 @@ char *strncpy(char *d, const char *s, size_t n) {
     for (; i < n; i++) d[i] = 0;
     return d;
 }
-char *strcpy(char *d, const char *s) { char *r = d; while ((*d++ = *s++)); return r; }
+char *strcpy(char *d, const char *s) { char *r = d; while ((*d++ = *s++)) {} return r; }
 char *strchr(const char *s, int c) { for (;; s++) { if (*s == (char)c) return (char *)s; if (!*s) return 0; } }
 
 /* Bump allocator over a heap region set up by hb_libnx.c. */

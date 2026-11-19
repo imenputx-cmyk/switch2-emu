@@ -7,7 +7,7 @@ fn main() -> ExitCode {
     let trace = args.iter().any(|a| a == "--trace-svc");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
         eprintln!(
-            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] <program.elf | homebrew.nro>\n\
+            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] <program.elf | homebrew.nro>\n\
              (built with --features window, frames are shown in a window unless --frames is given)"
         );
         return ExitCode::from(2);
@@ -37,11 +37,14 @@ fn main() -> ExitCode {
         let _ = dump_frames;
         // With a window the program runs until it exits or the window
         // closes; otherwise stop after 10^10 instructions.
-        let limit = if presenter.is_some() {
-            u64::MAX
-        } else {
-            10_000_000_000
-        };
+        let limit = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--steps=")?.parse().ok())
+            .unwrap_or(if presenter.is_some() {
+                u64::MAX
+            } else {
+                10_000_000_000
+            });
         return match emu_run::run_nro_presenting(&elf, limit, trace, config, presenter) {
             Ok(r) => {
                 std::io::stdout().write_all(&r.debug_output).unwrap();

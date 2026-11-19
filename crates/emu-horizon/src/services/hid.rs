@@ -1,7 +1,7 @@
 //! `hid`: input. The client reads controller state from a 0x40000-byte
 //! shared memory block (layout in libnx's `hidshmem.h`); commands turn
-//! input devices on and configure the controllers. So far the block is
-//! left zeroed: no input.
+//! input devices on and configure the controllers. The emulator writes
+//! the host's controller state (`System::input`) into it periodically.
 
 use super::{obj, CallError, Ctx, Service};
 use crate::handles::KObject;
@@ -23,8 +23,10 @@ impl Service for Hid {
             0 => {
                 // CreateAppletResource
                 let id = *self.shared_memory.get_or_insert_with(|| {
-                    ctx.kernel.new_shared_memory(SHARED_MEMORY_SIZE, Vec::new())
+                    ctx.kernel
+                        .new_shared_memory(SHARED_MEMORY_SIZE, initial_shared_memory())
                 });
+                ctx.system.hid_shared_memory = Some(id);
                 ctx.push_object(obj(AppletResource { shared_memory: id }));
             }
             // Activate{DebugPad,TouchScreen,Mouse,Keyboard,Npad},
@@ -56,4 +58,98 @@ impl Service for AppletResource {
         }
         Ok(())
     }
+}
+
+/// Controller state set by the host front end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputState {
+    /// `HidNpadButton_*` bits.
+    pub buttons: u64,
+    /// Analog sticks, -32767..=32767 per axis (y up).
+    pub stick_l: (i32, i32),
+    pub stick_r: (i32, i32),
+}
+
+pub mod button {
+    pub const A: u64 = 1 << 0;
+    pub const B: u64 = 1 << 1;
+    pub const X: u64 = 1 << 2;
+    pub const Y: u64 = 1 << 3;
+    pub const L: u64 = 1 << 6;
+    pub const R: u64 = 1 << 7;
+    pub const PLUS: u64 = 1 << 10;
+    pub const MINUS: u64 = 1 << 11;
+    pub const LEFT: u64 = 1 << 12;
+    pub const UP: u64 = 1 << 13;
+    pub const RIGHT: u64 = 1 << 14;
+    pub const DOWN: u64 = 1 << 15;
+}
+
+// Shared memory layout (libnx hidshmem.h, ISC; offsets computed from its
+// structs for AArch64): npad entries start at 0x9A00, 0x5000 bytes each;
+// entry 0 is player 1 (a Pro Controller here), entry 8 handheld mode.
+const NPAD: usize = 0x9A00;
+const NPAD_ENTRY: usize = 0x5000;
+const STYLE_SET: usize = 0x0;
+const FULL_KEY_LIFO: usize = 0x28;
+const HANDHELD_LIFO: usize = 0x378;
+const DEVICE_TYPE: usize = 0x4188;
+/// A lifo: header (unused, buffer count, tail, count: u64 each), then
+/// 17 entries of 0x30 bytes: sampling number, then the state (sampling
+/// number, buttons, left stick, right stick, attributes).
+const LIFO_ENTRIES: u64 = 17;
+const LIFO_STORAGE: usize = 0x20;
+const LIFO_ENTRY: usize = 0x30;
+
+const STYLE_FULL_KEY: u32 = 1 << 0;
+const STYLE_HANDHELD: u32 = 1 << 1;
+const DEVICE_FULL_KEY: u32 = 1 << 0;
+const DEVICE_HANDHELD: u32 = (1 << 2) | (1 << 3);
+const ATTR_CONNECTED: u32 = 1 << 0;
+
+/// The initial shared memory: player 1 and handheld connected.
+pub fn initial_shared_memory() -> Vec<u8> {
+    let mut m = vec![0u8; SHARED_MEMORY_SIZE as usize];
+    for (entry, style, device) in [
+        (0, STYLE_FULL_KEY, DEVICE_FULL_KEY),
+        (8, STYLE_HANDHELD, DEVICE_HANDHELD),
+    ] {
+        let base = NPAD + entry * NPAD_ENTRY;
+        m[base + STYLE_SET..base + STYLE_SET + 4].copy_from_slice(&style.to_le_bytes());
+        m[base + DEVICE_TYPE..base + DEVICE_TYPE + 4].copy_from_slice(&device.to_le_bytes());
+    }
+    m
+}
+
+/// Bytes to write for one input sample: (shared memory offset, data).
+pub fn sample_writes(sampling: u64, input: &InputState) -> Vec<(usize, Vec<u8>)> {
+    let mut state = Vec::with_capacity(LIFO_ENTRY);
+    state.extend_from_slice(&sampling.to_le_bytes());
+    state.extend_from_slice(&sampling.to_le_bytes());
+    state.extend_from_slice(&input.buttons.to_le_bytes());
+    for v in [
+        input.stick_l.0,
+        input.stick_l.1,
+        input.stick_r.0,
+        input.stick_r.1,
+    ] {
+        state.extend_from_slice(&v.to_le_bytes());
+    }
+    state.extend_from_slice(&ATTR_CONNECTED.to_le_bytes());
+    state.resize(LIFO_ENTRY, 0);
+    let tail = sampling % LIFO_ENTRIES;
+    let count = (sampling + 1).min(LIFO_ENTRIES);
+    let mut out = Vec::new();
+    for lifo in [NPAD + FULL_KEY_LIFO, NPAD + 8 * NPAD_ENTRY + HANDHELD_LIFO] {
+        out.push((
+            lifo + LIFO_STORAGE + tail as usize * LIFO_ENTRY,
+            state.clone(),
+        ));
+        let mut header = Vec::with_capacity(32);
+        for v in [0, LIFO_ENTRIES, tail, count] {
+            header.extend_from_slice(&v.to_le_bytes());
+        }
+        out.push((lifo, header));
+    }
+    out
 }
