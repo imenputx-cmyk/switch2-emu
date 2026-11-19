@@ -159,35 +159,59 @@ IPC test done
 }
 
 #[test]
-fn libnx_application_startup() {
+fn libnx_application_startup_and_sd_card() {
     // tests/programs/libnx_compat/hb_libnx.c links libnx's own service
     // clients (built from source), so this is the full IPC sequence of a
     // libnx application's startup: apm, appletOE and its proxies (events,
     // focus state), hid (shared memory), time:u (clocks read from shared
-    // memory), fsp-srv (domain + cloned sessions).
-    let r = emu_run::run_nro(&program("hb_libnx.nro"), 10_000_000, false).expect("boots");
+    // memory), fsp-srv (domain + cloned sessions). Then it uses the SD
+    // card, which is a host directory. FS results: 0x402 PathAlreadyExists,
+    // 0x202 PathNotFound, 0x2EE202 InvalidPath.
+    let sd = std::env::temp_dir().join(format!("switch2-emu-sd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sd);
+    std::fs::create_dir_all(sd.join("games")).unwrap();
+    std::fs::write(sd.join("hello.txt"), "hello from the host SD card\n").unwrap();
+    let config = emu_horizon::services::Config {
+        sdmc_root: Some(sd.clone()),
+        boot_time: Some(1_800_000_000),
+    };
+    let r =
+        emu_run::run_nro_with(&program("hb_libnx.nro"), 10_000_000, false, config).expect("boots");
+    let written = std::fs::read_to_string(sd.join("save/data.bin"));
+    std::fs::remove_dir_all(&sd).unwrap();
     assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0));
-    let out = String::from_utf8(r.debug_output).unwrap();
-    let mut lines = out.lines();
-    for expected in [
-        "hosversion = 0x150000",
-        "svcSetHeapSize = 0x0",
-        "smInitialize = 0x0",
-        "appletInitialize = 0x0",
-        "hidInitialize = 0x0",
-        "timeInitialize = 0x0",
-        "fsInitialize = 0x0",
-        "applet type = 0x0",
-        "timeGetCurrentTime = 0x0",
-    ] {
-        assert_eq!(lines.next(), Some(expected));
-    }
-    // The clock follows the host: any time after 2025 is fine.
-    let time = lines
-        .next()
-        .unwrap()
-        .strip_prefix("posix time = 0x")
-        .unwrap();
-    assert!(u64::from_str_radix(time, 16).unwrap() > 1_735_689_600);
-    assert_eq!(lines.next(), Some("fsOpenSdCardFileSystem = 0x0"));
+    let expected = "\
+hosversion = 0x150000
+svcSetHeapSize = 0x0
+smInitialize = 0x0
+appletInitialize = 0x0
+hidInitialize = 0x0
+timeInitialize = 0x0
+fsInitialize = 0x0
+applet type = 0x0
+timeGetCurrentTime = 0x0
+posix time = 0x6b49d200
+fsOpenSdCardFileSystem = 0x0
+OpenFile(/hello.txt) = 0x0
+Read = 0x0
+contents: hello from the host SD card
+CreateDirectory = 0x0
+CreateFile = 0x0
+CreateFile again = 0x402
+OpenFile(rw+append) = 0x0
+Write = 0x0
+GetSize = 0x0
+size = 0x10
+Read back = 0x0
+tail: by libnx
+OpenDirectory = 0x0
+ReadDirectory = 0x0
+  dir  games
+  file hello.txt
+  dir  save
+OpenDirectory(/../escape) = 0x2ee202
+OpenFile(/missing.txt) = 0x202
+";
+    assert_eq!(String::from_utf8(r.debug_output).unwrap(), expected);
+    assert_eq!(written.unwrap(), "written by libnx");
 }

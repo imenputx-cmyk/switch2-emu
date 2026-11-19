@@ -51,6 +51,17 @@ pub struct Ctx<'a> {
     pub kernel: &'a mut KernelObjects,
     /// The current system tick (19.2 MHz), for clocks.
     pub tick: u64,
+    pub config: &'a Config,
+}
+
+/// Host-side settings that services need.
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    /// Host directory that backs the SD card. Without one, opening the
+    /// SD card fails like a missing card.
+    pub sdmc_root: Option<std::path::PathBuf>,
+    /// POSIX time at boot for the clocks; `None` uses the host clock.
+    pub boot_time: Option<i64>,
 }
 
 impl Ctx<'_> {
@@ -132,15 +143,20 @@ pub trait Service {
 }
 
 /// Creates the service registered under `name`, if it is implemented.
-pub fn create(name: &str) -> Option<ServiceRef> {
+pub fn create(name: &str, config: &Config) -> Option<ServiceRef> {
     Some(match name {
         "sm:" => Rc::new(RefCell::new(sm::ServiceManager)),
         "set:sys" => Rc::new(RefCell::new(set::SystemSettings)),
         "apm" | "apm:p" => Rc::new(RefCell::new(apm::Manager)),
         "appletOE" => Rc::new(RefCell::new(am::AppletOE)),
         "hid" => Rc::new(RefCell::new(hid::Hid::default())),
-        "time:u" | "time:a" | "time:s" => Rc::new(RefCell::new(time::StaticService::default())),
-        "fsp-srv" => Rc::new(RefCell::new(fs::FileSystemProxy)),
+        "time:u" | "time:a" | "time:s" => Rc::new(RefCell::new(match config.boot_time {
+            Some(t) => time::StaticService::with_boot_time(t),
+            None => time::StaticService::default(),
+        })),
+        "fsp-srv" => Rc::new(RefCell::new(fs::FileSystemProxy {
+            sdmc_root: config.sdmc_root.clone(),
+        })),
         _ => return None,
     })
 }

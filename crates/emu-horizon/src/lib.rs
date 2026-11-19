@@ -142,6 +142,7 @@ pub struct Horizon {
     sessions: Vec<Session>,
     /// Events and shared memory created by services.
     pub kobjects: kobjects::KernelObjects,
+    pub config: services::Config,
     /// Log of SVC calls, for diagnostics.
     pub trace_svcs: bool,
 }
@@ -168,6 +169,7 @@ impl Horizon {
             debug_output: Vec::new(),
             sessions: Vec::new(),
             kobjects: kobjects::KernelObjects::default(),
+            config: services::Config::default(),
             trace_svcs: false,
         }
     }
@@ -723,7 +725,7 @@ impl Horizon {
         if name != "sm:" {
             return self.ret(NOT_FOUND);
         }
-        let service = services::create(&name).expect("sm: exists");
+        let service = services::create(&name, &self.config).expect("sm: exists");
         match self.new_session(service) {
             Some(h) => {
                 self.ret(SUCCESS);
@@ -858,6 +860,7 @@ impl Horizon {
             out_copy: Vec::new(),
             kernel: &mut self.kobjects,
             tick: self.cpu.counter,
+            config: &self.config,
         };
         let outcome = object.borrow_mut().call(req.command, &mut ctx);
         let services::Ctx {

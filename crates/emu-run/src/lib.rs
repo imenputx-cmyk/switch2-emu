@@ -129,8 +129,24 @@ pub struct HomebrewResult {
 }
 
 pub fn run_nro(nro: &[u8], max_steps: u64, trace_svcs: bool) -> Result<HomebrewResult, RunError> {
+    run_nro_with(
+        nro,
+        max_steps,
+        trace_svcs,
+        emu_horizon::services::Config::default(),
+    )
+}
+
+/// Like [`run_nro`], with host settings (SD card directory, clock).
+pub fn run_nro_with(
+    nro: &[u8],
+    max_steps: u64,
+    trace_svcs: bool,
+    config: emu_horizon::services::Config,
+) -> Result<HomebrewResult, RunError> {
     let mut hos = emu_horizon::Horizon::new();
     hos.trace_svcs = trace_svcs;
+    hos.config = config;
     hos.boot_homebrew(nro).map_err(RunError::Load)?;
     let stop = hos.run(max_steps);
     Ok(HomebrewResult {

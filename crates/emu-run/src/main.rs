@@ -6,7 +6,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let trace = args.iter().any(|a| a == "--trace-svc");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
-        eprintln!("usage: emu-run [--trace-svc] <program.elf | homebrew.nro>");
+        eprintln!("usage: emu-run [--trace-svc] [--sdmc=DIR] <program.elf | homebrew.nro>");
         return ExitCode::from(2);
     };
     let elf = match std::fs::read(&path) {
@@ -18,7 +18,14 @@ fn main() -> ExitCode {
     };
     let start = Instant::now();
     if emu_loader::nro::is_nro(&elf) {
-        return match emu_run::run_nro(&elf, 1_000_000_000, trace) {
+        let config = emu_horizon::services::Config {
+            sdmc_root: args
+                .iter()
+                .find_map(|a| a.strip_prefix("--sdmc="))
+                .map(Into::into),
+            boot_time: None,
+        };
+        return match emu_run::run_nro_with(&elf, 1_000_000_000, trace, config) {
             Ok(r) => {
                 std::io::stdout().write_all(&r.debug_output).unwrap();
                 let secs = start.elapsed().as_secs_f64();
