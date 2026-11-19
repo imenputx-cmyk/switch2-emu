@@ -1,8 +1,19 @@
 //! Guest CPU state for the AArch64 (ARMv8-A) core.
 //!
-//! This crate starts with the architectural register file only. The
-//! instruction decoder and interpreter are added next, checked against the
-//! ARM Architecture Reference Manual.
+//! - [`decoder`] turns 32-bit instruction words into [`decoder::Instr`].
+//! - [`interpreter`] executes them on a [`Cpu`] (see [`Cpu::execute`]).
+
+pub mod decoder;
+pub mod interpreter;
+
+/// Condition flags (PSTATE.NZCV).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Nzcv {
+    pub n: bool,
+    pub z: bool,
+    pub c: bool,
+    pub v: bool,
+}
 
 /// Index used for register 31, which means `XZR` (zero register) in most
 /// instructions and `SP` in others. The caller decides which one applies.
@@ -17,6 +28,8 @@ pub struct Cpu {
     sp: u64,
     /// Program counter.
     pc: u64,
+    /// Condition flags.
+    pub nzcv: Nzcv,
 }
 
 impl Cpu {
