@@ -6,8 +6,8 @@
 //! vector forms with the selected element broadcast into the second
 //! operand, and scalar forms as one-lane vector forms.
 //!
-//! Saturating instructions set FPSR.QC. Half precision lanes are not
-//! implemented yet.
+//! Saturating instructions set FPSR.QC. Floating-point lanes may be half,
+//! single or double precision.
 
 use crate::fp::{self, BinOp, Fp, FpType, Rounding};
 use crate::Cpu;
@@ -319,6 +319,19 @@ impl Simd {
 /// Decodes the Advanced SIMD data-processing groups not handled in
 /// `decoder.rs`.
 pub fn decode(insn: u32) -> Option<Simd> {
+    // Half-precision groups.
+    if insn & 0x9F60_C400 == 0x0E40_0400 {
+        return fp16_three_same(insn, false);
+    }
+    if insn & 0xDF60_C400 == 0x5E40_0400 {
+        return fp16_three_same(insn, true);
+    }
+    if insn & 0x9F7E_0C00 == 0x0E78_0800 {
+        return fp16_two_reg_misc(insn, false);
+    }
+    if insn & 0xDF7E_0C00 == 0x5E78_0800 {
+        return fp16_two_reg_misc(insn, true);
+    }
     if insn & 0x9F20_0400 == 0x0E20_0400 {
         return three_same(insn, false);
     }
@@ -395,6 +408,33 @@ fn three_same(insn: u32, scalar: bool) -> Option<Simd> {
         if !scalar && esize == 3 && !q {
             return None;
         }
+        let op = fp_three_same_op(u, a, opcode, scalar)?;
+        let s = Simd::new(op, insn, esize);
+        return Some(if scalar { s.scalar() } else { s });
+    }
+    int_three_same(insn, scalar, u, q, size, opcode)
+}
+
+fn fp16_three_same(insn: u32, scalar: bool) -> Option<Simd> {
+    let op = fp_three_same_op(
+        bit(insn, 29),
+        bit(insn, 23),
+        0b11000 | bits(insn, 13, 11),
+        scalar,
+    )?;
+    let s = Simd::new(op, insn, 1);
+    Some(if scalar { s.scalar() } else { s })
+}
+
+fn fp16_two_reg_misc(insn: u32, scalar: bool) -> Option<Simd> {
+    let op = fp_two_reg_op(bit(insn, 29), bit(insn, 23), bits(insn, 16, 12), scalar)?;
+    let s = Simd::new(op, insn, 1);
+    Some(if scalar { s.scalar() } else { s })
+}
+
+/// Floating-point three-same operations, shared by every precision.
+fn fp_three_same_op(u: bool, a: bool, opcode: u32, scalar: bool) -> Option<Op> {
+    {
         let op = match (u, a, opcode) {
             (false, false, 0b11000) if !scalar => Op::FArith(BinOp::MaxNum),
             (false, false, 0b11001) if !scalar => Op::FMla { sub: false },
@@ -422,10 +462,18 @@ fn three_same(insn: u32, scalar: bool) -> Option<Simd> {
             (true, true, 0b11110) if !scalar => Op::FPairwise(BinOp::Min),
             _ => return None,
         };
-        let s = Simd::new(op, insn, esize);
-        return Some(if scalar { s.scalar() } else { s });
+        Some(op)
     }
+}
 
+fn int_three_same(
+    insn: u32,
+    scalar: bool,
+    u: bool,
+    q: bool,
+    size: u32,
+    opcode: u32,
+) -> Option<Simd> {
     // Integer. `wide_ok`: the operation exists for 64-bit elements.
     let (op, wide_ok) = match (u, opcode) {
         (_, 0b00000) if !scalar => (
@@ -647,7 +695,20 @@ fn two_reg_misc(insn: u32, scalar: bool) -> Option<Simd> {
     let fe = fp_esize(size);
 
     // Floating-point forms: opcode 0b01100.. with a = 1, or 0b10110.. .
-    let fp_op = match (u, a, opcode) {
+    let fp_op = fp_two_reg_op(u, a, opcode, scalar);
+    if let Some(op) = fp_op {
+        if !scalar && fe == 3 && !q {
+            return None;
+        }
+        let s = Simd::new(op, insn, fe);
+        return Some(if scalar { s.scalar() } else { s });
+    }
+    int_two_reg_misc(insn, scalar, u, q, size, opcode, a, fe)
+}
+
+/// Floating-point two-register misc operations, shared by every precision.
+fn fp_two_reg_op(u: bool, a: bool, opcode: u32, scalar: bool) -> Option<Op> {
+    match (u, a, opcode) {
         (false, true, 0b01100) => Some(Op::FCompareZero(FCmp::Gt)),
         (false, true, 0b01101) => Some(Op::FCompareZero(FCmp::Eq)),
         (false, true, 0b01110) => Some(Op::FCompareZero(FCmp::Lt)),
@@ -688,15 +749,20 @@ fn two_reg_misc(insn: u32, scalar: bool) -> Option<Simd> {
         (true, true, 0b11101) => Some(Op::FRsqrte),
         (false, true, 0b11111) if scalar => Some(Op::FRecpx),
         _ => None,
-    };
-    if let Some(op) = fp_op {
-        if !scalar && fe == 3 && !q {
-            return None;
-        }
-        let s = Simd::new(op, insn, fe);
-        return Some(if scalar { s.scalar() } else { s });
     }
+}
 
+#[allow(clippy::too_many_arguments)]
+fn int_two_reg_misc(
+    insn: u32,
+    scalar: bool,
+    u: bool,
+    q: bool,
+    size: u32,
+    opcode: u32,
+    a: bool,
+    fe: u8,
+) -> Option<Simd> {
     // Narrowing/widening FP conversions.
     match (u, opcode) {
         (false, 0b10110) if !scalar && !a => {
@@ -787,9 +853,9 @@ fn across_lanes(insn: u32) -> Option<Simd> {
     let q = bit(insn, 30);
     let size = bits(insn, 23, 22);
     let opcode = bits(insn, 16, 12);
-    if u && (opcode == 0b01100 || opcode == 0b01111) {
-        // FP reductions over 4 singles (FP16 forms have U = 0).
-        if size & 1 != 0 || !q {
+    if opcode == 0b01100 || opcode == 0b01111 {
+        // FP reductions: U = 1 over 4 singles, U = 0 over halves.
+        if size & 1 != 0 || (u && !q) {
             return None;
         }
         let max = size >> 1 == 0;
@@ -797,7 +863,7 @@ fn across_lanes(insn: u32) -> Option<Simd> {
             max,
             num: opcode == 0b01100,
         };
-        return Some(Simd::new(op, insn, 2));
+        return Some(Simd::new(op, insn, if u { 2 } else { 1 }));
     }
     let op = match (u, opcode) {
         (_, 0b00011) => Op::AddLongV { unsigned: u },
@@ -822,12 +888,15 @@ fn scalar_pairwise(insn: u32) -> Option<Simd> {
     let u = bit(insn, 29);
     let size = bits(insn, 23, 22);
     let opcode = bits(insn, 16, 12);
-    if !u {
-        return if opcode == 0b11011 && size == 3 {
+    if !u && opcode == 0b11011 {
+        return if size == 3 {
             Some(Simd::new(Op::Addp, insn, 3).scalar())
         } else {
             None
         };
+    }
+    if !u && size & 1 != 0 {
+        return None;
     }
     let a = size >> 1 == 1;
     let op = match (a, opcode) {
@@ -838,7 +907,9 @@ fn scalar_pairwise(insn: u32) -> Option<Simd> {
         (true, 0b01111) => BinOp::Min,
         _ => return None,
     };
-    Some(Simd::new(Op::FPairwise(op), insn, fp_esize(size)).scalar())
+    // U = 0 selects half precision.
+    let esize = if u { fp_esize(size) } else { 1 };
+    Some(Simd::new(Op::FPairwise(op), insn, esize).scalar())
 }
 
 fn permute(insn: u32) -> Option<Simd> {
@@ -974,8 +1045,8 @@ fn shift_imm(insn: u32, scalar: bool) -> Option<Simd> {
             false,
         ),
         (_, 0b11100) | (_, 0b11111) => {
-            // Fixed-point conversions: single or double precision only.
-            if esize < 2 {
+            // Fixed-point conversions: half, single or double precision.
+            if esize < 1 {
                 return None;
             }
             let op = if opcode == 0b11100 {
@@ -1009,11 +1080,26 @@ fn by_element(insn: u32, scalar: bool) -> Option<Simd> {
 
     let is_fp = matches!((u, opcode), (false, 0b0001) | (false, 0b0101) | (_, 0b1001));
     if is_fp {
-        if size >> 1 == 0 {
-            return None; // Half precision (size 00) or unallocated (01).
+        if size == 0b01 {
+            return None;
         }
-        let double = size & 1 == 1;
-        let (index, esize) = if double {
+        let double = size == 0b11;
+        let (index, esize) = if size == 0b00 {
+            // Half precision: H:L:M index, Rm limited to V0-V15.
+            let mut s = Simd::new(
+                match (u, opcode) {
+                    (false, 0b0001) => Op::FMla { sub: false },
+                    (false, 0b0101) => Op::FMla { sub: true },
+                    (false, 0b1001) => Op::FArith(BinOp::Mul),
+                    _ => Op::FMulx,
+                },
+                insn,
+                1,
+            );
+            s.rm = rm4 as u8;
+            s.index = Some((h << 2) | (l << 1) | m);
+            return Some(if scalar { s.scalar() } else { s });
+        } else if double {
             if l == 1 || (!scalar && !q) {
                 return None;
             }
@@ -1150,10 +1236,10 @@ fn broadcast(elem: u64, esize: u8) -> u128 {
 }
 
 fn fp_type(esize: u8) -> FpType {
-    if esize == 3 {
-        FpType::Double
-    } else {
-        FpType::Single
+    match esize {
+        1 => FpType::Half,
+        2 => FpType::Single,
+        _ => FpType::Double,
     }
 }
 
@@ -1595,17 +1681,19 @@ impl Cpu {
                 u128::from(best)
             }
             Op::FMaxMinV { max, num } => {
-                let fp = Fp::new(FpType::Single, self.fpcr);
+                let fp = Fp::new(fp_type(e), self.fpcr);
                 let op = match (max, num) {
                     (true, false) => BinOp::Max,
                     (false, false) => BinOp::Min,
                     (true, true) => BinOp::MaxNum,
                     (false, true) => BinOp::MinNum,
                 };
-                // `Reduce()`: pairwise tree, lower half first.
-                let lo = fp.binop(op, get(n, 2, 0), get(n, 2, 1));
-                let hi = fp.binop(op, get(n, 2, 2), get(n, 2, 3));
-                u128::from(fp.binop(op, lo, hi))
+                // `Reduce()`: a pairwise tree, lower half first.
+                let mut vals: Vec<u64> = (0..count).map(|i| get(n, e, i)).collect();
+                while vals.len() > 1 {
+                    vals = vals.chunks(2).map(|p| fp.binop(op, p[0], p[1])).collect();
+                }
+                u128::from(vals[0])
             }
 
             // ---- permute, extract, table ----

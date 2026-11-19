@@ -108,5 +108,25 @@ int main(void) {
         print_u64(dot[i]);
     }
     print("\n");
+
+    /* Half precision: scalar _Float16 and FP16 vectors. */
+    static volatile int terms = 20;
+    _Float16 harmonic = 0;
+    for (int i = 1; i <= terms; i++) harmonic += (_Float16)1 / (_Float16)i;
+    print("harmonic(20) in fp16 = ");
+    print_f64((double)harmonic);
+    print("\n");
+
+    float32x4_t f = {0.1f, 1000.3f, -65519.0f, 1e-7f};
+    float16x4_t h = vcvt_f16_f32(f); /* round to half (65519 -> 65504, 1e-7 -> denormal) */
+    float16x8_t hv = vcombine_f16(h, h);
+    hv = vfmaq_f16(hv, hv, vdupq_n_f16((float16_t)0.5)); /* x + x * 0.5 */
+    float32x4_t back = vcvt_f32_f16(vget_high_f16(hv));
+    print("fp16 fma        =");
+    for (int i = 0; i < 4; i++) {
+        print(" ");
+        print_f64(back[i]);
+    }
+    print("\n");
     return 0;
 }

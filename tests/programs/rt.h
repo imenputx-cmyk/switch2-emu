@@ -77,6 +77,34 @@ static void print_hex(u64 v) {
     print(buf);
 }
 
+/* Prints a double with 6 decimals, using only integer formatting. */
+static void print_f64(double v) {
+    if (v != v) {
+        print("nan");
+        return;
+    }
+    if (v < 0) {
+        print("-");
+        v = -v;
+    }
+    if (v > 1.8e19) {
+        print("inf");
+        return;
+    }
+    u64 whole = (u64)v;
+    u64 frac = (u64)((v - (double)whole) * 1000000.0 + 0.5);
+    if (frac >= 1000000) {
+        whole++;
+        frac -= 1000000;
+    }
+    print_u64(whole);
+    print(".");
+    for (u64 d = 100000; d > 0; d /= 10) {
+        char c = (char)('0' + (frac / d) % 10);
+        sys_write(&c, 1);
+    }
+}
+
 int main(void);
 
 __attribute__((section(".text.start"))) void _start(void) { sys_exit((u64)main()); }

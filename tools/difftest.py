@@ -97,10 +97,17 @@ CLASSES = [
     ("simd_shift_imm", 0x9F800400, 0x0F000400),
     ("simd_shift_imm_scalar", 0xDF800400, 0x5F000400),
     ("simd_elem", 0x9F000400, 0x0F000000),
-    ("simd_elem_scalar", 0xDF000400, 0x5F000000),
+        ("simd_elem_scalar", 0xDF000400, 0x5F000000),
+    ("fp16_3same", 0x9F60C400, 0x0E400400),
+    ("fp16_3same_scalar", 0xDF60C400, 0x5E400400),
+    ("fp16_2misc", 0x9F7E0C00, 0x0E780800),
+    ("fp16_2misc_scalar", 0xDF7E0C00, 0x5E780800),
 ]
 
-# Interesting floating-point bit patterns (single, double).
+# Interesting floating-point bit patterns (half, single, double).
+FP16 = [0x0000, 0x8000, 0x3C00, 0xBC00, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7E12,
+        0x7C01, 0xFD00, 0x0001, 0x8001, 0x03FF, 0x0400, 0x7BFF, 0x6400, 0x3800,
+        0x4248, 0x5BFF, 0x3E00, 0x3555]
 FP32 = [0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x7F800000, 0xFF800000,
         0x7FC00000, 0xFFC00000, 0x7FC01234, 0x7F800001, 0xFFA00042, 0x00000001,
         0x80000001, 0x007FFFFF, 0x00800000, 0x7F7FFFFF, 0x4B000000, 0x3F000000,
@@ -140,6 +147,9 @@ def random_reg_value(rng):
 
 def random_fp_scalar(rng):
     roll = rng.random()
+    if roll < 0.15:
+        # Lanes of halves: four values, so every lane gets something useful.
+        return sum(rng.choice(FP16) << (16 * i) for i in range(4))
     if roll < 0.4:
         return rng.choice(FP32)
     if roll < 0.8:
@@ -267,6 +277,38 @@ def check_smax_smin(insn, regs, sp, ours):
     return ours[0] == "ok" and ours[3] == expected_regs and ours[6] == expected_mem
 
 
+def run_unicorn_isolated(*case):
+    """Runs Unicorn in a forked child. Some unallocated FP16 encodings hit
+    an assertion inside Unicorn's QEMU ("code should not be reached") that
+    aborts the whole process."""
+    import os
+    import pickle
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        try:
+            data = pickle.dumps(run_unicorn(*case))
+        except BaseException:  # noqa: BLE001 - report any failure as a crash
+            data = b""
+        os.write(w, data)
+        os._exit(0)
+    os.close(w)
+    chunks = []
+    while True:
+        chunk = os.read(r, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(r)
+    os.waitpid(pid, 0)
+    data = b"".join(chunks)
+    return pickle.loads(data) if data else ("qemu-crash",)
+
+
 def parse_ours(line):
     if line == "skip":
         return None
@@ -304,7 +346,13 @@ def main():
         if ours is None:
             stats["skipped (unpredictable)"] += 1
             continue
-        theirs = run_unicorn(insn, pc, nzcv, fpcr, regs, sp, vregs)
+        if name.startswith("fp16"):
+            theirs = run_unicorn_isolated(insn, pc, nzcv, fpcr, regs, sp, vregs)
+            if theirs[0] == "qemu-crash":
+                stats["Unicorn crashed" + (" (we reject too)" if ours[0] == "unimpl" else " (WE EXECUTE)")] += 1
+                continue
+        else:
+            theirs = run_unicorn(insn, pc, nzcv, fpcr, regs, sp, vregs)
         o_status, t_status = ours[0], theirs[0]
 
         if o_status == "unimpl" and t_status == "unimpl":
@@ -353,6 +401,18 @@ def main():
             rs = (insn >> 16) & 31
             if rs == 31 or ours[3][rs] == 1:
                 stats["impl. defined (STXR abort order)"] += 1
+                continue
+
+        if (name == "simd_shift_imm_scalar" and (insn >> 20) & 0b111 == 0b001
+                and (insn >> 11) & 0b11111 == 0b11111 and o_status == t_status == "ok"):
+            # FCVTZS/FCVTZU (scalar, fixed-point) on a half: the ARM ARM sets
+            # esize = 16 and datasize = esize, so the result is 16 bits.
+            # Unicorn's QEMU base writes 32 sign-extended bits.
+            rd = insn & 31
+            t_v = list(theirs[5])
+            t_v[rd] &= 0xFFFF
+            if ours[1:5] == theirs[1:5] and ours[5] == t_v and ours[6:] == theirs[6:]:
+                stats["known Unicorn bug (FP16 fixed-point width)"] += 1
                 continue
 
         same = (o_status == t_status) and ours[1:] == theirs[1:]

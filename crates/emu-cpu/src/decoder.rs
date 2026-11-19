@@ -652,6 +652,7 @@ pub enum Instr {
     FmovToGp {
         sf: bool,
         top: bool,
+        half: bool,
         rn: u8,
         rd: u8,
     },
@@ -659,6 +660,7 @@ pub enum Instr {
     FmovFromGp {
         sf: bool,
         top: bool,
+        half: bool,
         rn: u8,
         rd: u8,
     },
@@ -1570,7 +1572,7 @@ fn fp_type(insn: u32) -> Option<FpType> {
     match bits(insn, 23, 22) {
         0b00 => Some(FpType::Single),
         0b01 => Some(FpType::Double),
-        // Half precision (0b11) is not implemented yet.
+        0b11 => Some(FpType::Half),
         _ => None,
     }
 }
@@ -1652,7 +1654,19 @@ fn decode_simd_fp(insn: u32) -> Option<Instr> {
     // Advanced SIMD modified immediate.
     if insn & 0x9FF8_0400 == 0x0F00_0400 {
         if bit(insn, 11) {
-            return None; // FMOV (vector, half precision): later.
+            // FMOV (vector, half precision): op = 0, cmode = 1111 only.
+            if bit(insn, 29) || bits(insn, 15, 12) != 0b1111 {
+                return None;
+            }
+            let imm8 = (bits(insn, 18, 16) << 5) | bits(insn, 9, 5);
+            let h = crate::fp::expand_imm(imm8 as u8, FpType::Half);
+            let imm = h | (h << 16) | (h << 32) | (h << 48);
+            return Some(Instr::VecMoveImm {
+                q,
+                op: VecImmOp::Movi,
+                imm,
+                rd,
+            });
         }
         let op = bit(insn, 29);
         let cmode = bits(insn, 15, 12);
@@ -1856,12 +1870,14 @@ fn decode_fp_scalar(insn: u32) -> Option<Instr> {
                 (true, 0b01, 0b110) => Some(Instr::FmovToGp {
                     sf,
                     top: true,
+                    half: false,
                     rn,
                     rd,
                 }),
                 (true, 0b01, 0b111) => Some(Instr::FmovFromGp {
                     sf,
                     top: true,
+                    half: false,
                     rn,
                     rd,
                 }),
@@ -1903,14 +1919,16 @@ fn decode_fp_scalar(insn: u32) -> Option<Instr> {
                 rd,
             }),
             (0b00, 0b110 | 0b111) => {
-                // Only W<->S and X<->D are valid here.
-                if sf != (ty == FpType::Double) {
+                // Valid: W<->S, X<->D, and W or X<->H.
+                let half = ty == FpType::Half;
+                if !half && sf != (ty == FpType::Double) {
                     return None;
                 }
                 if opcode == 0b110 {
                     Some(Instr::FmovToGp {
                         sf,
                         top: false,
+                        half,
                         rn,
                         rd,
                     })
@@ -1918,6 +1936,7 @@ fn decode_fp_scalar(insn: u32) -> Option<Instr> {
                     Some(Instr::FmovFromGp {
                         sf,
                         top: false,
+                        half,
                         rn,
                         rd,
                     })
@@ -1980,6 +1999,7 @@ fn decode_fp_scalar(insn: u32) -> Option<Instr> {
             0b000011 => FpUnaryOp::Sqrt,
             0b000100 if ty != FpType::Single => FpUnaryOp::Convert(FpType::Single),
             0b000101 if ty != FpType::Double => FpUnaryOp::Convert(FpType::Double),
+            0b000111 if ty != FpType::Half => FpUnaryOp::Convert(FpType::Half),
             0b001000 => FpUnaryOp::Round(Rounding::TieEven),
             0b001001 => FpUnaryOp::Round(Rounding::PosInf),
             0b001010 => FpUnaryOp::Round(Rounding::NegInf),

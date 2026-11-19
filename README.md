@@ -10,7 +10,8 @@ This project does not include, distribute, or require any copyrighted Nintendo f
 2. **Guest CPU state:** AArch64 register file and NZCV flags. *(done)*
 3. **Decoder and interpreter:** Decode A64 instructions against the ARM Architecture Reference Manual, one instruction class at a time, cross-checked against Unicorn.
    - Done: the integer instruction set (including LSE atomics, CAS/CASP, LDXP/STXP, LDAPR, CRC32); scalar single/double floating point with ARM NaN rules; SIMD&FP loads and stores including LD1-LD4/ST1-ST4; Advanced SIMD integer and single/double floating-point arithmetic, widening/narrowing, saturating (with FPSR.QC), shifts, permutes, TBL/TBX, reductions, by-element forms, dot product, and the ARM reciprocal (square root) estimates.
-   - To do: half precision (FP16); FPCR rounding modes other than round-to-nearest, flush-to-zero, and the FPSR exception flags. Not targeted, because the Cortex-A78C does not have them: FCMLA/FCADD, FRINT32/64, BF16, LSE2.
+   - Half precision (FP16) in scalar and vector forms.
+   - To do: the Cryptographic Extension (AES, SHA, 64-bit PMULL); FPCR rounding modes other than round-to-nearest, flush-to-zero, and the FPSR exception flags. Not targeted, because the Cortex-A78C does not have them: FCMLA/FCADD, FRINT32/64, BF16, LSE2.
 4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory and ELF loader done; NSO/NRO to come)*
 5. **Service layer (HLE):** Simple emulation of OS calls.
 6. **JIT:** Dynamic translation from AArch64 to x86-64 after the interpreter is correct.

@@ -1,30 +1,6 @@
 /* Floating-point test program: scalar single and double precision. */
 #include "rt.h"
 
-/* Prints a double with 6 decimals, using only integer formatting. */
-static void print_f64(double v) {
-    if (v != v) {
-        print("nan");
-        return;
-    }
-    if (v < 0) {
-        print("-");
-        v = -v;
-    }
-    u64 whole = (u64)v;
-    u64 frac = (u64)((v - (double)whole) * 1000000.0 + 0.5);
-    if (frac >= 1000000) {
-        whole++;
-        frac -= 1000000;
-    }
-    print_u64(whole);
-    print(".");
-    for (u64 d = 100000; d > 0; d /= 10) {
-        char c = (char)('0' + (frac / d) % 10);
-        sys_write(&c, 1);
-    }
-}
-
 static void mandelbrot(void) {
     static const char shades[] = " .:-=+*#%@";
     for (int y = 0; y < 12; y++) {

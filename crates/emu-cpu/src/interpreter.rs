@@ -812,19 +812,44 @@ impl Cpu {
                 self.write_scalar(rd, result, ty.bytes());
             }
 
-            Instr::FmovToGp { sf, top, rn, rd } => {
+            Instr::FmovToGp {
+                sf,
+                top,
+                half,
+                rn,
+                rd,
+            } => {
                 let v = self.read_v(rn);
-                let value = if top { (v >> 64) as u64 } else { v as u64 };
+                let value = if top {
+                    (v >> 64) as u64
+                } else if half {
+                    u64::from(v as u16)
+                } else {
+                    v as u64
+                };
                 self.write_xzr(rd, truncate(value, sf));
             }
 
-            Instr::FmovFromGp { sf, top, rn, rd } => {
+            Instr::FmovFromGp {
+                sf,
+                top,
+                half,
+                rn,
+                rd,
+            } => {
                 let value = truncate(self.read_xzr(rn), sf);
                 if top {
                     let low = self.read_v(rd) & u128::from(u64::MAX);
                     self.write_v(rd, low | (u128::from(value) << 64));
                 } else {
-                    self.write_scalar(rd, value, if sf { 8 } else { 4 });
+                    let bytes = if half {
+                        2
+                    } else if sf {
+                        8
+                    } else {
+                        4
+                    };
+                    self.write_scalar(rd, value, bytes);
                 }
             }
 
