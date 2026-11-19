@@ -85,6 +85,37 @@ static Result flush(void) {
 #define W 1280
 #define H 720
 
+/* ---- a macro (MME) for the 3D engine ----
+ * Instruction fields: operation 2:0, result operation 6:4, exit 7,
+ * dst 10:8, src A 13:11, src B 16:14, ALU op 21:17, immediate 31:14. */
+#define MME_ADDI(res, dst, a, imm) (1u | (res) << 4 | (dst) << 8 | (a) << 11 | ((u32)(imm)) << 14)
+#define MME_ADD(res, dst, a, b) (0u | (res) << 4 | (dst) << 8 | (a) << 11 | (b) << 14)
+#define MME_EXIT 0x80u
+#define MME_NOP 0x11u
+#define R_FETCH 0
+#define R_MOVE_SET_METHOD 2
+#define R_FETCH_SEND 3
+#define R_MOVE_SEND 4
+#define MADDR(m, incr) ((m) >> 2 | (incr) << 12)
+
+/* fill_rect(scissor h, scissor v, r, g, b, a): sets scissor 0 and the
+ * clear color, then clears render target 0. */
+static const u32 fill_rect_macro[] = {
+    MME_ADDI(R_MOVE_SET_METHOD, 0, 0, MADDR(0x0E04, 1)), /* addr = SCISSOR_HORIZONTAL(0) */
+    MME_ADD(R_MOVE_SEND, 0, 1, 0),                      /* send r1 (param 0) */
+    MME_ADD(R_FETCH, 2, 0, 0),                          /* r2 = param 1 */
+    MME_ADD(R_MOVE_SEND, 0, 2, 0),                      /* send r2 */
+    MME_ADDI(R_MOVE_SET_METHOD, 0, 0, MADDR(0x0D80, 1)), /* addr = COLOR_CLEAR_VALUE */
+    MME_ADD(R_FETCH, 2, 0, 0),                          /* r2 = red */
+    MME_ADD(R_FETCH_SEND, 2, 2, 0),                     /* send red, r2 = green */
+    MME_ADD(R_FETCH_SEND, 2, 2, 0),                     /* send green, r2 = blue */
+    MME_ADD(R_FETCH_SEND, 2, 2, 0),                     /* send blue, r2 = alpha */
+    MME_ADD(R_MOVE_SEND, 0, 2, 0),                      /* send alpha */
+    MME_ADDI(R_MOVE_SET_METHOD, 0, 0, MADDR(0x19D0, 0)), /* addr = CLEAR_SURFACE */
+    MME_ADDI(R_MOVE_SEND, 0, 0, 0x3C) | MME_EXIT,        /* clear RGBA of target 0, exit */
+    MME_NOP,                                            /* delay slot */
+};
+
 static void clear_rect(u32 x0, u32 y0, u32 x1, u32 y1, float r, float g, float b) {
     incr(SUB_3D, 0x0E04, 2);              /* SET_SCISSOR_HORIZONTAL/VERTICAL(0) */
     w(x0 | x1 << 16);
@@ -92,6 +123,14 @@ static void clear_rect(u32 x0, u32 y0, u32 x1, u32 y1, float r, float g, float b
     incr(SUB_3D, 0x0D80, 4);              /* SET_COLOR_CLEAR_VALUE */
     w(fbits(r)); w(fbits(g)); w(fbits(b)); w(fbits(1.0f));
     set1(SUB_3D, 0x19D0, 0x3C);           /* CLEAR_SURFACE: RGBA, target 0 */
+}
+
+/* The same through the macro: CALL_MME_MACRO(0) takes the first
+ * parameter, CALL_MME_DATA(0) the rest (an increase-once run). */
+static void macro_rect(u32 x0, u32 y0, u32 x1, u32 y1, float r, float g, float b) {
+    cmd[cmd_pos++] = (5u << 29) | (6u << 16) | (SUB_3D << 13) | (0x3800 >> 2);
+    w(x0 | x1 << 16); w(y0 | y1 << 16);
+    w(fbits(r)); w(fbits(g)); w(fbits(b)); w(fbits(1.0f));
 }
 
 int hb_main(void *ctx, u64 x1, void *saved_lr) {
@@ -187,6 +226,12 @@ int hb_main(void *ctx, u64 x1, void *saved_lr) {
     incr(SUB_3D, 0x0800, 6);                             /* SET_COLOR_TARGET_*(0) */
     w(0); w(0); w(W); w(H); w(0xD5); w(4 << 4);          /* addr set per frame; RGBA8, 16 GOBs */
     set1(SUB_3D, 0x0E00, 1);                             /* SET_SCISSOR_ENABLE(0) */
+    /* Upload the macro as macro 0, starting at instruction 0. */
+    set1(SUB_3D, 0x0114, 0);                             /* LOAD_MME_INSTRUCTION_RAM_POINTER */
+    nonincr(SUB_3D, 0x0118, sizeof(fill_rect_macro) / 4);
+    for (u32 k = 0; k < sizeof(fill_rect_macro) / 4; k++) w(fill_rect_macro[k]);
+    set1(SUB_3D, 0x011C, 0);                             /* LOAD_MME_START_ADDRESS_RAM_POINTER */
+    set1(SUB_3D, 0x0120, 0);                             /* LOAD_MME_START_ADDRESS_RAM */
     for (u32 frame = 0; frame < 3; frame++) {
         u32 stride;
         framebufferBegin(&fb, &stride);
@@ -196,8 +241,8 @@ int hb_main(void *ctx, u64 x1, void *saved_lr) {
         /* Three stripes and a square that moves each frame. */
         clear_rect(0, 160, W, 240, 0.9f, 0.2f, 0.2f);
         clear_rect(0, 320, W, 400, 0.2f, 0.8f, 0.3f);
-        clear_rect(0, 480, W, 560, 0.2f, 0.4f, 0.95f);
-        clear_rect(100 + frame * 300, 260, 300 + frame * 300, 460, 1.0f, 0.9f, 0.2f);
+        macro_rect(0, 480, W, 560, 0.2f, 0.4f, 0.95f);
+        macro_rect(100 + frame * 300, 260, 300 + frame * 300, 460, 1.0f, 0.9f, 0.2f);
         Result rc = flush();
         if (rc) { line("frame submit failed: ", rc); return 1; }
         framebufferEnd(&fb);

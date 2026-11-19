@@ -5,6 +5,7 @@
 //! reported as not emulated.
 
 use super::inline::InlineToMemory;
+use super::mme::{self, MacroTarget};
 use super::{bits, EngineCtx};
 use crate::blocklinear;
 use crate::surface::ColorFormat;
@@ -48,6 +49,30 @@ pub struct Maxwell3D {
     pub mme_starts: Vec<u32>,
     /// Render target clears performed (for diagnostics and tests).
     pub clears: u64,
+    /// The macro being called: index and parameters so far.
+    pending_call: Option<(usize, Vec<u32>)>,
+    /// Macros run (for diagnostics and tests).
+    pub macro_calls: u64,
+}
+
+/// Lets a running macro write methods into the engine.
+struct Target<'e, 'c, 'm> {
+    engine: &'e mut Maxwell3D,
+    ctx: &'c mut EngineCtx<'m>,
+    /// Methods that were not emulated, reported after the macro.
+    unhandled: Vec<(u32, u32)>,
+}
+
+impl MacroTarget for Target<'_, '_, '_> {
+    fn send(&mut self, method: u32, value: u32) {
+        if !self.engine.write_method(method, value, self.ctx) {
+            self.unhandled.push((method * 4, value));
+        }
+    }
+
+    fn read(&self, method: u32) -> u32 {
+        self.engine.regs.get(method as usize).copied().unwrap_or(0)
+    }
 }
 
 impl Default for Maxwell3D {
@@ -58,6 +83,8 @@ impl Default for Maxwell3D {
             mme_code: vec![0; 0x2000],
             mme_starts: vec![0; 0x80],
             clears: 0,
+            pending_call: None,
+            macro_calls: 0,
         }
     }
 }
@@ -68,10 +95,71 @@ impl Maxwell3D {
         self.regs.get(offset as usize / 4).copied().unwrap_or(0)
     }
 
-    pub fn write(&mut self, method: u32, value: u32, ctx: &mut EngineCtx) -> bool {
+    /// A method write from a pushbuffer. `last` marks the final word of
+    /// a method run, which ends a macro call's parameters. Returns false
+    /// for methods that are not emulated; `unhandled` collects those that
+    /// macros wrote.
+    pub fn write(
+        &mut self,
+        method: u32,
+        value: u32,
+        last: bool,
+        ctx: &mut EngineCtx,
+        unhandled: &mut Vec<(u32, u32)>,
+    ) -> bool {
+        if method * 4 < reg::MACRO_CALLS {
+            return self.write_method(method, value, ctx);
+        }
+        // CALL_MME_MACRO(j) (even words) starts a call with its first
+        // parameter; CALL_MME_DATA(j) (odd) adds parameters.
+        let index = ((method - reg::MACRO_CALLS / 4) / 2) as usize;
+        if method.is_multiple_of(2) {
+            self.pending_call = Some((index, vec![value]));
+        } else if let Some((_, params)) = self.pending_call.as_mut() {
+            params.push(value);
+        }
+        if last {
+            if let Some((index, params)) = self.pending_call.take() {
+                self.call_macro(index, &params, ctx, unhandled);
+            }
+        }
+        true
+    }
+
+    fn call_macro(
+        &mut self,
+        index: usize,
+        params: &[u32],
+        ctx: &mut EngineCtx,
+        unhandled: &mut Vec<(u32, u32)>,
+    ) {
+        let Some(&start) = self.mme_starts.get(index) else {
+            ctx.faults.push(format!("macro {index} out of range"));
+            return;
+        };
+        let code = std::mem::take(&mut self.mme_code);
+        let mut target = Target {
+            engine: self,
+            ctx,
+            unhandled: Vec::new(),
+        };
+        let result = mme::execute(&code, start, params, &mut target);
+        let Target {
+            unhandled: u, ctx, ..
+        } = target;
+        unhandled.extend(u);
+        if let Err(e) = result {
+            ctx.faults
+                .push(format!("macro {index} at {start:#x}: {e:?}"));
+        }
+        self.mme_code = code;
+        self.macro_calls += 1;
+    }
+
+    /// A write to a 3D method (not a macro call).
+    fn write_method(&mut self, method: u32, value: u32, ctx: &mut EngineCtx) -> bool {
         let offset = method * 4;
         if offset >= reg::MACRO_CALLS {
-            // CALL_MME_MACRO / CALL_MME_DATA: needs the macro interpreter.
             return false;
         }
         if (0x180..=0x1B4).contains(&offset) {

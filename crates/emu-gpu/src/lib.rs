@@ -189,7 +189,7 @@ impl Gpu {
 
     fn process_word(&mut self, channel: usize, word: u32, mem: &mut Memory) {
         if let Some(mut p) = self.channels[channel].pending {
-            self.method(channel, p.subchannel, p.method, word, mem);
+            self.method(channel, p.subchannel, p.method, word, p.remaining == 1, mem);
             match p.mode {
                 Mode::Increasing => p.method += 1,
                 Mode::IncreaseOnce => {
@@ -211,7 +211,7 @@ impl Gpu {
             5 => Mode::IncreaseOnce,
             4 => {
                 // Immediate: the count field is the data.
-                self.method(channel, subchannel, method, count, mem);
+                self.method(channel, subchannel, method, count, true, mem);
                 return;
             }
             _ => return, // NOPs and legacy/unsupported headers
@@ -233,6 +233,7 @@ impl Gpu {
         subchannel: usize,
         method: u32,
         value: u32,
+        last: bool,
         mem: &mut Memory,
     ) {
         // Methods below 0x40 go to the channel itself.
@@ -257,8 +258,9 @@ impl Gpu {
             syncpoints,
             faults,
         };
+        let mut from_macros = Vec::new();
         let handled = match channels[channel].subchannels[subchannel].as_mut() {
-            Some(Engine::ThreeD(e)) => e.write(method, value, &mut ctx),
+            Some(Engine::ThreeD(e)) => e.write(method, value, last, &mut ctx, &mut from_macros),
             Some(Engine::Copy(e)) => e.write(method, value, &mut ctx),
             Some(Engine::Inline(e)) => e.write(method, value, &mut ctx),
             Some(Engine::Other(_)) | None => false,

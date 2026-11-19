@@ -3,6 +3,7 @@
 pub mod copy;
 pub mod inline;
 pub mod maxwell3d;
+pub mod mme;
 
 use crate::mmu::AddressSpace;
 use emu_memory::Memory;
