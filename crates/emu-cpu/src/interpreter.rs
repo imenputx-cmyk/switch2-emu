@@ -5,9 +5,9 @@
 //! JIT will be tested against.
 
 use crate::decoder::{
-    decode, ones, ror, AddrMode, BitfieldOp, BranchRegOp, CondOperand, CondSelectOp, DataProc1Op,
-    DataProc2Op, DataProc3Op, ElemSrc, ExclusiveOp, Extend, FpUnaryOp, Instr, LoadKind, LogicOp,
-    MoveWideOp, PairMode, Shift, SysReg, VecImmOp, VecLogicOp,
+    decode, ones, ror, AddrMode, AtomicOp, BitfieldOp, BranchRegOp, CondOperand, CondSelectOp,
+    DataProc1Op, DataProc2Op, DataProc3Op, ElemSrc, ExclusiveOp, Extend, FpUnaryOp, Instr,
+    LoadKind, LogicOp, MoveWideOp, PairMode, Shift, SysReg, VecImmOp, VecLogicOp,
 };
 use crate::fp::Fp;
 use crate::{Cpu, Nzcv};
@@ -416,6 +416,9 @@ impl Cpu {
                     DataProc2Op::Lsrv => shift_reg(a, Shift::Lsr, (b % 64) as u32, sf),
                     DataProc2Op::Asrv => shift_reg(a, Shift::Asr, (b % 64) as u32, sf),
                     DataProc2Op::Rorv => shift_reg(a, Shift::Ror, (b % 64) as u32, sf),
+                    DataProc2Op::Crc32 { castagnoli, size } => {
+                        crc32(a as u32, b, 1 << size, castagnoli)
+                    }
                 };
                 self.write_xzr(rd, truncate(result, sf));
             }
@@ -918,6 +921,129 @@ impl Cpu {
                 self.write_v(rd, vec_width(result, q));
             }
 
+            Instr::Atomic {
+                size,
+                op,
+                rs,
+                rn,
+                rt,
+            } => {
+                let addr = self.read_sp(rn);
+                let bytes = 1usize << size;
+                if !addr.is_multiple_of(bytes as u64) {
+                    return Err(Exit::Alignment { pc, addr });
+                }
+                let width = 8u32 << size;
+                let old = mem.read_uint(addr, bytes).map_err(fault)?;
+                let value = self.read_xzr(rs) & ones(width);
+                let new = match op {
+                    AtomicOp::Add => old.wrapping_add(value),
+                    AtomicOp::Clr => old & !value,
+                    AtomicOp::Eor => old ^ value,
+                    AtomicOp::Set => old | value,
+                    AtomicOp::Smax => {
+                        if (sext(old, width) as i64) >= (sext(value, width) as i64) {
+                            old
+                        } else {
+                            value
+                        }
+                    }
+                    AtomicOp::Smin => {
+                        if (sext(old, width) as i64) <= (sext(value, width) as i64) {
+                            old
+                        } else {
+                            value
+                        }
+                    }
+                    AtomicOp::Umax => old.max(value),
+                    AtomicOp::Umin => old.min(value),
+                    AtomicOp::Swp => value,
+                };
+                mem.write_uint(addr, bytes, new).map_err(fault)?;
+                self.write_xzr(rt, old);
+            }
+
+            Instr::CompareSwap { size, rs, rn, rt } => {
+                let addr = self.read_sp(rn);
+                let bytes = 1usize << size;
+                if !addr.is_multiple_of(bytes as u64) {
+                    return Err(Exit::Alignment { pc, addr });
+                }
+                let old = mem.read_uint(addr, bytes).map_err(fault)?;
+                if old == self.read_xzr(rs) & ones(8 << size) {
+                    mem.write_uint(addr, bytes, self.read_xzr(rt))
+                        .map_err(fault)?;
+                }
+                self.write_xzr(rs, old);
+            }
+
+            Instr::CompareSwapPair { sf, rs, rn, rt } => {
+                let addr = self.read_sp(rn);
+                let each = if sf { 8 } else { 4 };
+                if !addr.is_multiple_of(each as u64 * 2) {
+                    return Err(Exit::Alignment { pc, addr });
+                }
+                let mut buf = [0u8; 16];
+                mem.read(addr, &mut buf[..each * 2]).map_err(fault)?;
+                let word = |b: &[u8]| {
+                    let mut w = [0u8; 8];
+                    w[..each].copy_from_slice(b);
+                    u64::from_le_bytes(w)
+                };
+                let (old0, old1) = (word(&buf[..each]), word(&buf[each..each * 2]));
+                let mask = ones(each as u32 * 8);
+                let (c0, c1) = (self.read_xzr(rs) & mask, self.read_xzr(rs + 1) & mask);
+                if old0 == c0 && old1 == c1 {
+                    buf[..each].copy_from_slice(&self.read_xzr(rt).to_le_bytes()[..each]);
+                    buf[each..each * 2]
+                        .copy_from_slice(&self.read_xzr(rt + 1).to_le_bytes()[..each]);
+                    mem.write(addr, &buf[..each * 2]).map_err(fault)?;
+                }
+                self.write_xzr(rs, old0);
+                self.write_xzr(rs + 1, old1);
+            }
+
+            Instr::ExclusivePair {
+                sf,
+                store,
+                rn,
+                rt,
+                rt2,
+            } => {
+                let addr = self.read_sp(rn);
+                let each = if sf { 8 } else { 4 };
+                if !addr.is_multiple_of(each as u64 * 2) {
+                    return Err(Exit::Alignment { pc, addr });
+                }
+                match store {
+                    None => {
+                        let mut buf = [0u8; 16];
+                        mem.read(addr, &mut buf[..each * 2]).map_err(fault)?;
+                        let mut w = [0u8; 8];
+                        w[..each].copy_from_slice(&buf[..each]);
+                        self.write_xzr(rt, u64::from_le_bytes(w));
+                        w = [0; 8];
+                        w[..each].copy_from_slice(&buf[each..each * 2]);
+                        self.write_xzr(rt2, u64::from_le_bytes(w));
+                        self.exclusive = Some(addr);
+                    }
+                    Some(rs) => {
+                        let status = if self.exclusive == Some(addr) {
+                            let mut buf = [0u8; 16];
+                            buf[..each].copy_from_slice(&self.read_xzr(rt).to_le_bytes()[..each]);
+                            buf[each..each * 2]
+                                .copy_from_slice(&self.read_xzr(rt2).to_le_bytes()[..each]);
+                            mem.write(addr, &buf[..each * 2]).map_err(fault)?;
+                            0
+                        } else {
+                            1
+                        };
+                        self.exclusive = None;
+                        self.write_xzr(rs, status);
+                    }
+                }
+            }
+
             Instr::Unknown(raw) => return Err(Exit::Unimplemented { pc, insn: raw }),
         }
 
@@ -967,6 +1093,24 @@ impl Cpu {
             AddrMode::Literal { offset } => (pc.wrapping_add_signed(offset), None),
         }
     }
+}
+
+/// CRC32/CRC32C step over the low `bytes` bytes of `value`, as the ARM
+/// instructions define it: reflected polynomial, no pre/post inversion.
+fn crc32(acc: u32, value: u64, bytes: usize, castagnoli: bool) -> u64 {
+    let poly: u32 = if castagnoli { 0x82F6_3B78 } else { 0xEDB8_8320 };
+    let mut crc = acc;
+    for i in 0..bytes {
+        crc ^= u32::from((value >> (8 * i)) as u8);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ poly
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    u64::from(crc)
 }
 
 /// Clears the upper 64 bits of a vector result when Q = 0.
@@ -1195,6 +1339,21 @@ mod tests {
         let exit = cpu.execute(STR_X1_X0_8, &mut mem).unwrap_err();
         assert!(matches!(exit, Exit::Fault { pc: 0x40, .. }));
         assert_eq!(cpu.pc(), 0x40);
+    }
+
+    #[test]
+    fn crc32_matches_standard_check_values() {
+        // The standard check value of CRC-32 over "123456789" is 0xCBF43926
+        // and of CRC-32C 0xE3069283, with the usual ~0 pre/post inversion.
+        let run = |castagnoli| {
+            let mut crc = u32::MAX;
+            for b in b"123456789" {
+                crc = crc32(crc, u64::from(*b), 1, castagnoli) as u32;
+            }
+            !crc
+        };
+        assert_eq!(run(false), 0xCBF4_3926);
+        assert_eq!(run(true), 0xE306_9283);
     }
 
     #[test]

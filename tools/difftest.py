@@ -55,6 +55,7 @@ CLASSES = [
     ("ld_literal", 0x3F000000, 0x18000000),
     ("ldst_pair", 0x3E000000, 0x28000000),
     ("exclusive", 0x3F000000, 0x08000000),
+    ("atomic", 0x3F200C00, 0x38200000),
     # SIMD&FP loads and stores (V = 1).
     ("fp_ldst_uimm", 0x3F000000, 0x3D000000),
     ("fp_ldst_imm9", 0x3F200000, 0x3C000000),
@@ -215,6 +216,36 @@ def run_unicorn(insn, pc, nzcv, fpcr, regs, sp, vregs):
         uc.reg_read(UC_ARM64_REG_SP), v_out, mem_diff
 
 
+def check_smax_smin(insn, regs, sp, ours):
+    """Reference model for LDSMAX/LDSMIN, used because Unicorn's QEMU base
+    does not sign-extend the memory operand for sizes below 64 bits.
+    Returns True if our result matches the ARM definition."""
+    size, rs, rn, rt = insn >> 30, (insn >> 16) & 31, (insn >> 5) & 31, insn & 31
+    is_min = (insn >> 12) & 7 == 0b101
+    nbytes = 1 << size
+    addr = sp if rn == 31 else regs[rn]
+    if addr % nbytes:
+        return ours[0].startswith("align")
+    region = next((b for b in INITIAL if b <= addr and addr + nbytes <= b + len(INITIAL[b])), None)
+    if region is None:
+        return ours[0] == "fault"
+    old_bytes = INITIAL[region][addr - region:addr - region + nbytes]
+    old = int.from_bytes(old_bytes, "little")
+    mask = (1 << (8 * nbytes)) - 1
+    value = (0 if rs == 31 else regs[rs]) & mask
+
+    def signed(x):
+        return x - (1 << (8 * nbytes)) if x >> (8 * nbytes - 1) else x
+
+    new = min(old, value, key=signed) if is_min else max(old, value, key=signed)
+    new_bytes = new.to_bytes(nbytes, "little")
+    expected_mem = [f"{addr + i:x}={new_bytes[i]:x}" for i in range(nbytes) if new_bytes[i] != old_bytes[i]]
+    expected_regs = list(regs)
+    if rt != 31:
+        expected_regs[rt] = old
+    return ours[0] == "ok" and ours[3] == expected_regs and ours[6] == expected_mem
+
+
 def parse_ours(line):
     if line == "skip":
         return None
@@ -265,16 +296,43 @@ def main():
         if o_status == "fault" and t_status == "fault":
             stats["both fault"] += 1
             continue
-        if o_status == "align" and t_status == "align":
-            stats["both alignment-fault"] += 1
-            continue
-        if o_status == "align" and name == "exclusive" and t_status in ("ok", "fault"):
-            # Known QEMU difference: the ARM pseudocode checks alignment
-            # first (AArch64.ExclusiveMonitorsPass, CheckAlignment before
-            # translation). QEMU skips it for a failing STXR and reports a
-            # translation fault first for unaligned unmapped addresses.
-            stats["known QEMU difference"] += 1
-            continue
+        if o_status.startswith("align"):
+            if t_status == "align":
+                stats["both alignment-fault"] += 1
+                continue
+            if o_status == "align-lse2" and t_status == "ok":
+                # Unicorn's "max" CPU has FEAT_LSE2 (unaligned atomics within
+                # 16 bytes); the Switch 2's Cortex-A78C does not.
+                stats["CPU model difference (LSE2)"] += 1
+                continue
+            if o_status == "align-stx" and t_status == "ok":
+                # ARM pseudocode (AArch64.ExclusiveMonitorsPass) checks
+                # alignment first; QEMU skips it when the monitor fails.
+                stats["known QEMU difference (STXR)"] += 1
+                continue
+            if t_status == "fault":
+                # Alignment is checked before translation in the ARM
+                # pseudocode; QEMU reports the unmapped page first.
+                stats["known QEMU difference (fault order)"] += 1
+                continue
+
+        if name == "atomic" and (insn >> 15) & 1 == 0 and (insn >> 13) & 3 == 0b10:
+            # LDSMAX/LDSMIN: checked against our own reference model, see
+            # check_smax_smin().
+            if check_smax_smin(insn, regs, sp, ours):
+                stats["LDSMAX/LDSMIN ok (reference model)"] += 1
+                continue
+
+        is_store_exclusive = name == "exclusive" and (insn >> 21) & 0b101 == 0 and not (insn >> 23) & 1
+        if is_store_exclusive and o_status == "ok" and t_status == "fault":
+            # "It is IMPLEMENTATION DEFINED whether the detection of memory
+            # aborts happens before or after the check on the local
+            # Exclusives monitor" (AArch64.ExclusiveMonitorsPass). We check
+            # the monitor first and report failure (status 1); QEMU faults.
+            rs = (insn >> 16) & 31
+            if rs == 31 or ours[3][rs] == 1:
+                stats["impl. defined (STXR abort order)"] += 1
+                continue
 
         same = (o_status == t_status) and ours[1:] == theirs[1:]
         if same:

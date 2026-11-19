@@ -11,7 +11,8 @@ import sys
 def assemble(lines):
     """Returns a list of (instruction word, text) pairs."""
     out = subprocess.run(
-        ["llvm-mc", "-triple=aarch64", "-mattr=+v8.2a", "-show-encoding"],
+        # Cortex-A78C is the Switch 2 CPU: ARMv8.2 + LSE, RCpc, FP16, dotprod, CRC.
+        ["llvm-mc", "-triple=aarch64", "-mcpu=cortex-a78c", "-show-encoding"],
         input="\n".join(lines) + "\n",
         capture_output=True,
         text=True,

@@ -33,6 +33,41 @@ fn fresh_memory() -> Memory {
     mem
 }
 
+/// Classifies an alignment fault so the harness can tell CPU-model
+/// differences apart. "align-lse2" means FEAT_LSE2 would allow the access:
+/// an atomic inside one 16-byte block, or any LDAR/STLR/LDAPR. Unicorn's
+/// "max" model has LSE2; the Switch 2's Cortex-A78C does not.
+/// "align-stx" marks a store-exclusive.
+fn align_status(instr: Instr, addr: u64) -> &'static str {
+    let bytes: u64 = match instr {
+        Instr::Exclusive {
+            op: ExclusiveOp::StoreExclusive { .. },
+            ..
+        } => return "align-stx",
+        Instr::ExclusivePair { store: Some(_), .. } => return "align-stx",
+        Instr::Exclusive {
+            op: ExclusiveOp::LoadAcquire | ExclusiveOp::StoreRelease,
+            ..
+        } => return "align-lse2",
+        Instr::Exclusive { size, .. }
+        | Instr::Atomic { size, .. }
+        | Instr::CompareSwap { size, .. } => 1 << size,
+        Instr::ExclusivePair { sf, .. } | Instr::CompareSwapPair { sf, .. } => {
+            if sf {
+                16
+            } else {
+                8
+            }
+        }
+        _ => return "align",
+    };
+    if addr % 16 + bytes <= 16 {
+        "align-lse2"
+    } else {
+        "align"
+    }
+}
+
 /// Operand combinations the architecture leaves UNPREDICTABLE, where two
 /// correct implementations may legitimately disagree.
 fn unpredictable(instr: Instr) -> bool {
@@ -101,7 +136,7 @@ fn main() {
         let status = match cpu.step(&mut mem) {
             Ok(()) => "ok",
             Err(Exit::Fault { .. }) => "fault",
-            Err(Exit::Alignment { .. }) => "align",
+            Err(Exit::Alignment { addr, .. }) => align_status(decode(insn), addr),
             Err(Exit::Unimplemented { .. }) => "unimpl",
             Err(Exit::Svc(_)) => "svc",
             Err(Exit::Brk(_)) => "brk",

@@ -137,6 +137,22 @@ pub enum ExclusiveOp {
     StoreRelease,
 }
 
+/// Read-modify-write operation of an LSE atomic (LDADD, LDCLR, ..., SWP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOp {
+    Add,
+    /// Bit clear: `old & !value`.
+    Clr,
+    Eor,
+    /// Bit set: `old | value`.
+    Set,
+    Smax,
+    Smin,
+    Umax,
+    Umin,
+    Swp,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CondSelectOp {
     Csel,
@@ -159,6 +175,11 @@ pub enum DataProc2Op {
     Lsrv,
     Asrv,
     Rorv,
+    /// CRC32 or CRC32C (`castagnoli`) over `1 << size` bytes of Rm.
+    Crc32 {
+        castagnoli: bool,
+        size: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +412,39 @@ pub enum Instr {
     Exclusive {
         size: u8,
         op: ExclusiveOp,
+        rn: u8,
+        rt: u8,
+    },
+
+    /// LDXP, LDAXP, STXP, STLXP. `sf` selects 64-bit registers. For
+    /// stores, `store` holds the status register.
+    ExclusivePair {
+        sf: bool,
+        store: Option<u8>,
+        rn: u8,
+        rt: u8,
+        rt2: u8,
+    },
+    /// LSE atomic read-modify-write: Rt receives the old value.
+    Atomic {
+        size: u8,
+        op: AtomicOp,
+        rs: u8,
+        rn: u8,
+        rt: u8,
+    },
+    /// CAS family: if `[Xn] == Rs` then `[Xn] = Rt`; Rs receives the old
+    /// value either way.
+    CompareSwap {
+        size: u8,
+        rs: u8,
+        rn: u8,
+        rt: u8,
+    },
+    /// CASP family, on the register pairs (Rs, Rs+1) and (Rt, Rt+1).
+    CompareSwapPair {
+        sf: bool,
+        rs: u8,
         rn: u8,
         rt: u8,
     },
@@ -973,15 +1027,46 @@ fn decode_load_store(insn: u32) -> Option<Instr> {
         let o2 = bit(insn, 23);
         let l = bit(insn, 22);
         let o1 = bit(insn, 21);
+        let rs = reg(insn, 16);
+        let rt2 = reg(insn, 10);
         if o1 {
-            return None; // Pair exclusives and CAS: later.
+            if o2 {
+                // CAS, CASA, CASL, CASAL (all sizes). Unlike the other
+                // exclusives, QEMU and LLVM require Rt2 = 11111 here.
+                if rt2 != 31 {
+                    return None;
+                }
+                return Some(Instr::CompareSwap {
+                    size: size as u8,
+                    rs,
+                    rn,
+                    rt,
+                });
+            }
+            if !bit(insn, 31) {
+                // CASP family: register pairs must start at even numbers.
+                if rt2 != 31 || rs % 2 == 1 || rt % 2 == 1 {
+                    return None;
+                }
+                return Some(Instr::CompareSwapPair {
+                    sf: bit(insn, 30),
+                    rs,
+                    rn,
+                    rt,
+                });
+            }
+            // LDXP, LDAXP, STXP, STLXP.
+            return Some(Instr::ExclusivePair {
+                sf: bit(insn, 30),
+                store: if l { None } else { Some(rs) },
+                rn,
+                rt,
+                rt2,
+            });
         }
-        // Rt2 must be all ones, and Rs too unless it is the status register
-        // of a store-exclusive.
-        let store_exclusive = !o2 && !l;
-        if reg(insn, 10) != 31 || (!store_exclusive && reg(insn, 16) != 31) {
-            return None;
-        }
+        // Rt2 (and Rs, unless it holds a store-exclusive status) are
+        // should-be-one fields; like hardware and QEMU, ignore them.
+        let _ = rt2;
         let op = match (o2, l) {
             (false, false) => ExclusiveOp::StoreExclusive { rs: reg(insn, 16) },
             (false, true) => ExclusiveOp::LoadExclusive,
@@ -1096,6 +1181,43 @@ fn decode_load_store(insn: u32) -> Option<Instr> {
             size: size as u8,
             kind,
             mode,
+            rt,
+        });
+    }
+
+    // Atomic memory operations (LSE) and LDAPR.
+    if !simd && insn & 0x3F20_0C00 == 0x3820_0000 {
+        let rs = reg(insn, 16);
+        let o3 = bit(insn, 15);
+        let op = match (o3, bits(insn, 14, 12)) {
+            (false, 0b000) => AtomicOp::Add,
+            (false, 0b001) => AtomicOp::Clr,
+            (false, 0b010) => AtomicOp::Eor,
+            (false, 0b011) => AtomicOp::Set,
+            (false, 0b100) => AtomicOp::Smax,
+            (false, 0b101) => AtomicOp::Smin,
+            (false, 0b110) => AtomicOp::Umax,
+            (false, 0b111) => AtomicOp::Umin,
+            (true, 0b000) => AtomicOp::Swp,
+            (true, 0b100) => {
+                // LDAPR: A = 1, R = 0, Rs = 11111.
+                if bit(insn, 23) && !bit(insn, 22) && rs == 31 {
+                    return Some(Instr::Exclusive {
+                        size: size as u8,
+                        op: ExclusiveOp::LoadAcquire,
+                        rn,
+                        rt,
+                    });
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        return Some(Instr::Atomic {
+            size: size as u8,
+            op,
+            rs,
+            rn,
             rt,
         });
     }
@@ -1254,6 +1376,17 @@ fn decode_dp_reg(insn: u32) -> Option<Instr> {
             0b001001 => DataProc2Op::Lsrv,
             0b001010 => DataProc2Op::Asrv,
             0b001011 => DataProc2Op::Rorv,
+            0b010000..=0b010111 => {
+                let size = (amount & 3) as u8;
+                // Only CRC32X/CRC32CX use a 64-bit Rm, and they need sf = 1.
+                if (size == 3) != sf {
+                    return None;
+                }
+                DataProc2Op::Crc32 {
+                    castagnoli: amount & 0b100 != 0,
+                    size,
+                }
+            }
             _ => return None,
         };
         return Some(Instr::DataProc2 { sf, op, rm, rn, rd });
