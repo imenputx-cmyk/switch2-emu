@@ -19,3 +19,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  difftest:
+    # Cross-checks the interpreter against Unicorn on random instructions.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y llvm
+      - run: pip install unicorn==2.1.4
+      - run: cargo build --release --example difftest_runner
+      - run: python3 tools/difftest.py --cases 20000 --seed ${{ github.run_number }}

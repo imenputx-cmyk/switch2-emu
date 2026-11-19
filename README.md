@@ -8,8 +8,8 @@ This project does not include, distribute, or require any copyrighted Nintendo f
 
 1. **Foundation:** Cargo workspace, CI, and test setup. *(done)*
 2. **Guest CPU state:** AArch64 register file and NZCV flags. *(done)*
-3. **Decoder and interpreter:** Decode A64 instructions against the ARM Architecture Reference Manual, one instruction class at a time, with unit tests for each. *(in progress: add/sub immediate, move wide, B/BL/BR/BLR/RET, CBZ/CBNZ, NOP)*
-4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs.
+3. **Decoder and interpreter:** Decode A64 instructions against the ARM Architecture Reference Manual, one instruction class at a time. *(integer instructions done and cross-checked against Unicorn; SIMD/FP, LSE atomics and CRC32 to come)*
+4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory and ELF loader done; NSO/NRO to come)*
 5. **Service layer (HLE):** Simple emulation of OS calls.
 6. **JIT:** Dynamic translation from AArch64 to x86-64 after the interpreter is correct.
 7. **GPU:** Parse the command stream and translate it to Vulkan.
@@ -21,16 +21,34 @@ Accuracy comes before speed. The interpreter is the reference that the JIT and G
 
 ```
 crates/
-  emu-cpu/   AArch64 guest CPU: register state, decoder, reference interpreter
+  emu-memory/  Guest virtual memory: 4 KiB pages, permissions, faults
+  emu-cpu/     AArch64 CPU: register state, decoder, reference interpreter
+  emu-loader/  ELF loader (NSO/NRO later)
+  emu-run/     Runs freestanding test programs (CLI: emu-run file.elf)
+tests/programs/  C test programs, built with clang (ELF files are committed)
+tools/
+  asm.py       Assemble instructions with llvm-mc and print encodings
+  difftest.py  Differential test against Unicorn on random instructions
 ```
 
 ## Build and test
 
 ```sh
 cargo test
+cargo run --release -p emu-run -- tests/programs/hello.elf
 ```
 
-Test vectors for the decoder come from `llvm-mc -triple=aarch64 -show-encoding`, so expected encodings are produced by a real assembler rather than written by hand.
+### How correctness is checked
+
+1. **Unit tests** use encodings produced by `llvm-mc`, not written by hand.
+2. **Differential testing** (`tools/difftest.py`) runs random instructions from every implemented encoding class in both this interpreter and [Unicorn](https://www.unicorn-engine.org/) (QEMU's ARM64 core), from the same random state, and compares registers, flags, PC and memory. Unicorn is a test-time tool only and is not part of the emulator.
+
+   ```sh
+   pip install unicorn
+   cargo build --release --example difftest_runner
+   python3 tools/difftest.py --cases 20000
+   ```
+3. **Whole programs:** C programs in `tests/programs` are compiled with clang, run to completion, and their output is compared with expected values.
 
 ## References
 
