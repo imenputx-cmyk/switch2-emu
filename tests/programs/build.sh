@@ -49,3 +49,16 @@ LIBNX_SRC="services/sm.c services/applet.c services/hid.c services/time.c \
     python3 ../../../tools/elf2nro.py hb_libnx.elf ../hb_libnx.nro
     rm hb_libnx.elf
 )
+
+# Threads with libnx's own mutex, condvar, semaphore and light event code.
+(
+    cd libnx_compat
+    clang $(echo "$hb" | sed 's|homebrew/link.ld|../homebrew/link.ld|') \
+        -Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
+        -Iinclude -I"$L/include" -I"$L/include/switch" -I"$L/source" \
+        -o hb_threads.elf crt_libnx.S ../homebrew/hb_relocate.c glue.c hb_threads.c \
+        "$L/source/kernel/mutex.c" "$L/source/kernel/condvar.c" \
+        "$L/source/kernel/semaphore.c" "$L/source/kernel/levent.c" "$L/source/kernel/svc.s"
+    python3 ../../../tools/elf2nro.py hb_threads.elf ../hb_threads.nro
+    rm hb_threads.elf
+)

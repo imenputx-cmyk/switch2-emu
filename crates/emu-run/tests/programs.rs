@@ -215,3 +215,26 @@ OpenFile(/missing.txt) = 0x202
     assert_eq!(String::from_utf8(r.debug_output).unwrap(), expected);
     assert_eq!(written.unwrap(), "written by libnx");
 }
+
+#[test]
+fn threads_and_synchronization() {
+    // tests/programs/libnx_compat/hb_threads.c: four guest threads using
+    // libnx's mutex (ArbitrateLock/Unlock), condvar (process-wide keys),
+    // semaphore and light event (address arbiter), joined with
+    // WaitSynchronization. 0xEA01 (59905) is TimedOut.
+    let r = emu_run::run_nro(&program("hb_threads.nro"), 50_000_000, false).expect("boots");
+    assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0));
+    assert_eq!(
+        String::from_utf8(r.debug_output).unwrap(),
+        "\
+workers past the event before signal: 0
+workers past the event: 4
+counter (expect 2000): 2000
+consumed sum (expect 5050): 5050
+join rc: 0
+slept at least 5 ms: 1
+condvar timeout rc: 59905
+mutex held again: 1
+"
+    );
+}

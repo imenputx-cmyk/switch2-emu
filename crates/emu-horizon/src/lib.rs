@@ -16,12 +16,13 @@ pub mod kobjects;
 pub mod memmap;
 pub mod result;
 pub mod services;
+pub mod threads;
 
 use emu_cpu::{Cpu, Exit};
 use emu_loader::nro::parse_nro;
 use emu_loader::LoadError;
 use emu_memory::{Memory, Perm};
-use handles::{HandleTable, KObject, CURRENT_PROCESS, CURRENT_THREAD};
+use handles::{HandleTable, KObject, CURRENT_PROCESS};
 use memmap::{Block, MemState, MemoryMap, ATTR_LOCKED, ATTR_UNCACHED, PERM_R, PERM_W, PERM_X};
 use result::*;
 
@@ -132,8 +133,14 @@ pub struct Horizon {
     pub layout: Layout,
     heap_size: u64,
     main_thread_handle: u32,
-    thread_id: u64,
     process_id: u64,
+    /// All threads; `cpu` holds the registers of `threads[current]`.
+    pub threads: Vec<threads::Thread>,
+    pub current: usize,
+    next_tid: u64,
+    wait_counter: u64,
+    /// The current thread asked to yield (SleepThread(0)).
+    yield_requested: bool,
     /// MapMemory aliases: destination -> (source, size).
     aliases: Vec<(u64, u64, u64)>,
     /// Text written with svcOutputDebugString.
@@ -163,8 +170,12 @@ impl Horizon {
             layout: Layout::default(),
             heap_size: 0,
             main_thread_handle: 0,
-            thread_id: 0x51,
             process_id: 0x50,
+            threads: Vec::new(),
+            current: 0,
+            next_tid: 0x51,
+            wait_counter: 0,
+            yield_requested: false,
             aliases: Vec::new(),
             debug_output: Vec::new(),
             sessions: Vec::new(),
@@ -241,10 +252,13 @@ impl Horizon {
             MemState::Stack,
             PERM_R | PERM_W,
         );
-        self.map_block(l.tls_page, PAGE, MemState::ThreadLocal, PERM_R | PERM_W);
+        let tls = self.alloc_tls();
+        debug_assert_eq!(tls, l.tls_page);
+        let main = self.add_thread(Cpu::new(), 0x2C, tls, threads::ThreadState::Runnable);
+        self.current = main;
         self.main_thread_handle = self
             .handles
-            .insert(KObject::Thread { id: self.thread_id })
+            .insert(KObject::Thread { id: main })
             .expect("empty table");
 
         // Loader page: return stub (BRK, recognised by `run`) and config.
@@ -311,11 +325,23 @@ impl Horizon {
             if budget == 0 {
                 return Stop::StepLimit;
             }
-            match self.cpu.run(&mut self.mem, budget) {
-                None => return Stop::StepLimit,
+            match self.cpu.run(&mut self.mem, budget.min(threads::TIME_SLICE)) {
+                None => {
+                    // Time slice over: let the other threads run.
+                    if let Err(stop) = self.schedule(self.cpu.pc()) {
+                        return stop;
+                    }
+                }
                 Some(Exit::Svc(id)) => {
                     if let Err(stop) = self.svc(id) {
                         return stop;
+                    }
+                    let blocked =
+                        self.threads[self.current].state != threads::ThreadState::Runnable;
+                    if blocked || std::mem::take(&mut self.yield_requested) {
+                        if let Err(stop) = self.schedule(self.cpu.pc()) {
+                            return stop;
+                        }
                     }
                 }
                 Some(Exit::Brk(0x4C44)) if self.cpu.pc() == self.layout.loader_page => {
@@ -370,24 +396,32 @@ impl Horizon {
             0x05 => self.svc_unmap_memory(),
             0x06 => self.svc_query_memory(),
             0x07 => return Err(Stop::ExitProcess),
-            0x0B => {
-                // SleepThread: with a single thread there is nothing to
-                // yield to. Let time pass so polling loops make progress.
-                let ns = self.x(0) as i64;
-                if ns > 0 {
-                    self.cpu.counter += (ns as u64).saturating_mul(192) / 10_000;
-                }
-            }
+            0x08 => self.svc_create_thread(),
+            0x09 => self.svc_start_thread(),
+            0x0A => self.svc_exit_thread(),
+            0x0B => self.svc_sleep_thread(),
             0x0C => {
-                // GetThreadPriority: the main thread runs at 44 (0x2C).
-                if !self.is_thread(self.x(1) as u32) {
+                // GetThreadPriority
+                let Some(t) = self.thread_of(self.x(1) as u32) else {
                     self.ret(INVALID_HANDLE);
                     return Ok(());
-                }
+                };
                 self.ret(SUCCESS);
-                self.set_x(1, 0x2C);
+                self.set_x(1, u64::from(self.threads[t].priority));
             }
-            0x0D | 0x0F => self.ret(SUCCESS), // Set priority / core mask: accepted.
+            0x0D => {
+                // SetThreadPriority
+                let (h, prio) = (self.x(0) as u32, self.x(1) as u32);
+                match self.thread_of(h) {
+                    Some(_) if prio > 0x3F => self.ret(1 | (112 << 9)),
+                    Some(t) => {
+                        self.threads[t].priority = prio;
+                        self.ret(SUCCESS);
+                    }
+                    None => self.ret(INVALID_HANDLE),
+                }
+            }
+            0x0F => self.ret(SUCCESS), // SetThreadCoreMask: one core is emulated.
             0x0E => {
                 // GetThreadCoreMask: core 0, affinity mask core 0.
                 self.ret(SUCCESS);
@@ -411,26 +445,15 @@ impl Horizon {
             }
             0x13 => self.svc_map_shared_memory(),
             0x14 => self.svc_unmap_shared_memory(),
-            0x18 => return self.svc_wait_synchronization(pc),
+            0x18 => self.svc_wait_synchronization(),
             0x16 => {
                 let ok = self.handles.close(self.x(0) as u32);
                 self.ret(if ok { SUCCESS } else { INVALID_HANDLE });
             }
-            0x1A => self.ret(SUCCESS), // ArbitrateLock: only one thread, never contended.
-            0x1B => {
-                // ArbitrateUnlock: no waiters, so the mutex becomes free.
-                let addr = self.x(0);
-                match self.mem.write_uint(addr, 4, 0) {
-                    Ok(()) => self.ret(SUCCESS),
-                    Err(_) => self.ret(INVALID_ADDRESS),
-                }
-            }
-            0x1C => {
-                // WaitProcessWideKeyAtomic: no other thread can signal, so
-                // this times out; the mutex is held again on return.
-                self.ret(TIMED_OUT);
-            }
-            0x1D => self.ret(SUCCESS), // SignalProcessWideKey: no waiters.
+            0x1A => self.svc_arbitrate_lock(),
+            0x1B => self.svc_arbitrate_unlock(),
+            0x1C => self.svc_wait_process_wide_key(),
+            0x1D => self.svc_signal_process_wide_key(),
             0x1E => {
                 let tick = self.cpu.counter;
                 self.set_x(0, tick);
@@ -442,12 +465,13 @@ impl Horizon {
                 self.set_x(1, self.process_id);
             }
             0x25 => {
-                if !self.is_thread(self.x(1) as u32) {
+                // GetThreadId
+                let Some(t) = self.thread_of(self.x(1) as u32) else {
                     self.ret(INVALID_HANDLE);
                     return Ok(());
-                }
+                };
                 self.ret(SUCCESS);
-                self.set_x(1, self.thread_id);
+                self.set_x(1, self.thread_id(t));
             }
             0x26 => {
                 return Err(Stop::Break {
@@ -468,14 +492,12 @@ impl Horizon {
                 }
             }
             0x29 => self.svc_get_info(),
+            0x34 => self.svc_wait_for_address(),
+            0x35 => self.svc_signal_to_address(),
             0x2A | 0x2B => self.ret(SUCCESS), // Cache flushes: memory is coherent.
             _ => return Err(Stop::UnimplementedSvc { id, pc }),
         }
         Ok(())
-    }
-
-    fn is_thread(&self, handle: u32) -> bool {
-        handle == CURRENT_THREAD || matches!(self.handles.get(handle), Some(KObject::Thread { .. }))
     }
 
     fn is_process(&self, handle: u32) -> bool {
@@ -665,44 +687,6 @@ impl Horizon {
         self.map.remove(addr, size);
         self.kobjects.shared_memory[id].mapped_at = None;
         self.ret(SUCCESS);
-    }
-
-    /// WaitSynchronization: returns the index of a signaled object. With
-    /// a single thread nothing can signal while it waits, so a finite
-    /// timeout just lets the time pass and an infinite one is a deadlock.
-    fn svc_wait_synchronization(&mut self, pc: u64) -> Result<(), Stop> {
-        let (list, count, timeout) = (self.x(1), self.x(2), self.x(3) as i64);
-        if count > 0x40 {
-            self.ret(OUT_OF_RANGE);
-            return Ok(());
-        }
-        for i in 0..count {
-            let Ok(h) = self.mem.read_uint(list + 4 * i, 4) else {
-                self.ret(INVALID_ADDRESS);
-                return Ok(());
-            };
-            match self.handles.get(h as u32) {
-                Some(&KObject::Event { id }) => {
-                    if self.kobjects.events[id] {
-                        self.ret(SUCCESS);
-                        self.set_x(1, i);
-                        return Ok(());
-                    }
-                }
-                Some(KObject::Thread { .. } | KObject::Process) | Some(KObject::Session { .. }) => {
-                }
-                _ => {
-                    self.ret(INVALID_HANDLE);
-                    return Ok(());
-                }
-            }
-        }
-        if timeout < 0 {
-            return Err(Stop::Deadlock { pc });
-        }
-        self.cpu.counter += (timeout as u64).saturating_mul(192) / 10_000;
-        self.ret(TIMED_OUT);
-        Ok(())
     }
 
     fn svc_query_memory(&mut self) {

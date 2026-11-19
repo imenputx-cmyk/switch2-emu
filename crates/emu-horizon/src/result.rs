@@ -22,6 +22,7 @@ pub const INVALID_COMBINATION: ResultCode = kernel(116);
 pub const TIMED_OUT: ResultCode = kernel(117);
 pub const INVALID_ENUM_VALUE: ResultCode = kernel(120);
 pub const NOT_FOUND: ResultCode = kernel(121);
+pub const OUT_OF_RESOURCE: ResultCode = kernel(103);
 pub const OUT_OF_RANGE: ResultCode = kernel(119);
 pub const INVALID_STATE: ResultCode = kernel(125);
 

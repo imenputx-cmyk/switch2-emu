@@ -10,7 +10,8 @@ pub const CURRENT_PROCESS: u32 = 0xFFFF_8001;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KObject {
     Thread {
-        id: u64,
+        /// Index into `Horizon::threads`.
+        id: usize,
     },
     Process,
     /// A client session to an IPC service (index into the kernel's
