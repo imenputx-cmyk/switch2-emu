@@ -298,6 +298,10 @@ def run_unicorn_isolated(*case):
     pid = os.fork()
     if pid == 0:
         os.close(r)
+        # No core dumps: on CI runners every crash would otherwise write
+        # one, which takes seconds.
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         os.dup2(devnull, 2)
