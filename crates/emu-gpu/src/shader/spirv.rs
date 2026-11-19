@@ -542,8 +542,9 @@ mod tests {
 
     /// Validates with spirv-val when it is installed.
     fn validate(words: &[u32]) {
-        let path =
-            std::env::temp_dir().join(format!("emu-spirv-{}-{:p}.spv", std::process::id(), words));
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("emu-spirv-{}-{n}.spv", std::process::id()));
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         std::fs::write(&path, bytes).unwrap();
         match std::process::Command::new("spirv-val")
