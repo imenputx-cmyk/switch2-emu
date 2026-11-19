@@ -1,8 +1,9 @@
 //! Loads executable images into guest memory.
 //!
-//! Only 64-bit little-endian AArch64 ELF files are supported so far. They
-//! are used for test programs built with clang. The Switch's own formats
-//! (NSO, NRO) come later.
+//! - ELF (64-bit little-endian AArch64): test programs built with clang.
+//! - NRO ([`nro`]): Switch homebrew. NSO comes later.
+
+pub mod nro;
 
 use emu_memory::{Memory, Perm, PAGE_SIZE};
 use std::collections::BTreeMap;

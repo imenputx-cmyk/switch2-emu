@@ -12,8 +12,8 @@ This project does not include, distribute, or require any copyrighted Nintendo f
    - Done: the integer instruction set (including LSE atomics, CAS/CASP, LDXP/STXP, LDAPR, CRC32); scalar single/double floating point with ARM NaN rules; SIMD&FP loads and stores including LD1-LD4/ST1-ST4; Advanced SIMD integer and single/double floating-point arithmetic, widening/narrowing, saturating (with FPSR.QC), shifts, permutes, TBL/TBX, reductions, by-element forms, dot product, and the ARM reciprocal (square root) estimates.
    - Half precision (FP16) in scalar and vector forms, and the Cryptographic Extension (AES, SHA-1, SHA-256, 64-bit PMULL), checked against the FIPS test vectors. System instructions used from user code: DC ZVA, cache maintenance by address, IC IVAU, and the EL0 counters (CNTVCT/CNTPCT).
    - To do: FPCR rounding modes other than round-to-nearest, flush-to-zero, and the FPSR exception flags. Not targeted, because the Cortex-A78C does not have them: FCMLA/FCADD, FRINT32/64, BF16, LSE2.
-4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory and ELF loader done; NSO/NRO to come)*
-5. **Service layer (HLE):** Simple emulation of OS calls.
+4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory, ELF and NRO loaders done; NSO to come)*
+5. **Kernel and services (HLE):** Emulation of Horizon's SVCs and IPC services. *(in progress: homebrew boots through the homebrew ABI; memory, info, debug output and single-thread synchronization SVCs work; IPC services next)*
 6. **JIT:** Dynamic translation from AArch64 to x86-64 after the interpreter is correct.
 7. **GPU:** Parse the command stream and translate it to Vulkan.
 8. **Audio, input, and performance.**
@@ -26,13 +26,15 @@ Accuracy comes before speed. The interpreter is the reference that the JIT and G
 crates/
   emu-memory/  Guest virtual memory: 4 KiB pages, permissions, faults
   emu-cpu/     AArch64 CPU: register state, decoder, reference interpreter, FP rules
-  emu-loader/  ELF loader (NSO/NRO later)
+  emu-loader/  ELF and NRO loaders (NSO later)
+  emu-horizon/ Horizon kernel HLE: memory state map, handles, SVCs, homebrew boot
   emu-run/     Runs freestanding test programs (CLI: emu-run file.elf)
 tests/programs/  C test programs, built with clang (ELF files are committed)
 tools/
   asm.py       Assemble instructions with llvm-mc and print encodings
   difftest.py  Differential test against Unicorn on random instructions
   run_unicorn.py  Run a test program in Unicorn, to compare whole-program output
+  elf2nro.py   Convert a position-independent ELF to an NRO (homebrew format)
 ```
 
 ## Build and test
@@ -43,6 +45,7 @@ cargo run --release -p emu-run -- tests/programs/hello.elf
 cargo run --release -p emu-run -- tests/programs/float.elf
 cargo run --release -p emu-run -- tests/programs/simd.elf
 cargo run --release -p emu-run -- tests/programs/crypto.elf
+cargo run --release -p emu-run -- tests/programs/hb_hello.nro   # homebrew, real Switch SVCs
 ```
 
 ### How correctness is checked
@@ -63,4 +66,7 @@ cargo run --release -p emu-run -- tests/programs/crypto.elf
 ## References
 
 - ARM Architecture Reference Manual for A-profile (ARM DDI 0487): instruction encodings and pseudocode.
+- [switchbrew wiki](https://switchbrew.org/wiki/): the NRO format, the homebrew ABI, SVC numbers, arguments, `GetInfo` types, `MemoryInfo` layout and memory states.
+- [libnx](https://github.com/switchbrew/libnx) (ISC): read to learn what homebrew expects at startup (config entries, region queries, TLS layout, result codes). No code is copied; the test homebrew in `tests/programs/homebrew` has its own start code.
+- Ryujinx (MIT) and yuzu: overall structure of a kernel HLE. Only used as background; no code is copied.
 - [oboromi](https://github.com/0xNikilite/oboromi) (GPL-3.0): used only as an architectural reference for how a Switch 2 emulator can be organized (multi-core CPU manager, HIPC/service layer, SM86 GPU decoding). No code is copied from it, so this project keeps its own MIT/Apache-2.0 license.

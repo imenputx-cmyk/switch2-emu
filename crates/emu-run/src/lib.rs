@@ -1,8 +1,9 @@
-//! Runs freestanding AArch64 test programs (ELF) on the emulated CPU.
+//! Runs programs on the emulated CPU.
 //!
-//! Programs talk to the host through a tiny test ABI, `svc #0` with the call
-//! number in x8 (see `tests/programs/rt.h`). This is not the Switch OS
-//! interface; that is a later milestone.
+//! - ELF test programs talk to the host through a tiny test ABI, `svc #0`
+//!   with the call number in x8 (see `tests/programs/rt.h`).
+//! - NRO homebrew boots through the homebrew ABI on the Horizon HLE kernel
+//!   (`emu-horizon`) and uses real Switch SVCs.
 
 use emu_cpu::{Cpu, Exit};
 use emu_loader::load_elf;
@@ -116,4 +117,25 @@ pub fn run_elf(elf: &[u8], max_steps: u64) -> Result<RunResult, RunError> {
             }
         }
     }
+}
+
+/// Result of running homebrew on the Horizon HLE kernel.
+#[derive(Debug)]
+pub struct HomebrewResult {
+    pub stop: emu_horizon::Stop,
+    /// Text the program wrote with svcOutputDebugString.
+    pub debug_output: Vec<u8>,
+    pub instructions: u64,
+}
+
+pub fn run_nro(nro: &[u8], max_steps: u64, trace_svcs: bool) -> Result<HomebrewResult, RunError> {
+    let mut hos = emu_horizon::Horizon::new();
+    hos.trace_svcs = trace_svcs;
+    hos.boot_homebrew(nro).map_err(RunError::Load)?;
+    let stop = hos.run(max_steps);
+    Ok(HomebrewResult {
+        stop,
+        debug_output: hos.debug_output,
+        instructions: hos.cpu.counter,
+    })
 }

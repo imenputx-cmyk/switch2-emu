@@ -12,3 +12,11 @@ clang $common -mgeneral-regs-only -o hello.elf hello.c
 clang $common -fno-vectorize -fno-slp-vectorize -o float.elf float.c
 clang $common -mcpu=cortex-a78c -o simd.elf simd.c
 clang $common -mcpu=cortex-a78c -o crypto.elf crypto.c
+
+# Homebrew: position-independent, converted to NRO with tools/elf2nro.py.
+hb="--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib -fPIE \
+    -mcpu=cortex-a78c -fno-stack-protector -fuse-ld=lld \
+    -Wl,-pie,--no-dynamic-linker,-z,max-page-size=4096,-T,homebrew/link.ld,-s"
+clang $hb -o homebrew/hb_hello.elf homebrew/crt0.S homebrew/hb_hello.c
+python3 ../../tools/elf2nro.py homebrew/hb_hello.elf hb_hello.nro
+rm homebrew/hb_hello.elf

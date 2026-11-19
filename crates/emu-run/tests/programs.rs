@@ -87,3 +87,42 @@ pmull64        = 0x000000000000007d 0x000000000000007d
 ";
     assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
 }
+
+#[test]
+fn homebrew_nro_boots_through_the_homebrew_abi() {
+    // tests/programs/homebrew/hb_hello.c, converted with tools/elf2nro.py.
+    // Result codes follow libnx (module 1, description << 9): 0xF001
+    // InvalidEnumValue, 0xE401 InvalidHandle, 0xCA01 InvalidSize. The heap
+    // checksum was recomputed in Python.
+    let nro = program("hb_hello.nro");
+    let r = emu_run::run_nro(&nro, 10_000_000, false).expect("boots");
+    assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(42));
+    let expected = "\
+Hello from homebrew!
+relocated pointers work
+entry x1 = 0xffffffffffffffff
+config MainThreadHandle = 0x8000
+config AppletType = 0x0
+config HosVersion = 0x150000
+loader: switch2-emu
+heap region = 0x1000000000
+heap region size = 0x180000000
+aslr region = 0x8000000
+GetInfo(bad type) = 0xf001
+GetInfo(bad handle) = 0xe401
+SetHeapSize(0x123) = 0xca01
+SetHeapSize(4 MiB) = 0x0
+heap = 0x1000000000
+heap checksum = 0x2ff40000
+code:  type 0x3 perm 0x5
+stack: type 0xb perm 0x3 size 0x100000
+heap:  type 0x5 size 0x400000
+MapMemory = 0x0
+source while mapped: perm 0x0 attr 0x1
+UnmapMemory = 0x0
+value seen through heap = 0x1234567890abcdef
+tick advanced = 0x1
+Returning 42 to the loader
+";
+    assert_eq!(String::from_utf8(r.debug_output).unwrap(), expected);
+}

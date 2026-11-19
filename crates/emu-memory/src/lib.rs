@@ -42,6 +42,11 @@ impl Perm {
         write: true,
         exec: true,
     };
+    pub const NONE: Perm = Perm {
+        read: false,
+        write: false,
+        exec: false,
+    };
 }
 
 /// Why a memory access failed.
@@ -137,6 +142,44 @@ impl Memory {
                     })
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Unmaps `size` bytes at `addr` (page-aligned). Unmapped pages in
+    /// the range are ignored.
+    pub fn unmap(&mut self, addr: u64, size: u64) -> Result<(), MapError> {
+        if addr & PAGE_MASK != 0 || size & PAGE_MASK != 0 {
+            return Err(MapError::Unaligned);
+        }
+        let first = addr >> PAGE_BITS;
+        for i in 0..(size >> PAGE_BITS) {
+            self.pages.remove(&(first + i));
+        }
+        Ok(())
+    }
+
+    /// Moves the pages of `[src, src + size)` to `dst`, keeping their
+    /// contents and permissions. Used for Horizon's MapMemory, where the
+    /// source becomes inaccessible while the alias exists, so moving the
+    /// pages is equivalent to sharing them.
+    pub fn move_pages(&mut self, src: u64, dst: u64, size: u64) -> Result<(), Fault> {
+        let count = size >> PAGE_BITS;
+        for i in 0..count {
+            let page = (src >> PAGE_BITS) + i;
+            if !self.pages.contains_key(&page) {
+                return Err(Fault {
+                    addr: page << PAGE_BITS,
+                    kind: FaultKind::Unmapped,
+                });
+            }
+        }
+        for i in 0..count {
+            let page = self
+                .pages
+                .remove(&((src >> PAGE_BITS) + i))
+                .expect("checked");
+            self.pages.insert((dst >> PAGE_BITS) + i, page);
         }
         Ok(())
     }
@@ -330,6 +373,22 @@ mod tests {
         assert_eq!(
             m.fetch_u32(0x1000).unwrap_err().kind,
             FaultKind::NotExecutable
+        );
+    }
+
+    #[test]
+    fn move_and_unmap_pages() {
+        let mut m = Memory::new();
+        m.map(0x1000, PAGE_SIZE * 2, Perm::RW).unwrap();
+        m.write_u64(0x1008, 77).unwrap();
+        m.move_pages(0x1000, 0x9000, PAGE_SIZE * 2).unwrap();
+        assert_eq!(m.read_u64(0x9008).unwrap(), 77);
+        assert!(!m.is_mapped(0x1000));
+        m.unmap(0x9000, PAGE_SIZE).unwrap();
+        assert!(!m.is_mapped(0x9000) && m.is_mapped(0xA000));
+        assert_eq!(
+            m.move_pages(0x1000, 0x9000, PAGE_SIZE).unwrap_err().kind,
+            FaultKind::Unmapped
         );
     }
 

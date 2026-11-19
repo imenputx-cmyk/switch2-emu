@@ -10,6 +10,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "emu-horizon"
+version = "0.1.0"
+dependencies = [
+ "emu-cpu",
+ "emu-loader",
+ "emu-memory",
+]
+
+[[package]]
 name = "emu-loader"
 version = "0.1.0"
 dependencies = [
@@ -25,6 +34,7 @@ name = "emu-run"
 version = "0.1.0"
 dependencies = [
  "emu-cpu",
+ "emu-horizon",
  "emu-loader",
  "emu-memory",
 ]
