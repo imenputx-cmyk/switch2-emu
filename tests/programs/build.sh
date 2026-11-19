@@ -93,5 +93,25 @@ GFX_SRC="services/sm.c services/applet.c services/vi.c services/nv.c \
         buffer_producer_clang.c "$L/source/services/hid.c" "$L/source/runtime/pad.c" \
         $(for f in $GFX_SRC; do echo "$L/source/$f"; done)
     python3 ../../../tools/elf2nro.py hb_breakout.elf ../hb_breakout.nro
-    rm hb_gfx.elf hb_breakout.elf buffer_producer_clang.c
+    # GPU: libnx's nvidia stack (address space, channel, fences). Its
+    # nvchannel.c also uses variable-length arrays in structs; the
+    # functions doing so (all unused after 4.0.0) are dropped for clang.
+    awk '/^Result nvioctlChannel_(SubmitGpfifo|Submit|MapCommandBuffer|UnmapCommandBuffer)\(/{skip=1} !skip{print} skip && /^}/{skip=0}' \
+        "$L/source/nvidia/ioctl/nvchannel.c" > nvchannel_clang.c
+    cat >> nvchannel_clang.c <<'EOC'
+Result nvioctlChannel_SubmitGpfifo(u32 fd, nvioctl_gpfifo_entry *entries, u32 num_entries, u32 flags, nvioctl_fence *fence_inout) {
+    (void)fd; (void)entries; (void)num_entries; (void)flags; (void)fence_inout;
+    return MAKERESULT(Module_Libnx, LibnxError_IncompatSysVer);
+}
+EOC
+    clang $(echo "$hb" | sed 's|homebrew/link.ld|../homebrew/link.ld|') \
+        -Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
+        -Iinclude -I"$L/include" -I"$L/include/switch" -I"$L/source" -I"$L/source/display" \
+        -I"$L/source/nvidia/ioctl" \
+        -o hb_gpu.elf crt_libnx.S ../homebrew/hb_relocate.c glue.c hb_gpu.c \
+        buffer_producer_clang.c nvchannel_clang.c \
+        $(for f in $GFX_SRC nvidia/gpu.c nvidia/address_space.c nvidia/gpu_channel.c \
+            nvidia/channel.c nvidia/ioctl/nvhost-as-gpu.c nvidia/ioctl/nvhost-ctrl-gpu.c; do echo "$L/source/$f"; done)
+    python3 ../../../tools/elf2nro.py hb_gpu.elf ../hb_gpu.nro
+    rm hb_gfx.elf hb_breakout.elf hb_gpu.elf buffer_producer_clang.c nvchannel_clang.c
 )

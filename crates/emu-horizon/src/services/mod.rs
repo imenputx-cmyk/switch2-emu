@@ -9,6 +9,7 @@ pub mod apm;
 pub mod fs;
 pub mod hid;
 pub mod nv;
+pub mod nvgpu;
 pub mod set;
 pub mod sm;
 pub mod time;
@@ -74,6 +75,8 @@ pub type Presenter = Box<dyn FnMut(&Frame, &mut hid::InputState) -> bool>;
 pub struct System {
     /// nvmap objects by handle (== id).
     pub nvmap: std::collections::HashMap<u32, nv::NvMapObject>,
+    /// The GPU.
+    pub gpu: emu_gpu::Gpu,
     /// Buffer queues by binder id.
     pub buffer_queues: std::collections::HashMap<u32, vi::BufferQueue>,
     /// Called for each presented frame; without it frames are kept in

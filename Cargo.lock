@@ -90,10 +90,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "emu-gpu"
+version = "0.1.0"
+dependencies = [
+ "emu-memory",
+]
+
+[[package]]
 name = "emu-horizon"
 version = "0.1.0"
 dependencies = [
  "emu-cpu",
+ "emu-gpu",
  "emu-loader",
  "emu-memory",
 ]

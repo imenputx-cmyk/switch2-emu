@@ -340,3 +340,59 @@ fn breakout_game_with_input() {
     assert!(p[18] < right_wall - 40.0, "{}", p[18]);
     assert!((p[85] - right_wall).abs() < 2.0, "{}", p[85]);
 }
+
+#[test]
+fn gpu_commands_and_rendered_frames() {
+    // tests/programs/libnx_compat/hb_gpu.c submits pushbuffers through
+    // libnx's nvidia stack (nvhost-as-gpu, nvhost-gpu, syncpoint fences):
+    // copy engine fill and block-linear round trip, inline uploads and a
+    // semaphore, then frames made of 3D-engine clears into the display's
+    // framebuffers.
+    let r = emu_run::run_nro(&program("hb_gpu.nro"), 200_000_000, false).expect("boots");
+    assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0));
+    let out = String::from_utf8(r.debug_output).unwrap();
+    let expected = "\
+framebufferCreate = 0x0
+nvGpuInit = 0x0
+3D class = 0xb197
+nvAddressSpaceCreate = 0x0
+nvGpuChannelCreate = 0x0
+map cmd = 0x0
+map scratch = 0x0
+map framebuffer = 0x0
+submit = 0x0
+fill word 0 = 0x12345678
+fill word 63 = 0x12345678
+fill word 64 = 0x0
+inline 0 = 0xaaaa0001
+inline 2 = 0xcccc0003
+block-linear round trip = 0x1
+semaphore = 0x5e3a
+gpu frame 0x0
+gpu frame 0x1
+gpu frame 0x2
+";
+    assert_eq!(out, expected);
+    assert_eq!(r.frames.len(), 3);
+    let px = |f: &emu_horizon::services::Frame, x: u32, y: u32| {
+        let at = ((y * f.width + x) * 4) as usize;
+        [f.rgba[at], f.rgba[at + 1], f.rgba[at + 2], f.rgba[at + 3]]
+    };
+    let unorm = |v: f32| (v * 255.0).round() as u8;
+    for (i, f) in r.frames.iter().enumerate() {
+        let i = i as u32;
+        assert_eq!((f.width, f.height), (1280, 720));
+        assert_eq!(px(f, 5, 5), [unorm(0.05), unorm(0.05), unorm(0.15), 255]);
+        assert_eq!(px(f, 640, 200), [unorm(0.9), unorm(0.2), unorm(0.2), 255]);
+        assert_eq!(px(f, 1279, 559), [unorm(0.2), unorm(0.4), unorm(0.95), 255]);
+        // The yellow square moves 300 pixels per frame.
+        assert_eq!(
+            px(f, 100 + i * 300, 260),
+            [255, unorm(0.9), unorm(0.2), 255]
+        );
+        assert_eq!(
+            px(f, 300 + i * 300, 260),
+            [unorm(0.05), unorm(0.05), unorm(0.15), 255]
+        );
+    }
+}

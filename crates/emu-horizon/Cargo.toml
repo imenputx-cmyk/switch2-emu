@@ -9,3 +9,4 @@ description = "High-level emulation of the Horizon kernel: memory, handles, SVCs
 emu-cpu = { path = "../emu-cpu" }
 emu-memory = { path = "../emu-memory" }
 emu-loader = { path = "../emu-loader" }
+emu-gpu = { path = "../emu-gpu" }

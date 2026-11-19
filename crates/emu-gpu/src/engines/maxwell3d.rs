@@ -1,0 +1,339 @@
+//! The 3D engine (class B197, MAXWELL_B). Most methods only set state in
+//! a register file; a few trigger work. Emulated so far: render target
+//! clears, inline data uploads, syncpoint increments and report
+//! semaphores, and storing macro (MME) code. Draws and macro calls are
+//! reported as not emulated.
+
+use super::inline::InlineToMemory;
+use super::{bits, EngineCtx};
+use crate::blocklinear;
+use crate::surface::ColorFormat;
+
+/// Register file size in words: methods 0x0000..0x3800 (bytes).
+const REGS: usize = 0xE00;
+
+/// Register byte offsets.
+mod reg {
+    pub const MME_INSTRUCTION_RAM_POINTER: u32 = 0x114;
+    pub const MME_INSTRUCTION_RAM: u32 = 0x118;
+    pub const MME_START_ADDRESS_RAM_POINTER: u32 = 0x11C;
+    pub const MME_START_ADDRESS_RAM: u32 = 0x120;
+    pub const INCREMENT_SYNC_POINT: u32 = 0x2C8;
+    pub const COLOR_TARGET: u32 = 0x800; // + 64 * j: A, B, WIDTH, HEIGHT, FORMAT, MEMORY
+    pub const CLEAR_RECT_HORIZONTAL: u32 = 0xD6C;
+    pub const CLEAR_RECT_VERTICAL: u32 = 0xD70;
+    pub const COLOR_CLEAR_VALUE: u32 = 0xD80;
+    pub const SCISSOR_ENABLE: u32 = 0xE00;
+    pub const SCISSOR_HORIZONTAL: u32 = 0xE04;
+    pub const SCISSOR_VERTICAL: u32 = 0xE08;
+    pub const SURFACE_CLIP_HORIZONTAL: u32 = 0xFF4;
+    pub const SURFACE_CLIP_VERTICAL: u32 = 0xFF8;
+    pub const CLEAR_SURFACE: u32 = 0x19D0;
+    pub const REPORT_SEMAPHORE_A: u32 = 0x1B00;
+    pub const REPORT_SEMAPHORE_C: u32 = 0x1B08;
+    pub const REPORT_SEMAPHORE_D: u32 = 0x1B0C;
+    pub const MACRO_CALLS: u32 = 0x3800;
+}
+
+/// Methods that start work this backend cannot do yet (draws).
+const DRAW_TRIGGERS: [u32; 9] = [
+    0x304, 0x1214, 0x1218, 0x123C, 0x1304, 0x15E8, 0x15F0, 0x1614, 0x1618,
+];
+
+pub struct Maxwell3D {
+    regs: Vec<u32>,
+    inline: InlineToMemory,
+    /// Macro (MME) code and entry points, as uploaded.
+    pub mme_code: Vec<u32>,
+    pub mme_starts: Vec<u32>,
+    /// Render target clears performed (for diagnostics and tests).
+    pub clears: u64,
+}
+
+impl Default for Maxwell3D {
+    fn default() -> Self {
+        Maxwell3D {
+            regs: vec![0; REGS],
+            inline: InlineToMemory::default(),
+            mme_code: vec![0; 0x2000],
+            mme_starts: vec![0; 0x80],
+            clears: 0,
+        }
+    }
+}
+
+impl Maxwell3D {
+    /// A register by byte offset.
+    pub fn reg(&self, offset: u32) -> u32 {
+        self.regs.get(offset as usize / 4).copied().unwrap_or(0)
+    }
+
+    pub fn write(&mut self, method: u32, value: u32, ctx: &mut EngineCtx) -> bool {
+        let offset = method * 4;
+        if offset >= reg::MACRO_CALLS {
+            // CALL_MME_MACRO / CALL_MME_DATA: needs the macro interpreter.
+            return false;
+        }
+        if (0x180..=0x1B4).contains(&offset) {
+            return self.inline.write(method, value, ctx);
+        }
+        self.regs[method as usize] = value;
+        match offset {
+            reg::MME_INSTRUCTION_RAM => {
+                let p = self.reg(reg::MME_INSTRUCTION_RAM_POINTER);
+                if let Some(slot) = self.mme_code.get_mut(p as usize) {
+                    *slot = value;
+                }
+                self.regs[reg::MME_INSTRUCTION_RAM_POINTER as usize / 4] = p.wrapping_add(1);
+            }
+            reg::MME_START_ADDRESS_RAM => {
+                let p = self.reg(reg::MME_START_ADDRESS_RAM_POINTER);
+                if let Some(slot) = self.mme_starts.get_mut(p as usize) {
+                    *slot = value;
+                }
+                self.regs[reg::MME_START_ADDRESS_RAM_POINTER as usize / 4] = p.wrapping_add(1);
+            }
+            reg::INCREMENT_SYNC_POINT => ctx.increment_syncpoint(bits(value, 11, 0)),
+            reg::CLEAR_SURFACE => self.clear(value, ctx),
+            reg::REPORT_SEMAPHORE_D => self.report_semaphore(value, ctx),
+            o if DRAW_TRIGGERS.contains(&o) => return false,
+            _ => {}
+        }
+        true
+    }
+
+    fn report_semaphore(&mut self, d: u32, ctx: &mut EngineCtx) {
+        let operation = d & 3;
+        if operation == 1 || operation == 3 {
+            return; // acquire (always satisfied) / trap
+        }
+        let va = u64::from(self.reg(reg::REPORT_SEMAPHORE_A) & 0xFF) << 32
+            | u64::from(self.reg(reg::REPORT_SEMAPHORE_A + 4));
+        // Release writes the payload; a report writes the counter (none
+        // are tracked yet, so 0).
+        let value = if operation == 0 {
+            self.reg(reg::REPORT_SEMAPHORE_C)
+        } else {
+            0
+        };
+        if d & (1 << 28) != 0 {
+            ctx.write(va, &value.to_le_bytes());
+        } else {
+            let mut data = u64::from(value).to_le_bytes().to_vec();
+            data.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+            ctx.write(va, &data);
+        }
+    }
+
+    /// CLEAR_SURFACE: fills the selected render target with the clear
+    /// color, limited by the surface clip, scissor 0 and the clear rect.
+    fn clear(&mut self, v: u32, ctx: &mut EngineCtx) {
+        let mask = [v & 4 != 0, v & 8 != 0, v & 16 != 0, v & 32 != 0];
+        if !mask.iter().any(|&m| m) {
+            return; // depth/stencil only: no depth buffers yet
+        }
+        let rt = reg::COLOR_TARGET + 64 * bits(v, 9, 6);
+        let Some(format) = ColorFormat::from_raw(self.reg(rt + 0x10)) else {
+            ctx.faults.push(format!(
+                "clear: render target format {:#x} not supported",
+                self.reg(rt + 0x10)
+            ));
+            return;
+        };
+        let base = u64::from(self.reg(rt) & 0xFF) << 32 | u64::from(self.reg(rt + 4));
+        let memory = self.reg(rt + 0x14);
+        let pitch_layout = memory & (1 << 12) != 0;
+        let bpp = format.bytes_per_pixel();
+        // For pitch layout WIDTH holds the pitch in bytes.
+        let (width, row_bytes) = if pitch_layout {
+            (self.reg(rt + 8) / bpp, self.reg(rt + 8))
+        } else {
+            (self.reg(rt + 8), self.reg(rt + 8) * bpp)
+        };
+        let height = self.reg(rt + 0xC);
+        let block_height = bits(memory, 7, 4);
+
+        // Clear area.
+        let (mut x0, mut y0, mut x1, mut y1) = (0, 0, width, height);
+        let clip = |lo: u32, hi: u32, a: &mut u32, b: &mut u32| {
+            *a = (*a).max(lo);
+            *b = (*b).min(hi);
+        };
+        let ch = self.reg(reg::SURFACE_CLIP_HORIZONTAL);
+        let cv = self.reg(reg::SURFACE_CLIP_VERTICAL);
+        if ch >> 16 != 0 && cv >> 16 != 0 {
+            clip(ch & 0xFFFF, (ch & 0xFFFF) + (ch >> 16), &mut x0, &mut x1);
+            clip(cv & 0xFFFF, (cv & 0xFFFF) + (cv >> 16), &mut y0, &mut y1);
+        }
+        if self.reg(reg::SCISSOR_ENABLE) & 1 != 0 {
+            let (h, vv) = (
+                self.reg(reg::SCISSOR_HORIZONTAL),
+                self.reg(reg::SCISSOR_VERTICAL),
+            );
+            clip(h & 0xFFFF, h >> 16, &mut x0, &mut x1);
+            clip(vv & 0xFFFF, vv >> 16, &mut y0, &mut y1);
+        }
+        let (rh, rv) = (
+            self.reg(reg::CLEAR_RECT_HORIZONTAL),
+            self.reg(reg::CLEAR_RECT_VERTICAL),
+        );
+        if rh >> 16 != 0 && rv >> 16 != 0 {
+            clip(rh & 0xFFFF, rh >> 16, &mut x0, &mut x1);
+            clip(rv & 0xFFFF, rv >> 16, &mut y0, &mut y1);
+        }
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let color = [0, 1, 2, 3].map(|i| f32::from_bits(self.reg(reg::COLOR_CLEAR_VALUE + 4 * i)));
+        let pixel = format.encode(color);
+        let row: Vec<u8> = pixel
+            .iter()
+            .copied()
+            .cycle()
+            .take(((x1 - x0) * bpp) as usize)
+            .collect();
+        let partial = !mask.iter().all(|&m| m);
+        let keep = if partial {
+            match format.component_bytes(mask) {
+                Some(k) => Some(k),
+                None => {
+                    ctx.faults
+                        .push(format!("clear: masked clear of {format:?} not supported"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let addr = |x_byte: u32, y: u32| {
+            if pitch_layout {
+                base + u64::from(y) * u64::from(row_bytes) + u64::from(x_byte)
+            } else {
+                base + blocklinear::offset(x_byte, y, row_bytes, block_height) as u64
+            }
+        };
+        for y in y0..y1 {
+            let mut x = x0 * bpp;
+            let end = x1 * bpp;
+            while x < end {
+                // Runs of up to 16 bytes are contiguous in both layouts.
+                let n = (16 - x % 16).min(end - x);
+                let src = &row[(x - x0 * bpp) as usize..(x - x0 * bpp + n) as usize];
+                let va = addr(x, y);
+                match &keep {
+                    None => ctx.write(va, src),
+                    Some(keep) => {
+                        let mut cur = vec![0u8; n as usize];
+                        ctx.read(va, &mut cur);
+                        for (i, b) in cur.iter_mut().enumerate() {
+                            if keep[(x as usize + i) % bpp as usize] {
+                                *b = src[i];
+                            }
+                        }
+                        ctx.write(va, &cur);
+                    }
+                }
+                x += n;
+            }
+        }
+        self.clears += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::{immd, incr, run, setup};
+    use crate::{blocklinear, class};
+
+    fn rt_setup(target: u64, width: u32, height: u32, format: u32, memory: u32) -> Vec<u32> {
+        vec![
+            incr(0, 0, 1),
+            class::THREED,
+            incr(0, 0x800, 6),
+            (target >> 32) as u32,
+            target as u32,
+            width,
+            height,
+            format,
+            memory,
+        ]
+    }
+
+    #[test]
+    fn clear_pitch_target_with_scissor() {
+        let (mut gpu, mut mem) = setup();
+        let mut cmds = rt_setup(0x1001_0000, 64 * 4, 16, 0xD5, 1 << 12);
+        cmds.extend([
+            incr(0, 0xD80, 4),
+            1.0f32.to_bits(),
+            0.5f32.to_bits(),
+            0.0f32.to_bits(),
+            1.0f32.to_bits(),
+            immd(0, 0xE00, 1),
+            incr(0, 0xE04, 2),
+            2 | (10 << 16), // x 2..10
+            3 | (5 << 16),  // y 3..5
+            immd(0, 0x19D0, 0x3C),
+        ]);
+        run(&mut gpu, &mut mem, &cmds);
+        let px = |x: u64, y: u64| {
+            let mut b = [0u8; 4];
+            mem.read(0x101_0000 + y * 256 + x * 4, &mut b).unwrap();
+            b
+        };
+        assert_eq!(px(2, 3), [255, 128, 0, 255]);
+        assert_eq!(px(9, 4), [255, 128, 0, 255]);
+        assert_eq!(px(10, 4), [0; 4]);
+        assert_eq!(px(2, 5), [0; 4]);
+        assert_eq!(px(1, 3), [0; 4]);
+    }
+
+    #[test]
+    fn clear_block_linear_target() {
+        let (mut gpu, mut mem) = setup();
+        // 32x16 BGRA, 2 GOBs high.
+        let mut cmds = rt_setup(0x1002_0000, 32, 16, 0xCF, 1 << 4);
+        cmds.extend([
+            incr(0, 0xD80, 4),
+            0.0f32.to_bits(),
+            0.0f32.to_bits(),
+            1.0f32.to_bits(),
+            1.0f32.to_bits(),
+            immd(0, 0x19D0, 0x3C),
+        ]);
+        run(&mut gpu, &mut mem, &cmds);
+        let mut raw = vec![0u8; blocklinear::size(128, 16, 1)];
+        mem.read(0x102_0000, &mut raw).unwrap();
+        let linear = blocklinear::deswizzle(&raw, 128, 16, 1);
+        assert!(linear.chunks(4).all(|p| p == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn inline_upload_and_syncpoint() {
+        let (mut gpu, mut mem) = setup();
+        run(
+            &mut gpu,
+            &mut mem,
+            &[
+                incr(0, 0, 1),
+                class::THREED,
+                incr(0, 0x180, 2),
+                8,
+                1,
+                incr(0, 0x188, 2),
+                0x0,
+                0x1003_0000,
+                immd(0, 0x1B0, 1),
+                (3 << 29) | (2 << 16) | (0x1B4 / 4),
+                0x1122_3344,
+                0x5566_7788,
+                immd(0, 0x2C8, 50),
+            ],
+        );
+        let mut b = [0u8; 8];
+        mem.read(0x103_0000, &mut b).unwrap();
+        assert_eq!(b, [0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]);
+        assert_eq!(gpu.syncpoints[50], 1);
+    }
+}

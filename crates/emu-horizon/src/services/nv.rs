@@ -4,7 +4,7 @@
 //! objects over guest memory) and the parts of `/dev/nvhost-ctrl` used
 //! for fences. Struct layouts follow libnx's `nvidia/ioctl/*.c` (ISC).
 
-use super::{CallError, Ctx, Service};
+use super::{nvgpu, CallError, Ctx, Service};
 use std::collections::HashMap;
 
 /// An nvmap object: guest memory the GPU can use.
@@ -18,23 +18,25 @@ pub struct NvMapObject {
 }
 
 /// nvdrv error codes (returned in the reply, not as a result).
-const NV_SUCCESS: u32 = 0;
-const NV_NOT_IMPLEMENTED: u32 = 1;
-const NV_BAD_PARAMETER: u32 = 4;
+use nvgpu::{NV_BAD_PARAMETER, NV_NOT_IMPLEMENTED, NV_SUCCESS};
+const NV_TIMEOUT: u32 = 5;
 const NV_FILE_OPERATION_FAILED: u32 = 0x30003;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
     NvMap,
     NvHostCtrl,
+    /// A GPU address space (index into `Gpu::address_spaces`).
+    AsGpu(usize),
+    CtrlGpu,
+    /// A GPU channel (index into `Gpu::channels`).
+    Gpu(usize),
 }
 
 #[derive(Default)]
 pub struct NvDrv {
     fds: HashMap<u32, Device>,
     next_fd: u32,
-    /// Syncpoint values (nothing increments them yet: no GPU work).
-    syncpoints: HashMap<u32, u32>,
     events: HashMap<u32, usize>,
 }
 
@@ -71,9 +73,20 @@ impl NvDrv {
         dev: Device,
         io: &Ioctl,
         data: &mut [u8],
+        extra: &[u8],
         ctx: &mut Ctx,
     ) -> Result<u32, CallError> {
+        let fds = &self.fds;
+        let channel_of_fd = |fd: u32| match fds.get(&fd) {
+            Some(Device::Gpu(c)) => Some(*c),
+            _ => None,
+        };
         Ok(match (dev, io.kind, io.nr) {
+            (Device::AsGpu(a), 0x41, nr) => nvgpu::as_gpu(a, nr, data, ctx, channel_of_fd),
+            (Device::CtrlGpu, 0x47, nr) => nvgpu::ctrl_gpu(nr, data, ctx),
+            (Device::Gpu(c), kind @ (0x47 | 0x48), nr) => {
+                nvgpu::channel(c, kind, nr, data, extra, ctx)
+            }
             // NVMAP_IOC_CREATE {size in, handle out}
             (Device::NvMap, 1, 0x01) => {
                 let size = u32_at(data, 0);
@@ -153,18 +166,37 @@ impl NvDrv {
             }
             // NVHOST_IOCTL_CTRL_SYNCPT_READ {id, value out}
             (Device::NvHostCtrl, 0, 0x14) => {
-                let v = *self.syncpoints.get(&u32_at(data, 0)).unwrap_or(&0);
+                let v = ctx
+                    .system
+                    .gpu
+                    .syncpoints
+                    .get(u32_at(data, 0) as usize)
+                    .copied()
+                    .unwrap_or(0);
                 put_u32(data, 4, v);
                 NV_SUCCESS
             }
             // SYNCPT_INCR
             (Device::NvHostCtrl, 0, 0x15) => {
-                *self.syncpoints.entry(u32_at(data, 0)).or_default() += 1;
+                if let Some(v) = ctx.system.gpu.syncpoints.get_mut(u32_at(data, 0) as usize) {
+                    *v = v.wrapping_add(1);
+                }
                 NV_SUCCESS
             }
             // SYNCPT_WAIT, EVENT_WAIT, EVENT_WAIT_ASYNC: no GPU work is
             // ever pending, so every threshold has been reached.
-            (Device::NvHostCtrl, 0, 0x16 | 0x1D | 0x1E) => NV_SUCCESS,
+            (Device::NvHostCtrl, 0, 0x16 | 0x1D | 0x1E) => {
+                // SYNCPT_WAIT / EVENT_WAIT / EVENT_WAIT_ASYNC {id, threshold, ...}:
+                // GPU work runs at submission, so a fence that has not
+                // been reached never will be.
+                let (id, threshold) = (u32_at(data, 0) as usize, u32_at(data, 4));
+                let cur = ctx.system.gpu.syncpoints.get(id).copied().unwrap_or(0);
+                if cur.wrapping_sub(threshold) as i32 >= 0 {
+                    NV_SUCCESS
+                } else {
+                    NV_TIMEOUT
+                }
+            }
             // EVENT_SIGNAL, EVENT_REGISTER, EVENT_UNREGISTER
             (Device::NvHostCtrl, 0, 0x1C | 0x1F | 0x20) => NV_SUCCESS,
             _ => {
@@ -194,6 +226,11 @@ impl Service for NvDrv {
                 let dev = match &path[..end] {
                     b"/dev/nvmap" => Some(Device::NvMap),
                     b"/dev/nvhost-ctrl" => Some(Device::NvHostCtrl),
+                    b"/dev/nvhost-as-gpu" => {
+                        Some(Device::AsGpu(ctx.system.gpu.new_address_space()))
+                    }
+                    b"/dev/nvhost-ctrl-gpu" => Some(Device::CtrlGpu),
+                    b"/dev/nvhost-gpu" => Some(Device::Gpu(ctx.system.gpu.new_channel())),
                     _ => None,
                 };
                 match dev {
@@ -215,8 +252,9 @@ impl Service for NvDrv {
                     }
                 }
             }
-            1 => {
-                // Ioctl(fd, request) -> error; data in/out buffers.
+            1 | 11 | 12 => {
+                // Ioctl / Ioctl2 (second input buffer) / Ioctl3 (second
+                // output buffer)(fd, request) -> error.
                 let (fd, request) = (ctx.in_u32(0), ctx.in_u32(4));
                 let Some(&dev) = self.fds.get(&fd) else {
                     ctx.push_u32(NV_BAD_PARAMETER);
@@ -225,7 +263,12 @@ impl Service for NvDrv {
                 let io = decode(request);
                 let mut data = ctx.read_in_buffer(0)?;
                 data.resize(io.size, 0);
-                let err = self.ioctl(dev, &io, &mut data, ctx)?;
+                let extra = if command == 11 {
+                    ctx.read_in_buffer(1)?
+                } else {
+                    Vec::new()
+                };
+                let err = self.ioctl(dev, &io, &mut data, &extra, ctx)?;
                 if request >> 30 & 2 != 0 && err == NV_SUCCESS {
                     ctx.write_out_buffer(0, &data)?;
                 }
