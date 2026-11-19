@@ -12,6 +12,7 @@
 //! use; their method layouts come from NVIDIA's open-gpu-doc class
 //! headers (MIT).
 
+pub mod backend;
 pub mod blocklinear;
 pub mod engines;
 pub mod mmu;
@@ -106,6 +107,8 @@ pub struct Gpu {
     pub faults: Vec<String>,
     /// Log methods that are not emulated, once each.
     pub trace: bool,
+    /// Carries out rendering work (software by default).
+    pub backend: Box<dyn backend::Backend>,
 }
 
 impl Default for Gpu {
@@ -117,6 +120,7 @@ impl Default for Gpu {
             unimplemented: BTreeSet::new(),
             faults: Vec::new(),
             trace: false,
+            backend: Box::new(backend::SoftwareBackend),
         }
     }
 }
@@ -178,6 +182,18 @@ impl Gpu {
             }
             for w in raw.chunks_exact(4) {
                 self.process_word(channel, u32::from_le_bytes(w.try_into().unwrap()), mem);
+            }
+        }
+        // Results must be in memory before the fence signals.
+        if let Some(asid) = self.channels[channel].address_space {
+            let mut g = backend::GuestMemory {
+                mem,
+                aspace: &self.address_spaces[asid],
+                asid,
+            };
+            if let Err(e) = self.backend.flush(&mut g) {
+                self.faults
+                    .push(format!("{} backend: {e}", self.backend.name()));
             }
         }
         let sp = self.channels[channel].syncpoint as usize;
@@ -251,12 +267,17 @@ impl Gpu {
             unimplemented,
             faults,
             trace,
+            backend,
         } = self;
         let mut ctx = EngineCtx {
-            mem,
-            aspace: &address_spaces[asid],
+            guest: backend::GuestMemory {
+                mem,
+                aspace: &address_spaces[asid],
+                asid,
+            },
             syncpoints,
             faults,
+            backend: backend.as_mut(),
         };
         let mut from_macros = Vec::new();
         let handled = match channels[channel].subchannels[subchannel].as_mut() {

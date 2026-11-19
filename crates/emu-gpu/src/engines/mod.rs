@@ -5,26 +5,25 @@ pub mod inline;
 pub mod maxwell3d;
 pub mod mme;
 
-use crate::mmu::AddressSpace;
-use emu_memory::Memory;
+use crate::backend::{Backend, GuestMemory};
 
 /// What an engine can touch while executing a method.
 pub struct EngineCtx<'a> {
-    pub mem: &'a mut Memory,
-    pub aspace: &'a AddressSpace,
+    pub guest: GuestMemory<'a>,
     pub syncpoints: &'a mut Vec<u32>,
     pub faults: &'a mut Vec<String>,
+    pub backend: &'a mut dyn Backend,
 }
 
 impl EngineCtx<'_> {
     pub fn write(&mut self, va: u64, data: &[u8]) {
-        if let Err(f) = self.aspace.write(self.mem, va, data) {
+        if let Err(f) = self.guest.write(va, data) {
             self.faults.push(format!("write at {va:#x}: {f:?}"));
         }
     }
 
     pub fn read(&mut self, va: u64, buf: &mut [u8]) {
-        if let Err(f) = self.aspace.read(self.mem, va, buf) {
+        if let Err(f) = self.guest.read(va, buf) {
             self.faults.push(format!("read at {va:#x}: {f:?}"));
         }
     }

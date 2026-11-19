@@ -7,7 +7,7 @@ fn main() -> ExitCode {
     let trace = args.iter().any(|a| a == "--trace-svc");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
         eprintln!(
-            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] <program.elf | homebrew.nro>\n\
+            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] <program.elf | homebrew.nro>\n\
              (built with --features window, frames are shown in a window unless --frames is given)"
         );
         return ExitCode::from(2);
@@ -28,6 +28,11 @@ fn main() -> ExitCode {
                 .map(Into::into),
             boot_time: None,
             trace_unimplemented: trace,
+            gpu_backend: if args.iter().any(|a| a == "--gpu=vulkan") {
+                emu_horizon::services::GpuBackend::Vulkan
+            } else {
+                emu_horizon::services::GpuBackend::Software
+            },
         };
         let dump_frames = args.iter().any(|a| a.starts_with("--frames="));
         #[cfg(feature = "window")]

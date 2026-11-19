@@ -10,6 +10,7 @@ emu-cpu = { path = "../emu-cpu" }
 emu-memory = { path = "../emu-memory" }
 emu-loader = { path = "../emu-loader" }
 emu-horizon = { path = "../emu-horizon" }
+emu-gpu-vk = { path = "../emu-gpu-vk" }
 png = "0.17"
 minifb = { version = "0.28", optional = true }
 

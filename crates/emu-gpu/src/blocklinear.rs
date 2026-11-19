@@ -45,6 +45,51 @@ pub fn deswizzle(src: &[u8], pitch: u32, height: u32, block_height_log2: u32) ->
     out
 }
 
+/// Like [`deswizzle`] for rows of `row_bytes` (any size): returns tightly
+/// packed rows. `padded` is `row_bytes` rounded up to 16.
+pub fn deswizzle_width(
+    src: &[u8],
+    row_bytes: u32,
+    padded: u32,
+    height: u32,
+    block_height_log2: u32,
+) -> Vec<u8> {
+    let mut out = vec![0u8; (row_bytes * height) as usize];
+    for y in 0..height {
+        for x in (0..padded).step_by(16) {
+            let n = 16.min(row_bytes - x) as usize;
+            let from = offset(x, y, row_bytes, block_height_log2);
+            let to = (y * row_bytes + x) as usize;
+            if let Some(piece) = src.get(from..from + n) {
+                out[to..to + n].copy_from_slice(piece);
+            }
+        }
+    }
+    out
+}
+
+/// Writes tightly packed rows of `row_bytes` into a block-linear surface.
+pub fn swizzle_into(
+    dst: &mut [u8],
+    src: &[u8],
+    row_bytes: u32,
+    height: u32,
+    block_height_log2: u32,
+) {
+    for y in 0..height {
+        let mut x = 0;
+        while x < row_bytes {
+            let n = 16.min(row_bytes - x) as usize;
+            let to = offset(x, y, row_bytes, block_height_log2);
+            let from = (y * row_bytes + x) as usize;
+            if let Some(d) = dst.get_mut(to..to + n) {
+                d.copy_from_slice(&src[from..from + n]);
+            }
+            x += 16;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +123,19 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn swizzle_round_trip_odd_widths() {
+        for (row, height, bh) in [(100u32, 13u32, 1u32), (48, 9, 0), (4096 + 20, 40, 4)] {
+            let lin: Vec<u8> = (0..row * height).map(|i| (i * 13 + 7) as u8).collect();
+            let mut raw = vec![0u8; size(row, height, bh)];
+            swizzle_into(&mut raw, &lin, row, height, bh);
+            assert_eq!(
+                deswizzle_width(&raw, row, row.next_multiple_of(16), height, bh),
+                lin
+            );
+        }
     }
 
     #[test]

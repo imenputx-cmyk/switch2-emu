@@ -1,7 +1,7 @@
 //! Render target color formats (`SET_COLOR_TARGET_FORMAT` values from
 //! the 3D class header) and encoding clear colors into them.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColorFormat {
     Rgba32Float,
     Rgba16Unorm,

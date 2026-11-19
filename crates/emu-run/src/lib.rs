@@ -36,12 +36,15 @@ pub enum RunError {
         pc: u64,
     },
     StepLimit,
+    /// The requested GPU backend could not be created.
+    Gpu(String),
 }
 
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RunError::Load(e) => write!(f, "load failed: {e}"),
+            RunError::Gpu(e) => write!(f, "GPU backend: {e}"),
             RunError::Stopped { exit, cpu } => {
                 write!(
                     f,
@@ -163,6 +166,10 @@ pub fn run_nro_presenting(
 ) -> Result<HomebrewResult, RunError> {
     let mut hos = emu_horizon::Horizon::new();
     hos.system.on_present = on_present;
+    if config.gpu_backend == emu_horizon::services::GpuBackend::Vulkan {
+        let vk = emu_gpu_vk::VulkanBackend::new().map_err(RunError::Gpu)?;
+        hos.system.gpu.backend = Box::new(vk);
+    }
     hos.trace_svcs = trace_svcs;
     hos.config = config;
     hos.boot_homebrew(nro).map_err(RunError::Load)?;

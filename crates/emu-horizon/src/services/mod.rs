@@ -118,6 +118,17 @@ pub struct Config {
     pub boot_time: Option<i64>,
     /// Log commands and ioctls services do not implement.
     pub trace_unimplemented: bool,
+    /// How GPU work is carried out.
+    pub gpu_backend: GpuBackend,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuBackend {
+    /// On the CPU, directly in guest memory (the reference).
+    #[default]
+    Software,
+    /// On the host GPU through Vulkan.
+    Vulkan,
 }
 
 impl Ctx<'_> {

@@ -7,7 +7,7 @@
 use super::inline::InlineToMemory;
 use super::mme::{self, MacroTarget};
 use super::{bits, EngineCtx};
-use crate::blocklinear;
+use crate::backend::{Layout, Rect, Surface};
 use crate::surface::ColorFormat;
 
 /// Register file size in words: methods 0x0000..0x3800 (bytes).
@@ -274,56 +274,25 @@ impl Maxwell3D {
         }
 
         let color = [0, 1, 2, 3].map(|i| f32::from_bits(self.reg(reg::COLOR_CLEAR_VALUE + 4 * i)));
-        let pixel = format.encode(color);
-        let row: Vec<u8> = pixel
-            .iter()
-            .copied()
-            .cycle()
-            .take(((x1 - x0) * bpp) as usize)
-            .collect();
-        let partial = !mask.iter().all(|&m| m);
-        let keep = if partial {
-            match format.component_bytes(mask) {
-                Some(k) => Some(k),
-                None => {
-                    ctx.faults
-                        .push(format!("clear: masked clear of {format:?} not supported"));
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let addr = |x_byte: u32, y: u32| {
-            if pitch_layout {
-                base + u64::from(y) * u64::from(row_bytes) + u64::from(x_byte)
+        let surface = Surface {
+            addr: base,
+            width,
+            height,
+            format,
+            layout: if pitch_layout {
+                Layout::Pitch { pitch: row_bytes }
             } else {
-                base + blocklinear::offset(x_byte, y, row_bytes, block_height) as u64
-            }
-        };
-        for y in y0..y1 {
-            let mut x = x0 * bpp;
-            let end = x1 * bpp;
-            while x < end {
-                // Runs of up to 16 bytes are contiguous in both layouts.
-                let n = (16 - x % 16).min(end - x);
-                let src = &row[(x - x0 * bpp) as usize..(x - x0 * bpp + n) as usize];
-                let va = addr(x, y);
-                match &keep {
-                    None => ctx.write(va, src),
-                    Some(keep) => {
-                        let mut cur = vec![0u8; n as usize];
-                        ctx.read(va, &mut cur);
-                        for (i, b) in cur.iter_mut().enumerate() {
-                            if keep[(x as usize + i) % bpp as usize] {
-                                *b = src[i];
-                            }
-                        }
-                        ctx.write(va, &cur);
-                    }
+                Layout::BlockLinear {
+                    block_height_log2: block_height,
                 }
-                x += n;
-            }
+            },
+        };
+        let rect = Rect { x0, y0, x1, y1 };
+        if let Err(e) = ctx
+            .backend
+            .clear(&mut ctx.guest, &surface, rect, color, mask)
+        {
+            ctx.faults.push(format!("clear: {e}"));
         }
         self.clears += 1;
     }

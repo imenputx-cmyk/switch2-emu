@@ -16,6 +16,11 @@ jobs:
       - uses: actions/checkout@v4
       # The toolchain version comes from rust-toolchain.toml.
       - run: rustup toolchain install && rustup show active-toolchain
+      # Lavapipe (Mesa's software Vulkan) so the Vulkan backend tests
+      # run; elsewhere they skip when no Vulkan device exists.
+      - name: Install a Vulkan driver
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # Release: the graphics test runs ~10^8 guest instructions.

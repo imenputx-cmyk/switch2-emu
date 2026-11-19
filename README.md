@@ -15,7 +15,7 @@ This project does not include, distribute, or require any copyrighted Nintendo f
 4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory, ELF and NRO loaders done; NSO to come)*
 5. **Kernel and services (HLE):** Emulation of Horizon's SVCs and IPC services. *(in progress: homebrew boots through the homebrew ABI; memory, info, debug output and single-thread synchronization SVCs work; CMIF IPC with domains works; events, shared memory and waits; a libnx application's whole startup succeeds against HLE `sm:`, `set:sys`, `apm`, `appletOE`, `hid`, `time:u` and `fsp-srv`; the SD card is a host directory (`--sdmc=DIR`) with files and directories working; guest threads with a round-robin scheduler, mutexes, condition variables and the address arbiter; the display path (vi, binder buffer queue, nvdrv/nvmap) presents libnx framebuffers, shown in a window or saved as PNG; controller input from the keyboard through hid shared memory)*
 6. **JIT:** Dynamic translation from AArch64 to x86-64 after the interpreter is correct.
-7. **GPU:** Parse the command stream and translate it to Vulkan. *(in progress, `crates/emu-gpu`: nvdrv GPU devices, GPU address spaces, GPFIFO/pushbuffer processing, host semaphores and syncpoint fences; the DMA copy engine, inline-to-memory, 3D-engine clears with a software backend rendering into the display's framebuffers, and the macro processor (MME) that drivers use for draws and state. The classes are the Maxwell ones the Switch driver reports (B197 3D, B0B5 copy); the Switch 2's Ampere-class GPU comes after. Next: a Vulkan backend, then shaders and draws)*
+7. **GPU:** Parse the command stream and translate it to Vulkan. *(in progress, `crates/emu-gpu`: nvdrv GPU devices, GPU address spaces, GPFIFO/pushbuffer processing, host semaphores and syncpoint fences; the DMA copy engine, inline-to-memory, 3D-engine clears with a software backend rendering into the display's framebuffers, and the macro processor (MME) that drivers use for draws and state. A Vulkan backend (`crates/emu-gpu-vk`, `--gpu=vulkan`) runs the same work on the host GPU and must leave guest memory identical to the software backend; tests compare the two on Mesa's lavapipe in CI. The classes are the Maxwell ones the Switch driver reports (B197 3D, B0B5 copy); the Switch 2's Ampere-class GPU comes after. Next: shaders and draws on Vulkan)*
 8. **Audio, input, and performance.**
 
 Accuracy comes before speed. The interpreter is the reference that the JIT and GPU work will be tested against.
@@ -27,7 +27,8 @@ crates/
   emu-memory/  Guest virtual memory: 4 KiB pages, permissions, faults
   emu-cpu/     AArch64 CPU: register state, decoder, reference interpreter, FP rules
   emu-loader/  ELF and NRO loaders (NSO later)
-  emu-gpu/     GPU: address spaces, GPFIFO command processing, engines (software backend)
+  emu-gpu/     GPU: address spaces, GPFIFO command processing, engines, software backend
+  emu-gpu-vk/  Vulkan backend for emu-gpu (ash)
   emu-horizon/ Horizon kernel HLE: memory state map, handles, SVCs, homebrew boot,
                HIPC/CMIF IPC (sessions, domains) and HLE services
   emu-run/     Runs freestanding test programs (CLI: emu-run file.elf)
@@ -55,6 +56,7 @@ cargo run --release -p emu-run -- --frames=/tmp/frames tests/programs/hb_gfx.nro
 cargo run --release -p emu-run --features window -- tests/programs/hb_gfx.nro  # framebuffer in a window
 cargo run --release -p emu-run --features window -- tests/programs/hb_breakout.nro  # a small game: arrows move, X = A, Enter = +
 cargo run --release -p emu-run --features window -- tests/programs/hb_gpu.nro  # frames drawn by GPU commands
+cargo run --release -p emu-run --features window -- --gpu=vulkan tests/programs/hb_gpu.nro  # ... on the host GPU
 ```
 
 ### How correctness is checked

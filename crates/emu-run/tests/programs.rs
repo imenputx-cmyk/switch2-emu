@@ -396,3 +396,36 @@ gpu frame 0x2
         );
     }
 }
+
+#[test]
+fn gpu_frames_match_on_vulkan() {
+    // The same program on the Vulkan backend: frames must match the
+    // software backend's (within 1 per channel: float-to-unorm rounding
+    // of clear colors may differ between Vulkan implementations).
+    // Skipped when there is no Vulkan 1.3 device.
+    if let Err(e) = emu_gpu_vk::VulkanBackend::new() {
+        eprintln!("skipping: {e}");
+        return;
+    }
+    let nro = program("hb_gpu.nro");
+    let soft = emu_run::run_nro(&nro, 200_000_000, false).expect("boots");
+    let config = emu_horizon::services::Config {
+        gpu_backend: emu_horizon::services::GpuBackend::Vulkan,
+        ..Default::default()
+    };
+    let vk = emu_run::run_nro_with(&nro, 200_000_000, false, config).expect("boots");
+    assert_eq!(vk.stop, emu_horizon::Stop::ReturnedToLoader(0));
+    assert_eq!(vk.debug_output, soft.debug_output);
+    assert_eq!(vk.frames.len(), soft.frames.len());
+    for (a, b) in soft.frames.iter().zip(&vk.frames) {
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        let worst = a
+            .rgba
+            .iter()
+            .zip(&b.rgba)
+            .map(|(x, y)| x.abs_diff(*y))
+            .max()
+            .unwrap();
+        assert!(worst <= 1, "frames differ by {worst}");
+    }
+}

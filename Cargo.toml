@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/emu-cpu", "crates/emu-memory", "crates/emu-loader", "crates/emu-gpu", "crates/emu-horizon", "crates/emu-run"]
+members = ["crates/emu-cpu", "crates/emu-memory", "crates/emu-loader", "crates/emu-gpu", "crates/emu-gpu-vk", "crates/emu-horizon", "crates/emu-run"]
 
 [workspace.package]
 edition = "2021"
