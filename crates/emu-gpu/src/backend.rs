@@ -143,6 +143,9 @@ impl GuestMemory<'_> {
 pub trait Backend {
     fn name(&self) -> &str;
 
+    /// For tests and diagnostics: the concrete backend.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Fills `rect` of `surface` with `color`, writing only the
     /// components in `mask` (RGBA).
     fn clear(
@@ -168,6 +171,10 @@ pub struct SoftwareBackend;
 impl Backend for SoftwareBackend {
     fn name(&self) -> &str {
         "software"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn clear(

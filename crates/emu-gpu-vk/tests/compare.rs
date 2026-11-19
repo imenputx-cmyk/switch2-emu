@@ -21,6 +21,16 @@ fn incr(subch: u32, method: u32, count: u32) -> u32 {
 /// Runs `words` (placed at the start of the mapping) and returns the
 /// rest of the mapping afterwards.
 fn run(backend: Box<dyn Backend>, words: &[u32]) -> Vec<u8> {
+    run_with(backend, words, |_| {}).0
+}
+
+/// Like `run`, with extra guest data written first; also returns the
+/// backend.
+fn run_with(
+    backend: Box<dyn Backend>,
+    words: &[u32],
+    setup: impl Fn(&mut Memory),
+) -> (Vec<u8>, Box<dyn Backend>) {
     let mut mem = Memory::new();
     mem.map(GUEST, SIZE, Perm::RW).unwrap();
     // Non-zero initial contents: uploads must preserve them.
@@ -36,13 +46,14 @@ fn run(backend: Box<dyn Backend>, words: &[u32]) -> Vec<u8> {
     assert!(gpu.address_spaces[a].map(GPU_VA, GUEST, SIZE));
     let c = gpu.new_channel();
     gpu.channels[c].address_space = Some(a);
+    setup(&mut mem);
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     mem.write(GUEST, &bytes).unwrap();
     gpu.submit(c, &[GPU_VA | ((words.len() as u64) << 42)], 0, &mut mem);
     assert!(gpu.faults.is_empty(), "{:?}", gpu.faults);
     let mut out = vec![0u8; SIZE as usize - 0x1_0000];
     mem.read(GUEST + 0x1_0000, &mut out).unwrap();
-    out
+    (out, gpu.backend)
 }
 
 fn vulkan() -> Option<Box<dyn Backend>> {
@@ -143,4 +154,118 @@ fn masked_clear_falls_back_in_order() {
     w.extend(clear([0.0, 0.6, 0.0, 0.0], Some((8, 2, 30, 12)), 0x08)); // green only
     w.extend(clear([0.4, 0.0, 0.0, 1.0], Some((20, 6, 50, 14)), 0x3C));
     compare(w);
+}
+
+#[test]
+fn draws_with_translated_shaders() {
+    use emu_gpu::shader::{asm, attr};
+    let Some(vk) = vulkan() else { return };
+    // Shaders at +0x30000 (vertex) and +0x30200 (pixel); vertices at
+    // +0x31000: position, then color, 32 bytes each.
+    let vs = asm::program(
+        &asm::vertex_header(),
+        &[
+            asm::ald(0, attr::generic(0), 4),
+            asm::ald(4, attr::generic(1), 4),
+            asm::fmul32i(4, 4, 0.75),
+            asm::ast(0, attr::POSITION, 4),
+            asm::ast(4, attr::generic(0), 4),
+            asm::exit(),
+        ],
+    );
+    let ps = asm::program(
+        &asm::pixel_header(),
+        &[
+            asm::ipa(0, 0x80),
+            asm::ipa(1, 0x84),
+            asm::ipa(2, 0x88),
+            asm::mov32i(3, 0x3F80_0000),
+            asm::fadd_imm(1, 1, 0.25),
+            asm::exit(),
+        ],
+    );
+    let verts: Vec<f32> = vec![
+        -0.9, -0.8, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, //
+        0.8, -0.9, 0.0, 2.0, 0.0, 1.0, 0.0, 1.0, // w = 2: perspective
+        0.1, 0.9, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, -0.5, 0.95, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+    ];
+    let setup = move |mem: &mut Memory| {
+        mem.write(GUEST + 0x3_0000, &vs).unwrap();
+        mem.write(GUEST + 0x3_0200, &ps).unwrap();
+        let bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_le_bytes()).collect();
+        mem.write(GUEST + 0x3_1000, &bytes).unwrap();
+    };
+    let code = GPU_VA + 0x3_0000;
+    let vtx = GPU_VA + 0x3_1000;
+    let mut w = target(0x4_0000, 96, 64, RGBA8, 2 << 4);
+    w.extend(clear([0.2, 0.2, 0.2, 1.0], None, 0x3C));
+    w.extend([
+        incr(0, 0x1608, 2),
+        (code >> 32) as u32,
+        code as u32,
+        incr(0, 0x2000 + 64, 2),
+        1 | 1 << 4,
+        0,
+        incr(0, 0x2000 + 5 * 64, 2),
+        1 | 5 << 4,
+        0x200,
+        incr(0, 0x1160, 2),
+        1 << 21 | 7 << 27,
+        16 << 7 | 1 << 21 | 7 << 27,
+        incr(0, 0x1C00, 3),
+        32 | 1 << 12,
+        (vtx >> 32) as u32,
+        vtx as u32,
+        incr(0, 0xA00, 6),
+        48.0f32.to_bits(),
+        (-32.0f32).to_bits(),
+        1.0f32.to_bits(),
+        48.0f32.to_bits(),
+        32.0f32.to_bits(),
+        0,
+        incr(0, 0x121C, 1),
+        1,
+        incr(0, 0xE00, 3),
+        1,
+        4 | 90 << 16,
+        2 | 60 << 16, // scissor
+        // A triangle, then a strip over vertices 1..4.
+        incr(0, 0x1618, 1),
+        4,
+        incr(0, 0xD74, 2),
+        0,
+        3,
+        incr(0, 0x1614, 1),
+        0,
+        incr(0, 0x1214, 1),
+        1 | 3 << 16 | 5 << 28,
+    ]);
+    let (soft, _) = run_with(
+        Box::new(emu_gpu::backend::SoftwareBackend),
+        &w,
+        setup.clone(),
+    );
+    let (hard, backend) = run_with(vk, &w, setup);
+    let vkb = backend.as_any().downcast_ref::<VulkanBackend>().unwrap();
+    assert_eq!(
+        (vkb.gpu_draws, vkb.fallback_draws),
+        (2, 0),
+        "draws must run on the GPU"
+    );
+    // Rasterization and interpolation may differ slightly between
+    // implementations: compare the render target with a tolerance.
+    let rt = 0x4_0000 - 0x1_0000;
+    let size = emu_gpu::blocklinear::size(96 * 4, 64, 2);
+    let (a, b) = (&soft[rt..rt + size], &hard[rt..rt + size]);
+    let worst = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+    let differing = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x != y).count();
+    eprintln!("software vs Vulkan: {differing} pixels differ, by at most {worst}");
+    assert!(
+        worst <= 2 || differing <= 8,
+        "worst {worst}, {differing} pixels differ"
+    );
+    assert!(
+        a.chunks(4).filter(|p| p[0] > 100).count() > 500,
+        "the draw covered little"
+    );
 }

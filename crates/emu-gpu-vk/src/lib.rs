@@ -7,13 +7,21 @@
 //! writes between submissions are always picked up. Keeping images alive
 //! across submissions needs tracking of guest writes, which comes later.
 //!
+//! Draws translate the guest's shaders to SPIR-V and run as Vulkan
+//! pipelines (cached by their shaders and state); anything not
+//! translated yet falls back to the software renderer.
+//!
 //! Requires Vulkan 1.3 (dynamic rendering).
 
 use ash::vk;
 use emu_gpu::backend::{Backend, GuestMemory, Rect, SoftwareBackend, Surface};
+use emu_gpu::draw::{topology, Draw};
+use emu_gpu::shader::spirv;
 use emu_gpu::surface::ColorFormat;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::hash::{Hash, Hasher};
 
 fn vk_format(f: ColorFormat) -> vk::Format {
     match f {
@@ -62,6 +70,14 @@ pub struct VulkanBackend {
     recording: bool,
     images: HashMap<(usize, Surface), Image>,
     software: SoftwareBackend,
+    pipeline_layout: vk::PipelineLayout,
+    /// Pipelines by a hash of their shaders and fixed state.
+    pipelines: HashMap<u64, (vk::Pipeline, [vk::ShaderModule; 2])>,
+    /// Vertex buffers of the current batch, freed at flush.
+    transient: Vec<Buffer>,
+    /// Draws done on the GPU / in the software fallback (for tests).
+    pub gpu_draws: u64,
+    pub fallback_draws: u64,
 }
 
 impl VulkanBackend {
@@ -149,6 +165,9 @@ impl VulkanBackend {
         let fence = device
             .create_fence(&vk::FenceCreateInfo::default(), None)
             .map_err(err("fence"))?;
+        let pipeline_layout = device
+            .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+            .map_err(err("pipeline layout"))?;
         Ok(VulkanBackend {
             memory_props: instance.get_physical_device_memory_properties(pd),
             _entry: entry,
@@ -162,6 +181,11 @@ impl VulkanBackend {
             recording: false,
             images: HashMap::new(),
             software: SoftwareBackend,
+            pipeline_layout,
+            pipelines: HashMap::new(),
+            transient: Vec::new(),
+            gpu_draws: 0,
+            fallback_draws: 0,
         })
     }
 
@@ -212,13 +236,39 @@ impl VulkanBackend {
         );
     }
 
+    /// Orders color writes of earlier rendering before the next one.
+    unsafe fn color_barrier(&self) {
+        let mb = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )];
+        self.device.cmd_pipeline_barrier2(
+            self.cmd,
+            &vk::DependencyInfo::default().memory_barriers(&mb),
+        );
+    }
+
     unsafe fn create_buffer(&self, size: usize) -> Result<Buffer, String> {
+        self.create_buffer_with(
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+        )
+    }
+
+    unsafe fn create_buffer_with(
+        &self,
+        size: usize,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<Buffer, String> {
         let buffer = self
             .device
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(size as u64)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
+                    .usage(usage),
                 None,
             )
             .map_err(err("buffer"))?;
@@ -421,6 +471,10 @@ impl VulkanBackend {
         self.device
             .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
             .map_err(err("reset"))?;
+        for b in std::mem::take(&mut self.transient) {
+            self.device.destroy_buffer(b.buffer, None);
+            self.device.free_memory(b.memory, None);
+        }
         let mut result = Ok(());
         for key in keys {
             let img = self.images.remove(&key).unwrap();
@@ -436,9 +490,278 @@ impl VulkanBackend {
     }
 }
 
+/// What a draw needs on Vulkan, worked out before touching the device.
+struct Plan {
+    vs: Vec<u32>,
+    ps: Vec<u32>,
+    topology: vk::PrimitiveTopology,
+    /// (location, stream, offset, format)
+    attributes: Vec<(u32, u32, u32, vk::Format)>,
+    /// (stream, stride)
+    bindings: Vec<(u32, u32)>,
+    viewport: vk::Viewport,
+}
+
+fn vertex_format(widths: u32, kind: u32) -> Option<vk::Format> {
+    Some(match (widths, kind) {
+        (0x01, 7) => vk::Format::R32G32B32A32_SFLOAT,
+        (0x02, 7) => vk::Format::R32G32B32_SFLOAT,
+        (0x04, 7) => vk::Format::R32G32_SFLOAT,
+        (0x12, 7) => vk::Format::R32_SFLOAT,
+        (0x03, 7) => vk::Format::R16G16B16A16_SFLOAT,
+        (0x0A, 2) => vk::Format::R8G8B8A8_UNORM,
+        (0x03, 2) => vk::Format::R16G16B16A16_UNORM,
+        _ => return None,
+    })
+}
+
+fn plan(d: &Draw) -> Result<Plan, String> {
+    let header = |stage| emu_gpu::shader::Header {
+        stage,
+        omap_targets: [0; 8],
+        omap_depth: false,
+    };
+    let vs = spirv::translate(&d.vs, &header(emu_gpu::shader::Stage::Vertex))?;
+    let ps = spirv::translate(&d.ps, &d.ps_header)?;
+    let topology = match d.topology {
+        topology::TRIANGLES => vk::PrimitiveTopology::TRIANGLE_LIST,
+        topology::TRIANGLE_STRIP => vk::PrimitiveTopology::TRIANGLE_STRIP,
+        topology::TRIANGLE_FAN => vk::PrimitiveTopology::TRIANGLE_FAN,
+        t => return Err(format!("topology {t}")),
+    };
+    // Attributes the vertex shader reads: generic i is location i.
+    let mut read = [false; 32];
+    for i in &d.vs {
+        if let emu_gpu::shader::decode::Inst::Ald { addr, count, .. } = *i {
+            for k in 0..count {
+                let a = addr + 4 * k;
+                if (0x80..0x280).contains(&a) {
+                    read[((a - 0x80) / 16) as usize] = true;
+                }
+            }
+        }
+    }
+    let mut attributes = Vec::new();
+    let mut bindings: Vec<(u32, u32)> = Vec::new();
+    for (i, a) in d.attributes.iter().enumerate() {
+        if !read[i] {
+            continue;
+        }
+        let s = d
+            .streams
+            .get(a.stream as usize)
+            .copied()
+            .unwrap_or_default();
+        if a.constant || !s.enabled || a.swap_rb {
+            return Err(format!("attribute {i} not fetched from a buffer"));
+        }
+        let f = vertex_format(a.widths, a.kind)
+            .ok_or_else(|| format!("attribute format {:#x}/{}", a.widths, a.kind))?;
+        attributes.push((i as u32, a.stream, a.offset, f));
+        if !bindings.iter().any(|b| b.0 == a.stream) {
+            bindings.push((a.stream, s.stride));
+        }
+    }
+    let v = &d.viewport;
+    if v.scale[0] <= 0.0 {
+        return Err("viewport with negative width".into());
+    }
+    let (near, far) = (v.offset[2], v.offset[2] + v.scale[2]);
+    if !(0.0..=1.0).contains(&near) || !(0.0..=1.0).contains(&far) {
+        return Err("viewport depth range outside 0..1".into());
+    }
+    let viewport = vk::Viewport {
+        x: v.offset[0] - v.scale[0],
+        y: v.offset[1] - v.scale[1],
+        width: 2.0 * v.scale[0],
+        height: 2.0 * v.scale[1],
+        min_depth: near,
+        max_depth: far,
+    };
+    Ok(Plan {
+        vs,
+        ps,
+        topology,
+        attributes,
+        bindings,
+        viewport,
+    })
+}
+
+impl VulkanBackend {
+    unsafe fn shader_module(&self, words: &[u32]) -> Result<vk::ShaderModule, String> {
+        self.device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+            .map_err(err("shader module"))
+    }
+
+    unsafe fn pipeline(&mut self, p: &Plan, format: vk::Format) -> Result<vk::Pipeline, String> {
+        let mut h = DefaultHasher::new();
+        (&p.vs, &p.ps, p.topology.as_raw(), format.as_raw()).hash(&mut h);
+        for a in &p.attributes {
+            (a.0, a.1, a.2, a.3.as_raw()).hash(&mut h);
+        }
+        p.bindings.hash(&mut h);
+        let key = h.finish();
+        if let Some((pipe, _)) = self.pipelines.get(&key) {
+            return Ok(*pipe);
+        }
+        let vs = self.shader_module(&p.vs)?;
+        let ps = self.shader_module(&p.ps)?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vs)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(ps)
+                .name(c"main"),
+        ];
+        let bindings: Vec<_> = p
+            .bindings
+            .iter()
+            .map(|&(stream, stride)| {
+                vk::VertexInputBindingDescription::default()
+                    .binding(stream)
+                    .stride(stride)
+                    .input_rate(vk::VertexInputRate::VERTEX)
+            })
+            .collect();
+        let attributes: Vec<_> = p
+            .attributes
+            .iter()
+            .map(|&(location, stream, offset, format)| {
+                vk::VertexInputAttributeDescription::default()
+                    .location(location)
+                    .binding(stream)
+                    .format(format)
+                    .offset(offset)
+            })
+            .collect();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(p.topology);
+        let viewport = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let formats = [format];
+        let mut rendering =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&assembly)
+            .viewport_state(&viewport)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic)
+            .layout(self.pipeline_layout)
+            .push_next(&mut rendering);
+        let pipe = self
+            .device
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .map_err(|(_, e)| format!("pipeline: {e}"))?[0];
+        self.pipelines.insert(key, (pipe, [vs, ps]));
+        Ok(pipe)
+    }
+
+    unsafe fn draw_gpu(
+        &mut self,
+        g: &mut GuestMemory,
+        d: &Draw,
+        target: &Surface,
+        p: Plan,
+    ) -> Result<(), String> {
+        let view = self.image(g, target)?;
+        let pipe = self.pipeline(&p, vk_format(target.format))?;
+        // Vertex data: each stream from its start to the last vertex used.
+        let last = d.ranges.iter().map(|&(f, c)| f + c).max().unwrap_or(0);
+        let mut buffers = Vec::new();
+        for &(stream, stride) in &p.bindings {
+            let s = d.streams[stream as usize];
+            let size = (u64::from(last) * u64::from(stride)).max(16) as usize;
+            let mut data = vec![0u8; size];
+            g.read(s.addr, &mut data)
+                .map_err(|f| format!("vertex buffer: {f:?}"))?;
+            let b = self.create_buffer_with(size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), b.ptr, size);
+            buffers.push((stream, b.buffer));
+            self.transient.push(b);
+        }
+        self.begin()?;
+        let attachments = [vk::RenderingAttachmentInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: target.width,
+                height: target.height,
+            },
+        };
+        self.color_barrier();
+        self.device.cmd_begin_rendering(
+            self.cmd,
+            &vk::RenderingInfo::default()
+                .render_area(area)
+                .layer_count(1)
+                .color_attachments(&attachments),
+        );
+        let (x0, y0) = (d.clip.x0.min(target.width), d.clip.y0.min(target.height));
+        let (x1, y1) = (
+            d.clip.x1.min(target.width).max(x0),
+            d.clip.y1.min(target.height).max(y0),
+        );
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x0 as i32,
+                y: y0 as i32,
+            },
+            extent: vk::Extent2D {
+                width: x1 - x0,
+                height: y1 - y0,
+            },
+        };
+        self.device.cmd_set_viewport(self.cmd, 0, &[p.viewport]);
+        self.device.cmd_set_scissor(self.cmd, 0, &[scissor]);
+        self.device
+            .cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipe);
+        for (stream, buffer) in buffers {
+            self.device
+                .cmd_bind_vertex_buffers(self.cmd, stream, &[buffer], &[0]);
+        }
+        for &(first, count) in &d.ranges {
+            self.device.cmd_draw(self.cmd, count, 1, first, 0);
+        }
+        self.device.cmd_end_rendering(self.cmd);
+        Ok(())
+    }
+}
+
 impl Backend for VulkanBackend {
     fn name(&self) -> &str {
         "vulkan"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn clear(
@@ -475,6 +798,7 @@ impl Backend for VulkanBackend {
                     height: s.height,
                 },
             };
+            self.color_barrier();
             self.device.cmd_begin_rendering(
                 self.cmd,
                 &vk::RenderingInfo::default()
@@ -510,11 +834,25 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
-    fn draw(&mut self, g: &mut GuestMemory, d: &emu_gpu::draw::Draw) -> Result<(), String> {
-        // Shaders are not translated to SPIR-V yet: draw in software on
-        // up-to-date guest memory.
-        self.flush(g)?;
-        self.software.draw(g, d)
+    fn draw(&mut self, g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
+        let Some(target) = d.target else {
+            return Ok(());
+        };
+        let plan = match plan(d) {
+            Ok(p) => p,
+            Err(why) => {
+                // Not translatable yet: draw in software on up-to-date
+                // guest memory.
+                let _ = why;
+                self.fallback_draws += 1;
+                self.flush(g)?;
+                return self.software.draw(g, d);
+            }
+        };
+        // SAFETY: see `clear`.
+        unsafe { self.draw_gpu(g, d, &target, plan) }?;
+        self.gpu_draws += 1;
+        Ok(())
     }
 
     fn flush(&mut self, g: &mut GuestMemory) -> Result<(), String> {
@@ -531,6 +869,18 @@ impl Drop for VulkanBackend {
             for (_, img) in std::mem::take(&mut self.images) {
                 self.destroy_image(img);
             }
+            for b in std::mem::take(&mut self.transient) {
+                self.device.destroy_buffer(b.buffer, None);
+                self.device.free_memory(b.memory, None);
+            }
+            for (_, (pipe, modules)) in std::mem::take(&mut self.pipelines) {
+                self.device.destroy_pipeline(pipe, None);
+                for m in modules {
+                    self.device.destroy_shader_module(m, None);
+                }
+            }
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
