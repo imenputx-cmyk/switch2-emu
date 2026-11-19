@@ -4,6 +4,7 @@
 //! Manual. Speed is not a goal here; this is the ground truth that a later
 //! JIT will be tested against.
 
+use crate::decoder::PostIndex;
 use crate::decoder::{
     decode, ones, ror, AddrMode, AtomicOp, BitfieldOp, BranchRegOp, CondOperand, CondSelectOp,
     DataProc1Op, DataProc2Op, DataProc3Op, ElemSrc, ExclusiveOp, Extend, FpUnaryOp, Instr,
@@ -1044,11 +1045,114 @@ impl Cpu {
                 }
             }
 
+            Instr::SimdLoadStoreMulti {
+                load,
+                q,
+                size,
+                rpt,
+                selem,
+                rn,
+                rt,
+                post,
+            } => {
+                let addr = self.read_sp(rn);
+                let ebytes = 1usize << size;
+                let elements = (if q { 16 } else { 8 }) / ebytes;
+                let total = usize::from(rpt) * usize::from(selem) * elements * ebytes;
+                let mut buf = vec![0u8; total];
+                // Byte offset `offs` holds element `e` of register `t + r + s`,
+                // in the order of the ARM pseudocode.
+                let order = |f: &mut dyn FnMut(u8, u32, usize)| {
+                    let mut offs = 0;
+                    for r in 0..rpt {
+                        for e in 0..elements as u32 {
+                            for s in 0..selem {
+                                f((rt + r + s) % 32, e, offs);
+                                offs += ebytes;
+                            }
+                        }
+                    }
+                };
+                if load {
+                    mem.read(addr, &mut buf).map_err(fault)?;
+                    let mut regs = [None::<u128>; 32];
+                    order(&mut |t, e, offs| {
+                        let base = regs[t as usize].unwrap_or_else(|| vec_width(self.read_v(t), q));
+                        let mut w = [0u8; 8];
+                        w[..ebytes].copy_from_slice(&buf[offs..offs + ebytes]);
+                        regs[t as usize] = Some(set_element(base, size, e, u64::from_le_bytes(w)));
+                    });
+                    for (t, value) in regs.iter().enumerate() {
+                        if let Some(v) = value {
+                            self.write_v(t as u8, *v);
+                        }
+                    }
+                } else {
+                    order(&mut |t, e, offs| {
+                        let elem = get_element(self.read_v(t), size, e);
+                        buf[offs..offs + ebytes].copy_from_slice(&elem.to_le_bytes()[..ebytes]);
+                    });
+                    mem.write(addr, &buf).map_err(fault)?;
+                }
+                self.post_index(rn, addr, post, total as u64);
+            }
+
+            Instr::SimdLoadStoreSingle {
+                load,
+                replicate,
+                q,
+                size,
+                index,
+                selem,
+                rn,
+                rt,
+                post,
+            } => {
+                let addr = self.read_sp(rn);
+                let ebytes = 1usize << size;
+                let total = usize::from(selem) * ebytes;
+                let mut buf = [0u8; 32];
+                if load {
+                    mem.read(addr, &mut buf[..total]).map_err(fault)?;
+                    for s in 0..selem {
+                        let t = (rt + s) % 32;
+                        let off = usize::from(s) * ebytes;
+                        let mut w = [0u8; 8];
+                        w[..ebytes].copy_from_slice(&buf[off..off + ebytes]);
+                        let elem = u64::from_le_bytes(w);
+                        let v = if replicate {
+                            let lanes = (if q { 16 } else { 8 }) / ebytes;
+                            (0..lanes as u32).fold(0, |acc, i| set_element(acc, size, i, elem))
+                        } else {
+                            set_element(self.read_v(t), size, index, elem)
+                        };
+                        self.write_v(t, v);
+                    }
+                } else {
+                    for s in 0..selem {
+                        let elem = get_element(self.read_v((rt + s) % 32), size, index);
+                        let off = usize::from(s) * ebytes;
+                        buf[off..off + ebytes].copy_from_slice(&elem.to_le_bytes()[..ebytes]);
+                    }
+                    mem.write(addr, &buf[..total]).map_err(fault)?;
+                }
+                self.post_index(rn, addr, post, total as u64);
+            }
+
             Instr::Unknown(raw) => return Err(Exit::Unimplemented { pc, insn: raw }),
         }
 
         self.set_pc(next_pc);
         Ok(())
+    }
+
+    /// Applies the base-register writeback of a structure load/store.
+    fn post_index(&mut self, rn: u8, addr: u64, post: Option<PostIndex>, bytes: u64) {
+        match post {
+            None => {}
+            Some(PostIndex::Imm) => self.write_sp(rn, addr.wrapping_add(bytes)),
+            Some(PostIndex::Reg(rm)) => self.write_sp(rn, addr.wrapping_add(self.read_xzr(rm))),
+        }
     }
 
     /// Reads the element feeding DUP or INS.

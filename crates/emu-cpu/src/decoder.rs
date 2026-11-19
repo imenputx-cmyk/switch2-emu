@@ -273,6 +273,15 @@ pub enum VecLogicOp {
     Bif,
 }
 
+/// Base-register writeback of a SIMD structure load/store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostIndex {
+    /// Add the number of bytes transferred.
+    Imm,
+    /// Add the value of Xm.
+    Reg(u8),
+}
+
 /// Source of DUP and INS: a general register or a vector element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElemSrc {
@@ -416,6 +425,31 @@ pub enum Instr {
         rt: u8,
     },
 
+    /// LD1-LD4 / ST1-ST4 (multiple structures): `rpt` consecutive groups
+    /// of `selem` interleaved registers starting at Vt.
+    SimdLoadStoreMulti {
+        load: bool,
+        q: bool,
+        size: u8,
+        rpt: u8,
+        selem: u8,
+        rn: u8,
+        rt: u8,
+        post: Option<PostIndex>,
+    },
+    /// LD1-LD4 / ST1-ST4 (single structure) and LD1R-LD4R (`replicate`).
+    /// `size` is log2 bytes per element.
+    SimdLoadStoreSingle {
+        load: bool,
+        replicate: bool,
+        q: bool,
+        size: u8,
+        index: u32,
+        selem: u8,
+        rn: u8,
+        rt: u8,
+        post: Option<PostIndex>,
+    },
     /// LDXP, LDAXP, STXP, STLXP. `sf` selects 64-bit registers. For
     /// stores, `store` holds the status register.
     ExclusivePair {
@@ -1016,7 +1050,99 @@ fn simd_size_kind(size: u32, opc: u32) -> Option<(u32, LoadKind)> {
     Some((scale, kind))
 }
 
+fn decode_simd_structure(insn: u32) -> Option<Instr> {
+    let q = bit(insn, 30);
+    let load = bit(insn, 22);
+    let rn = reg(insn, 5);
+    let rt = reg(insn, 0);
+    let post = if bit(insn, 23) {
+        let rm = reg(insn, 16);
+        Some(if rm == 31 {
+            PostIndex::Imm
+        } else {
+            PostIndex::Reg(rm)
+        })
+    } else {
+        if bits(insn, 20, 16) != 0 {
+            return None;
+        }
+        None
+    };
+    let size = bits(insn, 11, 10) as u8;
+
+    if !bit(insn, 24) {
+        // Multiple structures.
+        if bit(insn, 21) {
+            return None;
+        }
+        let (rpt, selem) = match bits(insn, 15, 12) {
+            0b0000 => (1, 4),
+            0b0010 => (4, 1),
+            0b0100 => (1, 3),
+            0b0110 => (3, 1),
+            0b0111 => (1, 1),
+            0b1000 => (1, 2),
+            0b1010 => (2, 1),
+            _ => return None,
+        };
+        if size == 3 && !q && selem > 1 {
+            return None;
+        }
+        return Some(Instr::SimdLoadStoreMulti {
+            load,
+            q,
+            size,
+            rpt,
+            selem,
+            rn,
+            rt,
+            post,
+        });
+    }
+
+    // Single structure.
+    let opcode = bits(insn, 15, 13);
+    let s = bits(insn, 12, 12);
+    let selem = (((opcode & 1) << 1) | bits(insn, 21, 21)) as u8 + 1;
+    let qb = u32::from(q);
+    let (scale, index, replicate) = match opcode >> 1 {
+        0b00 => (0, (qb << 3) | (s << 2) | u32::from(size), false),
+        0b01 => {
+            if size & 1 != 0 {
+                return None;
+            }
+            (1, (qb << 2) | (s << 1) | u32::from(size >> 1), false)
+        }
+        0b10 => match (size, s) {
+            (0b00, _) => (2, (qb << 1) | s, false),
+            (0b01, 0) => (3, qb, false),
+            _ => return None,
+        },
+        _ => {
+            if !load || s != 0 {
+                return None;
+            }
+            (size, 0, true)
+        }
+    };
+    Some(Instr::SimdLoadStoreSingle {
+        load,
+        replicate,
+        q,
+        size: scale,
+        index,
+        selem,
+        rn,
+        rt,
+        post,
+    })
+}
+
 fn decode_load_store(insn: u32) -> Option<Instr> {
+    // Advanced SIMD load/store multiple and single structures.
+    if insn & 0xBE00_0000 == 0x0C00_0000 {
+        return decode_simd_structure(insn);
+    }
     let simd = bit(insn, 26);
     let size = bits(insn, 31, 30);
     let rn = reg(insn, 5);

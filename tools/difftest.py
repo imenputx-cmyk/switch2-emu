@@ -62,6 +62,10 @@ CLASSES = [
     ("fp_ldst_regoff", 0x3F200C00, 0x3C200800),
     ("fp_ld_literal", 0x3F000000, 0x1C000000),
     ("fp_ldst_pair", 0x3E000000, 0x2C000000),
+    ("simd_ldst_multi", 0xBFBF0000, 0x0C000000),
+    ("simd_ldst_multi_post", 0xBFA00000, 0x0C800000),
+    ("simd_ldst_single", 0xBF9F0000, 0x0D000000),
+    ("simd_ldst_single_post", 0xBF800000, 0x0D800000),
     # Scalar floating point.
     ("fp_3src", 0xFF000000, 0x1F000000),
     ("fp_1src", 0xFF207C00, 0x1E204000),
