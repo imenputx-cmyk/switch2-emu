@@ -13,9 +13,10 @@ pub enum KObject {
         id: u64,
     },
     Process,
-    /// A client session to a named port (an IPC service).
+    /// A client session to an IPC service (index into the kernel's
+    /// session table).
     Session {
-        name: String,
+        id: usize,
     },
 }
 

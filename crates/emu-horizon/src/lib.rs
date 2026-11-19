@@ -11,8 +11,10 @@
 //! simplified (documented at each SVC).
 
 pub mod handles;
+pub mod ipc;
 pub mod memmap;
 pub mod result;
+pub mod services;
 
 use emu_cpu::{Cpu, Exit};
 use emu_loader::nro::parse_nro;
@@ -78,6 +80,17 @@ pub enum Stop {
         id: u16,
         pc: u64,
     },
+    /// An IPC command that is not implemented yet.
+    UnimplementedIpc {
+        service: String,
+        command: u32,
+        control: bool,
+    },
+    /// A malformed IPC message.
+    BadIpc {
+        pc: u64,
+        error: ipc::ParseError,
+    },
     /// The CPU stopped (fault, undefined instruction, BRK, ...).
     Cpu(Exit),
     StepLimit,
@@ -95,6 +108,14 @@ mod config_key {
 }
 const LOADER_INFO: &str = "switch2-emu";
 
+/// An IPC session: the service object behind it and, once converted to
+/// a domain, its table of objects (index = object id, 0 unused).
+struct Session {
+    object: services::ServiceRef,
+    domain: Option<Vec<Option<services::ServiceRef>>>,
+    closed: bool,
+}
+
 pub struct Horizon {
     pub mem: Memory,
     pub cpu: Cpu,
@@ -109,6 +130,8 @@ pub struct Horizon {
     aliases: Vec<(u64, u64, u64)>,
     /// Text written with svcOutputDebugString.
     pub debug_output: Vec<u8>,
+    /// IPC sessions, indexed by `KObject::Session::id`.
+    sessions: Vec<Session>,
     /// Log of SVC calls, for diagnostics.
     pub trace_svcs: bool,
 }
@@ -133,6 +156,7 @@ impl Horizon {
             process_id: 0x50,
             aliases: Vec::new(),
             debug_output: Vec::new(),
+            sessions: Vec::new(),
             trace_svcs: false,
         }
     }
@@ -382,6 +406,7 @@ impl Horizon {
                 self.set_x(0, tick);
             }
             0x1F => self.svc_connect_to_named_port(),
+            0x21 => return self.svc_send_sync_request(pc),
             0x24 => {
                 self.ret(SUCCESS);
                 self.set_x(1, self.process_id);
@@ -584,20 +609,169 @@ impl Horizon {
         }
     }
 
-    /// ConnectToNamedPort: gives a session handle. Services (IPC over
-    /// SendSyncRequest) are the next milestone, so the session cannot be
-    /// used yet.
+    /// ConnectToNamedPort: only the service manager has a named port.
     fn svc_connect_to_named_port(&mut self) {
         let Some(name) = self.read_cstr(self.x(1), 12) else {
             return self.ret(INVALID_ADDRESS);
         };
-        match self.handles.insert(KObject::Session { name }) {
+        if name != "sm:" {
+            return self.ret(NOT_FOUND);
+        }
+        let service = services::create(&name).expect("sm: exists");
+        match self.new_session(service) {
             Some(h) => {
                 self.ret(SUCCESS);
                 self.set_x(1, u64::from(h));
             }
             None => self.ret(OUT_OF_HANDLES),
         }
+    }
+
+    fn new_session(&mut self, object: services::ServiceRef) -> Option<u32> {
+        let id = self.sessions.len();
+        self.sessions.push(Session {
+            object,
+            domain: None,
+            closed: false,
+        });
+        self.handles.insert(KObject::Session { id })
+    }
+
+    /// SendSyncRequest: handles one CMIF request from the TLS command
+    /// buffer and writes the reply there.
+    fn svc_send_sync_request(&mut self, pc: u64) -> Result<(), Stop> {
+        let Some(&KObject::Session { id }) = self.handles.get(self.x(0) as u32) else {
+            self.ret(INVALID_HANDLE);
+            return Ok(());
+        };
+        let tls = self.cpu.tpidrro_el0;
+        let mut msg = [0u8; ipc::MESSAGE_SIZE];
+        if self.mem.read(tls, &mut msg).is_err() {
+            self.ret(INVALID_ADDRESS);
+            return Ok(());
+        }
+        let is_domain = self.sessions[id].domain.is_some();
+        let req =
+            ipc::parse_request(&msg, is_domain).map_err(|error| Stop::BadIpc { pc, error })?;
+
+        let reply = match req.kind {
+            ipc::TYPE_CLOSE => {
+                self.sessions[id].closed = true;
+                self.ret(SUCCESS);
+                return Ok(());
+            }
+            ipc::TYPE_CONTROL | ipc::TYPE_CONTROL_WITH_CONTEXT => self.control(id, &req)?,
+            ipc::TYPE_REQUEST | ipc::TYPE_REQUEST_WITH_CONTEXT => self.request(id, &req)?,
+            _ => {
+                let service = self.sessions[id].object.borrow().name().to_string();
+                return Err(Stop::UnimplementedIpc {
+                    service,
+                    command: u32::from(req.kind),
+                    control: true,
+                });
+            }
+        };
+        let out = ipc::write_reply(&reply, is_domain && req.kind != ipc::TYPE_CONTROL);
+        self.mem.write(tls, &out).expect("TLS is mapped");
+        self.ret(SUCCESS);
+        Ok(())
+    }
+
+    /// Control requests (sent on the session itself, never as domain
+    /// messages).
+    fn control(&mut self, id: usize, req: &ipc::Request) -> Result<ipc::Reply, Stop> {
+        let mut reply = ipc::Reply::default();
+        match req.command {
+            0 => {
+                // ConvertCurrentObjectToDomain: the object becomes id 1.
+                let object = self.sessions[id].object.clone();
+                self.sessions[id].domain = Some(vec![None, Some(object)]);
+                reply.data.extend_from_slice(&1u32.to_le_bytes());
+            }
+            2 | 4 => {
+                // CloneCurrentObject(Ex): a new session to the same object.
+                let object = self.sessions[id].object.clone();
+                match self.new_session(object) {
+                    Some(h) => reply.move_handles.push(h),
+                    None => reply.result = OUT_OF_HANDLES,
+                }
+            }
+            3 => {
+                // QueryPointerBufferSize.
+                reply.data.extend_from_slice(&0x8000u16.to_le_bytes());
+            }
+            command => {
+                let service = self.sessions[id].object.borrow().name().to_string();
+                return Err(Stop::UnimplementedIpc {
+                    service,
+                    command,
+                    control: true,
+                });
+            }
+        }
+        Ok(reply)
+    }
+
+    fn request(&mut self, id: usize, req: &ipc::Request) -> Result<ipc::Reply, Stop> {
+        let object = match &req.domain {
+            None => self.sessions[id].object.clone(),
+            Some(d) => {
+                let table = self.sessions[id].domain.as_mut().expect("domain session");
+                if d.kind == ipc::DOMAIN_CLOSE {
+                    if let Some(slot) = table.get_mut(d.object_id as usize) {
+                        *slot = None;
+                    }
+                    return Ok(ipc::Reply::default());
+                }
+                match table.get(d.object_id as usize).cloned().flatten() {
+                    Some(o) => o,
+                    // Unknown object id: HIPC "target not found".
+                    None => {
+                        return Ok(ipc::Reply {
+                            result: 10 | (410 << 9),
+                            ..Default::default()
+                        })
+                    }
+                }
+            }
+        };
+        let mut ctx = services::Ctx {
+            req,
+            mem: &mut self.mem,
+            out: Vec::new(),
+            out_objects: Vec::new(),
+        };
+        let outcome = object.borrow_mut().call(req.command, &mut ctx);
+        let services::Ctx {
+            out, out_objects, ..
+        } = ctx;
+        let mut reply = ipc::Reply::default();
+        match outcome {
+            Ok(()) => {
+                reply.data = out;
+                for obj in out_objects {
+                    if let Some(table) = self.sessions[id].domain.as_mut() {
+                        table.push(Some(obj));
+                        reply.objects.push((table.len() - 1) as u32);
+                    } else {
+                        match self.new_session(obj) {
+                            Some(h) => reply.move_handles.push(h),
+                            None => reply.result = OUT_OF_HANDLES,
+                        }
+                    }
+                }
+            }
+            Err(services::CallError::Result(code)) => reply.result = code,
+            Err(services::CallError::Unimplemented) => {
+                let service = object.borrow().name().to_string();
+                return Err(Stop::UnimplementedIpc {
+                    service,
+                    command: req.command,
+                    control: false,
+                });
+            }
+        }
+        Ok(reply)
     }
 
     fn svc_get_info(&mut self) {

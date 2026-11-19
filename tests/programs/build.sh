@@ -17,6 +17,15 @@ clang $common -mcpu=cortex-a78c -o crypto.elf crypto.c
 hb="--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib -fPIE \
     -mcpu=cortex-a78c -fno-stack-protector -fuse-ld=lld \
     -Wl,-pie,--no-dynamic-linker,-z,max-page-size=4096,-T,homebrew/link.ld,-s"
-clang $hb -o homebrew/hb_hello.elf homebrew/crt0.S homebrew/hb_hello.c
+clang $hb -o homebrew/hb_hello.elf homebrew/crt0.S homebrew/hb_relocate.c homebrew/hb_hello.c
 python3 ../../tools/elf2nro.py homebrew/hb_hello.elf hb_hello.nro
+
+# IPC test: compiled against libnx's header-only IPC code (ISC). Set LIBNX
+# to a libnx checkout (default: a fresh shallow clone in /tmp).
+LIBNX=${LIBNX:-/tmp/libnx}
+[ -d "$LIBNX" ] || git clone -q --depth 1 https://github.com/switchbrew/libnx "$LIBNX"
+clang $hb -Ihomebrew/include_stubs -I"$LIBNX/nx/include" -o homebrew/hb_ipc.elf \
+    homebrew/crt0.S homebrew/hb_svc.S homebrew/hb_relocate.c homebrew/hb_ipc.c
+python3 ../../tools/elf2nro.py homebrew/hb_ipc.elf hb_ipc.nro
+rm homebrew/hb_ipc.elf
 rm homebrew/hb_hello.elf

@@ -126,3 +126,34 @@ Returning 42 to the loader
 ";
     assert_eq!(String::from_utf8(r.debug_output).unwrap(), expected);
 }
+
+#[test]
+fn homebrew_ipc_with_libnx_client_code() {
+    // tests/programs/homebrew/hb_ipc.c uses libnx's own header-only IPC
+    // code (service.h/cmif.h/hipc.h), so these are the exact messages real
+    // homebrew sends: sm: RegisterClient (with PID), GetServiceHandle (move
+    // handle), set:sys GetFirmwareVersion2 (fixed-size C buffer), domain
+    // conversion and domain messages, close. Error codes: 0xF201 kernel
+    // NotFound, 0xE15 sm NotRegistered, 0xE401 kernel InvalidHandle.
+    let r = emu_run::run_nro(&program("hb_ipc.nro"), 10_000_000, false).expect("boots");
+    assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0));
+    let expected = "\
+ConnectToNamedPort(sm:) = 0x0
+ConnectToNamedPort(nope) = 0xf201
+sm pointer buffer size = 0x8000
+sm RegisterClient = 0x0
+sm GetServiceHandle(set:sys) = 0x0
+sm GetServiceHandle(nosuch) = 0xe15
+set:sys GetFirmwareVersion2 = 0x0
+firmware major = 0x15
+display version = 21.0.0
+display title = NintendoSDK Firmware for NX 21.0.0-1.0 (switch2-emu)
+ConvertToDomain = 0x0
+domain object id = 0x1
+domain GetFirmwareVersion = 0x0
+domain display version = 21.0.0
+CloseHandle(closed handle) = 0xe401
+IPC test done
+";
+    assert_eq!(String::from_utf8(r.debug_output).unwrap(), expected);
+}
