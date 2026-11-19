@@ -215,6 +215,9 @@ pub enum SysReg {
     TpidrEl0,
     TpidrroEl0,
     CntvctEl0,
+    /// Physical counter. Horizon lets user code read it (libnx's
+    /// `armGetSystemTick` does).
+    CntpctEl0,
     CntfrqEl0,
     CtrEl0,
     DczidEl0,
@@ -230,6 +233,7 @@ impl SysReg {
             0x5e82 => SysReg::TpidrEl0,
             0x5e83 => SysReg::TpidrroEl0,
             0x5f02 => SysReg::CntvctEl0,
+            0x5f01 => SysReg::CntpctEl0,
             0x5f00 => SysReg::CntfrqEl0,
             0x5801 => SysReg::CtrEl0,
             0x5807 => SysReg::DczidEl0,
@@ -724,6 +728,19 @@ pub enum Instr {
     /// Other Advanced SIMD data processing, see [`crate::simd`].
     Simd(crate::simd::Simd),
 
+    /// DC ZVA: zero the 64-byte block containing Xt.
+    DcZva {
+        rt: u8,
+    },
+    /// DC CVAC/CVAU/CIVAC/CVAP: data cache maintenance. No effect here,
+    /// since the emulated memory is always coherent.
+    DcMaint,
+    /// IC IVAU: instruction cache invalidate. A future JIT must drop
+    /// translated code for the line here.
+    IcIvau {
+        rt: u8,
+    },
+
     /// Not yet implemented or unallocated.
     Unknown(u32),
 }
@@ -1008,6 +1025,21 @@ fn decode_branch_sys(insn: u32) -> Option<Instr> {
             _ => None,
         };
     }
+    // SYS at EL0: DC ZVA, data cache maintenance by address, IC IVAU.
+    if insn & 0xFFF8_0000 == 0xD508_0000 {
+        let rt = reg(insn, 0);
+        // op1 = 3, CRn = 7; select on CRm:op2.
+        if bits(insn, 18, 16) == 3 && bits(insn, 15, 12) == 7 && bits(insn, 7, 5) == 1 {
+            return match bits(insn, 11, 8) {
+                4 => Some(Instr::DcZva { rt }),
+                10 | 11 | 12 | 14 => Some(Instr::DcMaint),
+                5 => Some(Instr::IcIvau { rt }),
+                _ => None,
+            };
+        }
+        return None;
+    }
+
     // MRS / MSR (register).
     let key = bits(insn, 19, 5);
     match insn & 0xFFF0_0000 {

@@ -101,7 +101,18 @@ CLASSES = [
     ("fp16_3same", 0x9F60C400, 0x0E400400),
     ("fp16_3same_scalar", 0xDF60C400, 0x5E400400),
     ("fp16_2misc", 0x9F7E0C00, 0x0E780800),
-    ("fp16_2misc_scalar", 0xDF7E0C00, 0x5E780800),
+        ("fp16_2misc_scalar", 0xDF7E0C00, 0x5E780800),
+    ("crypto_aes", 0xFF3E0C00, 0x4E280800),
+    ("crypto_sha3", 0xFF208C00, 0x5E000000),
+    ("crypto_sha2", 0xFF3E0C00, 0x5E280800),
+        ("crypto_pmull64", 0xBFE0FC00, 0x0EE0E000),
+    ("sys_dc_zva", 0xFFFFFFE0, 0xD50B7420),
+    ("sys_dc_cvac", 0xFFFFFFE0, 0xD50B7A20),
+    ("sys_dc_civac", 0xFFFFFFE0, 0xD50B7E20),
+    ("sys_dc_cvau", 0xFFFFFFE0, 0xD50B7B20),
+    ("sys_dc_cvap", 0xFFFFFFE0, 0xD50B7C20),
+    ("sys_ic_ivau", 0xFFFFFFE0, 0xD50B7520),
+    ("sys_mrs", 0xFFF00000, 0xD5300000),
 ]
 
 # Interesting floating-point bit patterns (half, single, double).

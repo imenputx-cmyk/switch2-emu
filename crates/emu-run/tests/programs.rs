@@ -71,3 +71,19 @@ fp16 fma        = 0.149902 1501.000000 -inf 0.000000
     assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
     assert_eq!(result.exit_code, 0);
 }
+
+#[test]
+fn crypto_program_matches_published_test_vectors() {
+    // AES-128: FIPS-197 Appendix C.1. SHA-256/SHA-1 of "abc": FIPS 180
+    // examples (also Python's hashlib). Implemented with the AESE/AESD/
+    // AESMC/AESIMC, SHA1*, SHA256* and PMULL instructions.
+    let result = emu_run::run_elf(&program("crypto.elf"), 10_000_000).expect("program runs");
+    let expected = "\
+aes128 encrypt = 69c4e0d86a7b0430d8cdb78070b4c55a
+aes128 decrypt = 00112233445566778899aabbccddeeff
+sha256(abc)    = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+sha1(abc)      = a9993e364706816aba3e25717850c26c9cd0d89d
+pmull64        = 0x000000000000007d 0x000000000000007d
+";
+    assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
+}

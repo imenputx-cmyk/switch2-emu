@@ -3,6 +3,7 @@
 //! - [`decoder`] turns 32-bit instruction words into [`decoder::Instr`].
 //! - [`interpreter`] executes them on a [`Cpu`] (see [`Cpu::step`]).
 
+pub mod crypto;
 pub mod decoder;
 pub mod fp;
 pub mod interpreter;

@@ -540,12 +540,12 @@ impl Cpu {
                     SysReg::Fpsr => self.fpsr,
                     SysReg::TpidrEl0 => self.tpidr_el0,
                     SysReg::TpidrroEl0 => self.tpidrro_el0,
-                    SysReg::CntvctEl0 => self.counter,
+                    SysReg::CntvctEl0 | SysReg::CntpctEl0 => self.counter,
                     SysReg::CntfrqEl0 => self.counter_freq,
                     // 64-byte cache lines.
                     SysReg::CtrEl0 => 0x8444_C004,
-                    // DC ZVA is not implemented yet, so report it prohibited.
-                    SysReg::DczidEl0 => 0x10,
+                    // DC ZVA allowed, 64-byte blocks (as on the Cortex-A78).
+                    SysReg::DczidEl0 => 0x4,
                 };
                 self.write_xzr(rt, value);
             }
@@ -1166,6 +1166,12 @@ impl Cpu {
 
             Instr::Simd(simd) => self.exec_simd(simd),
 
+            Instr::DcZva { rt } => {
+                let addr = self.read_xzr(rt) & !63;
+                mem.write(addr, &[0u8; 64]).map_err(fault)?;
+            }
+            Instr::DcMaint | Instr::IcIvau { .. } => {}
+
             Instr::Unknown(raw) => return Err(Exit::Unimplemented { pc, insn: raw }),
         }
 
@@ -1470,6 +1476,23 @@ mod tests {
         let exit = cpu.execute(STR_X1_X0_8, &mut mem).unwrap_err();
         assert!(matches!(exit, Exit::Fault { pc: 0x40, .. }));
         assert_eq!(cpu.pc(), 0x40);
+    }
+
+    #[test]
+    fn dc_zva_zeroes_aligned_block_and_counters_read() {
+        let mut mem = Memory::new();
+        mem.map(0x10000, 0x1000, Perm::RW).unwrap();
+        mem.write(0x10000, &[0xAA; 0x100]).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.write_xzr(1, 0x10047);
+        cpu.execute(0xD50B_7421, &mut mem).unwrap(); // dc zva, x1
+        assert_eq!(mem.read_u64(0x1003F - 7).unwrap(), 0xAAAA_AAAA_AAAA_AAAA);
+        assert_eq!(mem.read_u64(0x10040).unwrap(), 0);
+        assert_eq!(mem.read_u64(0x10078).unwrap(), 0);
+        assert_eq!(mem.read_uint(0x10080, 1).unwrap(), 0xAA);
+        cpu.counter = 1234;
+        cpu.execute(0xD53B_E020, &mut mem).unwrap(); // mrs x0, cntpct_el0
+        assert_eq!(cpu.read_xzr(0), 1234);
     }
 
     #[test]

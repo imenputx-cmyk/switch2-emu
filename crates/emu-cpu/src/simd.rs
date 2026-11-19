@@ -260,6 +260,21 @@ pub enum Op {
         max: bool,
         num: bool,
     },
+    // ---- Cryptographic Extension ----
+    Aese,
+    Aesd,
+    Aesmc,
+    Aesimc,
+    Sha1Rounds(crate::crypto::Sha1Fn),
+    Sha1H,
+    Sha1Su0,
+    Sha1Su1,
+    Sha256H,
+    Sha256H2,
+    Sha256Su0,
+    Sha256Su1,
+    /// PMULL/PMULL2 with 64-bit elements.
+    Pmull64,
 }
 
 /// A decoded Advanced SIMD instruction.
@@ -319,6 +334,41 @@ impl Simd {
 /// Decodes the Advanced SIMD data-processing groups not handled in
 /// `decoder.rs`.
 pub fn decode(insn: u32) -> Option<Simd> {
+    // Cryptographic AES, SHA three-register and SHA two-register.
+    if insn & 0xFFFE_0C00 == 0x4E28_0800 {
+        let op = match bits(insn, 16, 12) {
+            0b00100 => Op::Aese,
+            0b00101 => Op::Aesd,
+            0b00110 => Op::Aesmc,
+            0b00111 => Op::Aesimc,
+            _ => return None,
+        };
+        return Some(Simd::new(op, insn, 0));
+    }
+    if insn & 0xFFE0_8C00 == 0x5E00_0000 {
+        use crate::crypto::Sha1Fn;
+        let op = match bits(insn, 14, 12) {
+            0b000 => Op::Sha1Rounds(Sha1Fn::Choose),
+            0b001 => Op::Sha1Rounds(Sha1Fn::Parity),
+            0b010 => Op::Sha1Rounds(Sha1Fn::Majority),
+            0b011 => Op::Sha1Su0,
+            0b100 => Op::Sha256H,
+            0b101 => Op::Sha256H2,
+            0b110 => Op::Sha256Su1,
+            _ => return None,
+        };
+        return Some(Simd::new(op, insn, 2));
+    }
+    if insn & 0xFFFE_0C00 == 0x5E28_0800 {
+        let op = match bits(insn, 16, 12) {
+            0b00000 => Op::Sha1H,
+            0b00001 => Op::Sha1Su1,
+            0b00010 => Op::Sha256Su0,
+            _ => return None,
+        };
+        return Some(Simd::new(op, insn, 2));
+    }
+
     // Half-precision groups.
     if insn & 0x9F60_C400 == 0x0E40_0400 {
         return fp16_three_same(insn, false);
@@ -620,7 +670,12 @@ fn three_different(insn: u32, scalar: bool) -> Option<Simd> {
     let u = bit(insn, 29);
     let size = bits(insn, 23, 22);
     if size == 3 {
-        return None;
+        // Only PMULL/PMULL2 with 64-bit elements (Cryptographic Extension).
+        return if !scalar && !u && bits(insn, 15, 12) == 0b1110 {
+            Some(Simd::new(Op::Pmull64, insn, 3))
+        } else {
+            None
+        };
     }
     let op = match (u, bits(insn, 15, 12)) {
         (_, 0b0000) => Op::AddSubLong {
@@ -1917,6 +1972,56 @@ impl Cpu {
                     acc | ((r & ones(8 << (e - 1))) << (i * (8 << (e - 1))))
                 });
                 self.finish_narrow(&s, half);
+                return;
+            }
+            Op::Aese | Op::Aesd | Op::Aesmc | Op::Aesimc => {
+                use crate::crypto;
+                let v = match s.op {
+                    Op::Aese => crypto::aese(d, n),
+                    Op::Aesd => crypto::aesd(d, n),
+                    Op::Aesmc => crypto::aesmc(n),
+                    _ => crypto::aesimc(n),
+                };
+                self.write_v(s.rd, v);
+                return;
+            }
+            Op::Sha1Rounds(f) => {
+                let v = crate::crypto::sha1_rounds(d, n as u32, m, f);
+                self.write_v(s.rd, v);
+                return;
+            }
+            Op::Sha1H => {
+                self.write_v(s.rd, u128::from(crate::crypto::sha1h(n as u32)));
+                return;
+            }
+            Op::Sha1Su0 => {
+                self.write_v(s.rd, crate::crypto::sha1su0(d, n, m));
+                return;
+            }
+            Op::Sha1Su1 => {
+                self.write_v(s.rd, crate::crypto::sha1su1(d, n));
+                return;
+            }
+            Op::Sha256H => {
+                self.write_v(s.rd, crate::crypto::sha256_hash(d, n, m, true));
+                return;
+            }
+            Op::Sha256H2 => {
+                self.write_v(s.rd, crate::crypto::sha256_hash(n, d, m, false));
+                return;
+            }
+            Op::Sha256Su0 => {
+                self.write_v(s.rd, crate::crypto::sha256su0(d, n));
+                return;
+            }
+            Op::Sha256Su1 => {
+                self.write_v(s.rd, crate::crypto::sha256su1(d, n, m));
+                return;
+            }
+            Op::Pmull64 => {
+                let half = u32::from(s.q);
+                let v = crate::crypto::clmul64(get(n, 3, half), get(m, 3, half));
+                self.write_v(s.rd, v);
                 return;
             }
             Op::FCvtLong => {

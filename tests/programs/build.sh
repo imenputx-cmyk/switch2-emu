@@ -11,3 +11,4 @@ common="--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib \
 clang $common -mgeneral-regs-only -o hello.elf hello.c
 clang $common -fno-vectorize -fno-slp-vectorize -o float.elf float.c
 clang $common -mcpu=cortex-a78c -o simd.elf simd.c
+clang $common -mcpu=cortex-a78c -o crypto.elf crypto.c
