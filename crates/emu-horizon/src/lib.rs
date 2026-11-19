@@ -12,6 +12,7 @@
 
 pub mod handles;
 pub mod ipc;
+pub mod kobjects;
 pub mod memmap;
 pub mod result;
 pub mod services;
@@ -91,6 +92,10 @@ pub enum Stop {
         pc: u64,
         error: ipc::ParseError,
     },
+    /// The only thread waits forever on objects nothing can signal.
+    Deadlock {
+        pc: u64,
+    },
     /// The CPU stopped (fault, undefined instruction, BRK, ...).
     Cpu(Exit),
     StepLimit,
@@ -110,9 +115,12 @@ const LOADER_INFO: &str = "switch2-emu";
 
 /// An IPC session: the service object behind it and, once converted to
 /// a domain, its table of objects (index = object id, 0 unused).
+type Domain = std::rc::Rc<std::cell::RefCell<Vec<Option<services::ServiceRef>>>>;
+
 struct Session {
     object: services::ServiceRef,
-    domain: Option<Vec<Option<services::ServiceRef>>>,
+    /// Shared by clones of the session (CloneCurrentObject).
+    domain: Option<Domain>,
     closed: bool,
 }
 
@@ -132,6 +140,8 @@ pub struct Horizon {
     pub debug_output: Vec<u8>,
     /// IPC sessions, indexed by `KObject::Session::id`.
     sessions: Vec<Session>,
+    /// Events and shared memory created by services.
+    pub kobjects: kobjects::KernelObjects,
     /// Log of SVC calls, for diagnostics.
     pub trace_svcs: bool,
 }
@@ -157,6 +167,7 @@ impl Horizon {
             aliases: Vec::new(),
             debug_output: Vec::new(),
             sessions: Vec::new(),
+            kobjects: kobjects::KernelObjects::default(),
             trace_svcs: false,
         }
     }
@@ -382,6 +393,23 @@ impl Horizon {
                 self.set_x(2, 1);
             }
             0x10 => self.set_x(0, 0), // GetCurrentProcessorNumber.
+            0x12 | 0x17 => {
+                // ClearEvent / ResetSignal.
+                match self.handles.get(self.x(0) as u32) {
+                    Some(&KObject::Event { id: event }) => {
+                        let was = std::mem::replace(&mut self.kobjects.events[event], false);
+                        self.ret(if id == 0x17 && !was {
+                            INVALID_STATE
+                        } else {
+                            SUCCESS
+                        });
+                    }
+                    _ => self.ret(INVALID_HANDLE),
+                }
+            }
+            0x13 => self.svc_map_shared_memory(),
+            0x14 => self.svc_unmap_shared_memory(),
+            0x18 => return self.svc_wait_synchronization(pc),
             0x16 => {
                 let ok = self.handles.close(self.x(0) as u32);
                 self.ret(if ok { SUCCESS } else { INVALID_HANDLE });
@@ -597,6 +625,84 @@ impl Horizon {
         self.ret(SUCCESS);
     }
 
+    fn svc_map_shared_memory(&mut self) {
+        let (handle, addr, size, perm) = (self.x(0) as u32, self.x(1), self.x(2), self.x(3) as u32);
+        let Some(&KObject::SharedMemory { id }) = self.handles.get(handle) else {
+            return self.ret(INVALID_HANDLE);
+        };
+        if let Some(err) = Self::page_range_ok(addr, size) {
+            return self.ret(err);
+        }
+        if perm == 0 || perm & !(PERM_R | PERM_W) != 0 {
+            return self.ret(INVALID_MEMORY_PERMISSIONS);
+        }
+        let shm = &self.kobjects.shared_memory[id];
+        if shm.size != size {
+            return self.ret(INVALID_SIZE);
+        }
+        if shm.mapped_at.is_some() || !self.map.is_free(addr, size) {
+            return self.ret(INVALID_MEMORY_STATE);
+        }
+        let init = shm.init.clone();
+        self.map_block(addr, size, MemState::Shared, perm);
+        self.mem.write_privileged(addr, &init).expect("just mapped");
+        self.kobjects.shared_memory[id].mapped_at = Some(addr);
+        self.ret(SUCCESS);
+    }
+
+    fn svc_unmap_shared_memory(&mut self) {
+        let (handle, addr, size) = (self.x(0) as u32, self.x(1), self.x(2));
+        let Some(&KObject::SharedMemory { id }) = self.handles.get(handle) else {
+            return self.ret(INVALID_HANDLE);
+        };
+        let shm = &self.kobjects.shared_memory[id];
+        if shm.mapped_at != Some(addr) || shm.size != size {
+            return self.ret(INVALID_MEMORY_STATE);
+        }
+        self.mem.unmap(addr, size).expect("mapped");
+        self.map.remove(addr, size);
+        self.kobjects.shared_memory[id].mapped_at = None;
+        self.ret(SUCCESS);
+    }
+
+    /// WaitSynchronization: returns the index of a signaled object. With
+    /// a single thread nothing can signal while it waits, so a finite
+    /// timeout just lets the time pass and an infinite one is a deadlock.
+    fn svc_wait_synchronization(&mut self, pc: u64) -> Result<(), Stop> {
+        let (list, count, timeout) = (self.x(1), self.x(2), self.x(3) as i64);
+        if count > 0x40 {
+            self.ret(OUT_OF_RANGE);
+            return Ok(());
+        }
+        for i in 0..count {
+            let Ok(h) = self.mem.read_uint(list + 4 * i, 4) else {
+                self.ret(INVALID_ADDRESS);
+                return Ok(());
+            };
+            match self.handles.get(h as u32) {
+                Some(&KObject::Event { id }) => {
+                    if self.kobjects.events[id] {
+                        self.ret(SUCCESS);
+                        self.set_x(1, i);
+                        return Ok(());
+                    }
+                }
+                Some(KObject::Thread { .. } | KObject::Process) | Some(KObject::Session { .. }) => {
+                }
+                _ => {
+                    self.ret(INVALID_HANDLE);
+                    return Ok(());
+                }
+            }
+        }
+        if timeout < 0 {
+            return Err(Stop::Deadlock { pc });
+        }
+        self.cpu.counter += (timeout as u64).saturating_mul(192) / 10_000;
+        self.ret(TIMED_OUT);
+        Ok(())
+    }
+
     fn svc_query_memory(&mut self) {
         let (out, addr) = (self.x(0), self.x(2));
         let info = self.map.query(addr);
@@ -685,14 +791,22 @@ impl Horizon {
             0 => {
                 // ConvertCurrentObjectToDomain: the object becomes id 1.
                 let object = self.sessions[id].object.clone();
-                self.sessions[id].domain = Some(vec![None, Some(object)]);
+                self.sessions[id].domain = Some(Domain::new(vec![None, Some(object)].into()));
                 reply.data.extend_from_slice(&1u32.to_le_bytes());
             }
             2 | 4 => {
                 // CloneCurrentObject(Ex): a new session to the same object.
                 let object = self.sessions[id].object.clone();
+                let domain = self.sessions[id].domain.clone();
                 match self.new_session(object) {
-                    Some(h) => reply.move_handles.push(h),
+                    Some(h) => {
+                        let Some(KObject::Session { id: new }) = self.handles.get(h).cloned()
+                        else {
+                            unreachable!()
+                        };
+                        self.sessions[new].domain = domain;
+                        reply.move_handles.push(h);
+                    }
                     None => reply.result = OUT_OF_HANDLES,
                 }
             }
@@ -716,7 +830,8 @@ impl Horizon {
         let object = match &req.domain {
             None => self.sessions[id].object.clone(),
             Some(d) => {
-                let table = self.sessions[id].domain.as_mut().expect("domain session");
+                let domain = self.sessions[id].domain.clone().expect("domain session");
+                let mut table = domain.borrow_mut();
                 if d.kind == ipc::DOMAIN_CLOSE {
                     if let Some(slot) = table.get_mut(d.object_id as usize) {
                         *slot = None;
@@ -740,17 +855,30 @@ impl Horizon {
             mem: &mut self.mem,
             out: Vec::new(),
             out_objects: Vec::new(),
+            out_copy: Vec::new(),
+            kernel: &mut self.kobjects,
+            tick: self.cpu.counter,
         };
         let outcome = object.borrow_mut().call(req.command, &mut ctx);
         let services::Ctx {
-            out, out_objects, ..
+            out,
+            out_objects,
+            out_copy,
+            ..
         } = ctx;
         let mut reply = ipc::Reply::default();
         match outcome {
             Ok(()) => {
                 reply.data = out;
+                for kobj in out_copy {
+                    match self.handles.insert(kobj) {
+                        Some(h) => reply.copy_handles.push(h),
+                        None => reply.result = OUT_OF_HANDLES,
+                    }
+                }
                 for obj in out_objects {
-                    if let Some(table) = self.sessions[id].domain.as_mut() {
+                    if let Some(domain) = self.sessions[id].domain.clone() {
+                        let mut table = domain.borrow_mut();
                         table.push(Some(obj));
                         reply.objects.push((table.len() - 1) as u32);
                     } else {

@@ -13,7 +13,7 @@ This project does not include, distribute, or require any copyrighted Nintendo f
    - Half precision (FP16) in scalar and vector forms, and the Cryptographic Extension (AES, SHA-1, SHA-256, 64-bit PMULL), checked against the FIPS test vectors. System instructions used from user code: DC ZVA, cache maintenance by address, IC IVAU, and the EL0 counters (CNTVCT/CNTPCT).
    - To do: FPCR rounding modes other than round-to-nearest, flush-to-zero, and the FPSR exception flags. Not targeted, because the Cortex-A78C does not have them: FCMLA/FCADD, FRINT32/64, BF16, LSE2.
 4. **Memory and loader:** Guest virtual memory map and loading of homebrew/test ROMs. *(paged memory, ELF and NRO loaders done; NSO to come)*
-5. **Kernel and services (HLE):** Emulation of Horizon's SVCs and IPC services. *(in progress: homebrew boots through the homebrew ABI; memory, info, debug output and single-thread synchronization SVCs work; CMIF IPC with domains works, with the `sm:` and `set:sys` services)*
+5. **Kernel and services (HLE):** Emulation of Horizon's SVCs and IPC services. *(in progress: homebrew boots through the homebrew ABI; memory, info, debug output and single-thread synchronization SVCs work; CMIF IPC with domains works; events, shared memory and waits; a libnx application's whole startup succeeds against HLE `sm:`, `set:sys`, `apm`, `appletOE`, `hid`, `time:u` and `fsp-srv` — file access and input state are next)*
 6. **JIT:** Dynamic translation from AArch64 to x86-64 after the interpreter is correct.
 7. **GPU:** Parse the command stream and translate it to Vulkan.
 8. **Audio, input, and performance.**
@@ -48,6 +48,7 @@ cargo run --release -p emu-run -- tests/programs/simd.elf
 cargo run --release -p emu-run -- tests/programs/crypto.elf
 cargo run --release -p emu-run -- tests/programs/hb_hello.nro   # homebrew, real Switch SVCs
 cargo run --release -p emu-run -- tests/programs/hb_ipc.nro     # IPC with libnx's client code
+cargo run --release -p emu-run -- tests/programs/hb_libnx.nro   # libnx app startup (applet, hid, time, fs)
 ```
 
 ### How correctness is checked
@@ -69,6 +70,6 @@ cargo run --release -p emu-run -- tests/programs/hb_ipc.nro     # IPC with libnx
 
 - ARM Architecture Reference Manual for A-profile (ARM DDI 0487): instruction encodings and pseudocode.
 - [switchbrew wiki](https://switchbrew.org/wiki/): the NRO format, the homebrew ABI, SVC numbers, arguments, `GetInfo` types, `MemoryInfo` layout and memory states.
-- [libnx](https://github.com/switchbrew/libnx) (ISC): read to learn what homebrew expects (config entries, region queries, TLS layout, IPC message layout, result codes). No libnx code is copied into the emulator. The IPC test homebrew (`tests/programs/hb_ipc.nro`) is compiled against libnx's header-only IPC code on purpose, so the emulator is tested with the exact messages real homebrew sends; its license is in `tests/programs/LICENSE-libnx.md`.
+- [libnx](https://github.com/switchbrew/libnx) (ISC): read to learn what homebrew expects (config entries, region queries, TLS layout, IPC message layout, result codes). No libnx code is copied into the emulator. The IPC test homebrew (`tests/programs/hb_ipc.nro`) is compiled against libnx's header-only IPC code on purpose, so the emulator is tested with the exact messages real homebrew sends; `tests/programs/hb_libnx.nro` goes further and links libnx's real service clients built from source (with small libc stand-ins in `tests/programs/libnx_compat/`). Their license is in `tests/programs/LICENSE-libnx.md`.
 - Ryujinx (MIT) and yuzu: overall structure of a kernel HLE. Only used as background; no code is copied.
 - [oboromi](https://github.com/0xNikilite/oboromi) (GPL-3.0): used only as an architectural reference for how a Switch 2 emulator can be organized (multi-core CPU manager, HIPC/service layer, SM86 GPU decoding). No code is copied from it, so this project keeps its own MIT/Apache-2.0 license.

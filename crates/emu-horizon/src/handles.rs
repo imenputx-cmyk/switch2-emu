@@ -18,6 +18,13 @@ pub enum KObject {
     Session {
         id: usize,
     },
+    /// The readable side of an event (index into `KernelObjects::events`).
+    Event {
+        id: usize,
+    },
+    SharedMemory {
+        id: usize,
+    },
 }
 
 #[derive(Debug, Default)]

@@ -6,6 +6,7 @@ PHDRS {
     ro   PT_LOAD FLAGS(4);
     data PT_LOAD FLAGS(6);
     dyn  PT_DYNAMIC;
+    tls  PT_TLS;
 }
 SECTIONS {
     . = 0;
@@ -22,6 +23,11 @@ SECTIONS {
     .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) } :data
     .dynamic : { *(.dynamic) } :data :dyn
     .got : { *(.got .got.plt) } :data
+    __tdata_start = .;
+    .tdata : { *(.tdata .tdata.*) } :data :tls
+    __tdata_end = .;
+    .tbss : { *(.tbss .tbss.*) } :data :tls
+    __tls_size = SIZEOF(.tdata) + SIZEOF(.tbss);
     __bss_start__ = .;
     .bss : { *(.bss .bss.*) *(COMMON) } :data
     __bss_end__ = .;

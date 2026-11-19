@@ -4,10 +4,17 @@
 //! (the run stops) instead of being answered with a made-up success, so
 //! missing functionality is found early.
 
+pub mod am;
+pub mod apm;
+pub mod fs;
+pub mod hid;
 pub mod set;
 pub mod sm;
+pub mod time;
 
+use crate::handles::KObject;
 use crate::ipc::{Buffer, Request};
+use crate::kobjects::KernelObjects;
 use crate::result::ResultCode;
 use emu_memory::Memory;
 use std::cell::RefCell;
@@ -39,6 +46,11 @@ pub struct Ctx<'a> {
     pub out: Vec<u8>,
     /// Interfaces returned to the client (as handles or domain objects).
     pub out_objects: Vec<ServiceRef>,
+    /// Kernel objects returned as copy handles.
+    pub out_copy: Vec<KObject>,
+    pub kernel: &'a mut KernelObjects,
+    /// The current system tick (19.2 MHz), for clocks.
+    pub tick: u64,
 }
 
 impl Ctx<'_> {
@@ -64,8 +76,26 @@ impl Ctx<'_> {
         self.out.extend_from_slice(&v.to_le_bytes());
     }
 
+    pub fn push_u8(&mut self, v: u8) {
+        self.out.push(v);
+    }
+
+    pub fn push_bytes(&mut self, v: &[u8]) {
+        self.out.extend_from_slice(v);
+    }
+
     pub fn push_object(&mut self, obj: ServiceRef) {
         self.out_objects.push(obj);
+    }
+
+    pub fn push_copy(&mut self, obj: KObject) {
+        self.out_copy.push(obj);
+    }
+
+    /// Returns a lazily created event stored in `slot`, as a copy handle.
+    pub fn push_event(&mut self, slot: &mut Option<usize>, signaled: bool) {
+        let id = *slot.get_or_insert_with(|| self.kernel.new_event(signaled));
+        self.push_copy(KObject::Event { id });
     }
 
     /// The `index`-th output buffer: a C pointer if the client sent one
@@ -91,6 +121,11 @@ impl Ctx<'_> {
     }
 }
 
+/// Wraps a service object for returning it from a command.
+pub fn obj<S: Service + 'static>(s: S) -> ServiceRef {
+    Rc::new(RefCell::new(s))
+}
+
 pub trait Service {
     fn name(&self) -> &str;
     fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError>;
@@ -101,6 +136,11 @@ pub fn create(name: &str) -> Option<ServiceRef> {
     Some(match name {
         "sm:" => Rc::new(RefCell::new(sm::ServiceManager)),
         "set:sys" => Rc::new(RefCell::new(set::SystemSettings)),
+        "apm" | "apm:p" => Rc::new(RefCell::new(apm::Manager)),
+        "appletOE" => Rc::new(RefCell::new(am::AppletOE)),
+        "hid" => Rc::new(RefCell::new(hid::Hid::default())),
+        "time:u" | "time:a" | "time:s" => Rc::new(RefCell::new(time::StaticService::default())),
+        "fsp-srv" => Rc::new(RefCell::new(fs::FileSystemProxy)),
         _ => return None,
     })
 }

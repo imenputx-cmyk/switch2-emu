@@ -157,3 +157,37 @@ IPC test done
 ";
     assert_eq!(String::from_utf8(r.debug_output).unwrap(), expected);
 }
+
+#[test]
+fn libnx_application_startup() {
+    // tests/programs/libnx_compat/hb_libnx.c links libnx's own service
+    // clients (built from source), so this is the full IPC sequence of a
+    // libnx application's startup: apm, appletOE and its proxies (events,
+    // focus state), hid (shared memory), time:u (clocks read from shared
+    // memory), fsp-srv (domain + cloned sessions).
+    let r = emu_run::run_nro(&program("hb_libnx.nro"), 10_000_000, false).expect("boots");
+    assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0));
+    let out = String::from_utf8(r.debug_output).unwrap();
+    let mut lines = out.lines();
+    for expected in [
+        "hosversion = 0x150000",
+        "svcSetHeapSize = 0x0",
+        "smInitialize = 0x0",
+        "appletInitialize = 0x0",
+        "hidInitialize = 0x0",
+        "timeInitialize = 0x0",
+        "fsInitialize = 0x0",
+        "applet type = 0x0",
+        "timeGetCurrentTime = 0x0",
+    ] {
+        assert_eq!(lines.next(), Some(expected));
+    }
+    // The clock follows the host: any time after 2025 is fine.
+    let time = lines
+        .next()
+        .unwrap()
+        .strip_prefix("posix time = 0x")
+        .unwrap();
+    assert!(u64::from_str_radix(time, 16).unwrap() > 1_735_689_600);
+    assert_eq!(lines.next(), Some("fsOpenSdCardFileSystem = 0x0"));
+}

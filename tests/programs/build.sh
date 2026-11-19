@@ -29,3 +29,23 @@ clang $hb -Ihomebrew/include_stubs -I"$LIBNX/nx/include" -o homebrew/hb_ipc.elf 
 python3 ../../tools/elf2nro.py homebrew/hb_ipc.elf hb_ipc.nro
 rm homebrew/hb_ipc.elf
 rm homebrew/hb_hello.elf
+
+# libnx test: libnx's real service clients (sm, applet, hid, time, fs, ...)
+# compiled from source with small libc stand-ins (libnx_compat/), so the
+# emulator answers the exact IPC traffic of a libnx app's startup.
+L="$LIBNX/nx"
+LIBNX_SRC="services/sm.c services/applet.c services/hid.c services/time.c \
+    services/fs.c services/set.c services/apm.c sf/sessionmgr.c kernel/random.c \
+    runtime/alloc.c kernel/mutex.c kernel/condvar.c kernel/event.c kernel/shmem.c \
+    kernel/tmem.c kernel/wait.c kernel/virtmem.c kernel/uevent.c kernel/utimer.c \
+    runtime/hosversion.c runtime/env.c kernel/svc.s"
+(
+    cd libnx_compat
+    clang $(echo "$hb" | sed 's|homebrew/link.ld|../homebrew/link.ld|') \
+        -Os -ffunction-sections -fdata-sections -Wl,--gc-sections \
+        -Iinclude -I"$L/include" -I"$L/include/switch" -I"$L/source" \
+        -o hb_libnx.elf crt_libnx.S ../homebrew/hb_relocate.c glue.c hb_libnx.c \
+        $(for f in $LIBNX_SRC; do echo "$L/source/$f"; done)
+    python3 ../../../tools/elf2nro.py hb_libnx.elf ../hb_libnx.nro
+    rm hb_libnx.elf
+)

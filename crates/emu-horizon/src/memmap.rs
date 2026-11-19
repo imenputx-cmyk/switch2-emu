@@ -19,6 +19,8 @@ pub enum MemState {
     CodeMutable = 0x04,
     /// Mapped with SetHeapSize.
     Heap = 0x05,
+    /// Shared memory mapped with MapSharedMemory.
+    Shared = 0x06,
     /// Alias of heap memory made with MapMemory (thread stacks).
     Stack = 0x0B,
     ThreadLocal = 0x0C,
