@@ -50,6 +50,9 @@ mod reg {
     pub const MME_DATA_RAM_ADDRESS: u32 = 0x558;
     pub const MME_DMA_READ: u32 = 0x55C;
     pub const MME_DMA_READ_FIFOED: u32 = 0x560;
+    /// NVN2 root tables (constant banks 24-31 of SM86 shaders).
+    pub const ROOT_TABLE_SELECT: u32 = 0x504;
+    pub const ROOT_TABLE_LOAD: u32 = 0x508;
     pub const VIEWPORT_SCALE_X: u32 = 0xA00; // scale x, y, z, offset x, y, z
     pub const VERTEX_ARRAY_START: u32 = 0xD74;
     pub const DRAW_VERTEX_ARRAY: u32 = 0xD78;
@@ -126,6 +129,10 @@ pub struct Maxwell3D {
     mme64_write: usize,
     /// MME64 data RAM.
     pub data_ram: Vec<u32>,
+    /// NVN2 root tables (8 x 64 words), loaded through methods 0x504
+    /// (select table and byte offset) and 0x508 (data), as in Lichii.
+    pub root_tables: [[u32; 64]; 8],
+    root_select: (usize, u32),
 }
 
 /// Words a single MME DMA read may fetch.
@@ -201,6 +208,8 @@ impl Default for Maxwell3D {
             mme64_code: Vec::new(),
             mme64_write: 0,
             data_ram: Vec::new(),
+            root_tables: [[0; 64]; 8],
+            root_select: (0, 0),
         }
     }
 }
@@ -364,6 +373,18 @@ impl Maxwell3D {
                     return true;
                 }
                 reg::MME_MEM_ADDRESS_A | reg::MME_MEM_ADDRESS_B | reg::MME_DATA_RAM_ADDRESS => {
+                    return true;
+                }
+                reg::ROOT_TABLE_SELECT => {
+                    self.root_select = ((value & 7) as usize, (value >> 8) & 0xFF);
+                    return true;
+                }
+                reg::ROOT_TABLE_LOAD => {
+                    let (table, offset) = self.root_select;
+                    if offset < 256 && offset % 4 == 0 {
+                        self.root_tables[table][offset as usize / 4] = value;
+                    }
+                    self.root_select.1 = offset + 4;
                     return true;
                 }
                 reg::MME_DMA_READ => {
@@ -706,6 +727,13 @@ impl Maxwell3D {
             (x0, x1) = (x0.max(h & 0xFFFF), x1.min(h >> 16));
             (y0, y1) = (y0.max(vv & 0xFFFF), y1.min(vv >> 16));
         }
+        let root_tables = self.ampere.then(|| {
+            self.root_tables
+                .iter()
+                .flatten()
+                .flat_map(|w| w.to_le_bytes())
+                .collect()
+        });
         let d = Draw {
             target,
             vs,
@@ -728,6 +756,7 @@ impl Maxwell3D {
             textures: self.texture_pools(),
             depth: self.depth_state()?,
             blend: self.blend_state()?,
+            root_tables,
             blend_constant: [0, 1, 2, 3]
                 .map(|i| f32::from_bits(self.reg(reg::BLEND_CONSTANT + 4 * i))),
         };

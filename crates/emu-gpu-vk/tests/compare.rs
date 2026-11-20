@@ -742,3 +742,87 @@ fn switch2_sm86_shaders() {
     );
     shaded_draw_on(vs, ps, 8, &[], true);
 }
+
+#[test]
+fn switch2_uniforms_and_root_tables() {
+    use emu_gpu::shader::asm::{pixel_header, vertex_header};
+    use emu_gpu::shader::sm86::asm::{exit, inst, program};
+    let with_header = |header: &[u8], insts: &[emu_gpu::shader::sm86::Instruction]| {
+        let mut p = program(insts);
+        p[..header.len()].copy_from_slice(header);
+        p
+    };
+    let vs = with_header(
+        &vertex_header(),
+        &[
+            inst(
+                0x321,
+                0,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x80), (74, 2, 3)],
+            ),
+            inst(
+                0x321,
+                4,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x90), (74, 2, 3)],
+            ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 0),
+                    (40, 10, 0x70),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 4),
+                    (40, 10, 0x80),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            exit(),
+        ],
+    );
+    // PS: color from IPA; blue = root table 1 word 4 (ULDC c[25][0x10]),
+    // then multiplied by itself through a uniform operand (FMUL form 6).
+    let ps = with_header(
+        &pixel_header(),
+        &[
+            inst(0x326, 0, &[(32, 8, 255), (64, 8, 0x20), (81, 3, 7)]),
+            inst(0x326, 1, &[(32, 8, 255), (64, 8, 0x21), (81, 3, 7)]),
+            inst(
+                0xAB9,
+                5,
+                &[(38, 16, 0x10), (54, 5, 25), (73, 3, 4), (91, 1, 1)],
+            ),
+            inst(0xC02, 2, &[(32, 6, 5), (72, 4, 15), (91, 1, 1)]),
+            inst(0xC20, 2, &[(24, 8, 2), (32, 8, 5), (84, 3, 4), (91, 1, 1)]),
+            inst(0x802, 3, &[(32, 32, 1.0f32.to_bits()), (72, 4, 15)]),
+            exit(),
+        ],
+    );
+    // Root table 1, byte 0x10 = 1.0.
+    let extra = [
+        incr(0, 0x504, 1),
+        1 | 0x10 << 8,
+        incr(0, 0x508, 1),
+        1.0f32.to_bits(),
+    ];
+    let Some((soft, _)) = shaded_draw_on(vs, ps, 8, &extra, true) else {
+        return;
+    };
+    let rt = 0x4_0000 - 0x1_0000;
+    let size = emu_gpu::blocklinear::size(96 * 4, 64, 2);
+    let blue = soft[rt..rt + size]
+        .chunks(4)
+        .filter(|p| p[2] == 255)
+        .count();
+    assert!(blue > 500, "{blue} pixels took blue from the root table");
+}

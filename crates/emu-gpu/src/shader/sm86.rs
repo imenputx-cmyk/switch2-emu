@@ -32,6 +32,72 @@ use super::decode::{
 /// Bytes of a graphics program header before the first instruction.
 pub const HEADER_SIZE: usize = 0x80;
 
+/// Uniform registers UR0-UR62 live in R191-R253 (URZ is RZ): the IR has
+/// one register file. A program whose own registers reach R191 cannot use
+/// uniforms this way and is reported.
+pub const UNIFORM_BASE: u8 = 191;
+
+/// The IR register of uniform register `n`.
+pub fn ureg(n: u32) -> u8 {
+    match n {
+        63.. => RZ,
+        n => UNIFORM_BASE + n as u8,
+    }
+}
+
+/// NVN2's root tables: constant banks 24-31, 256 bytes each, which the IR
+/// reads as bank 17 (unused by games, as Lichii notes) at (bank - 24) * 256.
+pub const ROOT_TABLE_BANK: u8 = 17;
+
+/// Uniform-datapath opcodes (registers are URs): UMOV, UIADD3, ULOP3,
+/// UIMAD, USHF, ULDC.
+fn is_uniform_op(op: u32) -> bool {
+    matches!(
+        op,
+        0x882
+            | 0xC82
+            | 0x290
+            | 0x890
+            | 0x292
+            | 0x892
+            | 0x2A4
+            | 0x4A4
+            | 0x8A4
+            | 0x299
+            | 0x899
+            | 0xAB9
+            | 0xABB
+    )
+}
+
+/// Whether an instruction reads or writes uniform registers.
+fn uses_uniforms(op: u32) -> bool {
+    is_uniform_op(op) || matches!(op >> 9, 6 | 7) || op == 0x3C2 || op == 0xC02
+}
+
+/// The highest ordinary register a program names (fields 16, 24, 64, and
+/// 32 in register forms), ignoring uniform-datapath instructions.
+fn highest_register(insts: &[Instruction]) -> u8 {
+    let mut top = 0u8;
+    for i in insts {
+        let op = i.opcode();
+        if is_uniform_op(op) {
+            continue;
+        }
+        let mut fields = vec![16, 24, 64];
+        if op >> 9 == 1 {
+            fields.push(32);
+        }
+        for f in fields {
+            let r = i.reg(f);
+            if r != RZ {
+                top = top.max(r);
+            }
+        }
+    }
+    top
+}
+
 /// One 128-bit instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Instruction(pub [u32; 4]);
@@ -91,11 +157,16 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Inst>, DecodeError> {
     // are native indices until all are decoded.
     let mut lowered: Vec<Vec<Inst>> = Vec::new();
     let mut furthest = 0usize;
-    for (index, chunk) in code.chunks_exact(16).enumerate() {
-        let words = std::array::from_fn(|i| {
-            u32::from_le_bytes(chunk[4 * i..4 * i + 4].try_into().unwrap())
-        });
-        let insts = decode(Instruction(words), index)?;
+    let all: Vec<Instruction> = code
+        .chunks_exact(16)
+        .map(|chunk| {
+            Instruction(std::array::from_fn(|i| {
+                u32::from_le_bytes(chunk[4 * i..4 * i + 4].try_into().unwrap())
+            }))
+        })
+        .collect();
+    for (index, &inst) in all.iter().enumerate() {
+        let insts = decode(inst, index)?;
         for inst in &insts {
             if let Op::Bra { target } | Op::Ssy { target } = inst.op {
                 furthest = furthest.max(target);
@@ -105,6 +176,20 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Inst>, DecodeError> {
         lowered.push(insts);
         if terminal && index >= furthest {
             break;
+        }
+    }
+    // Registers past the program's own hold the uniforms.
+    let program = &all[..lowered.len()];
+    if highest_register(program) >= UNIFORM_BASE {
+        if let Some(index) = program.iter().position(|i| {
+            let op = i.opcode();
+            uses_uniforms(op)
+        }) {
+            return Err(native(
+                index,
+                &program[index],
+                "uniform registers with R191 and up in use",
+            ));
         }
     }
     let mut first = Vec::with_capacity(lowered.len() + 1);
@@ -133,6 +218,9 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Inst>, DecodeError> {
 /// Decodes one instruction (at native index `index`).
 pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
     let op = i.opcode();
+    if is_uniform_op(op) {
+        return decode_uniform(i, index);
+    }
     let form = op >> 9;
     let pred = i.pred_at(12);
     let dst = i.reg(16);
@@ -145,16 +233,7 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
         abs: i.on(73),
         neg: i.on(72),
     };
-    let cbuf = || -> Result<Operand, DecodeError> {
-        let bank = i.bits(54, 5);
-        if i.on(91) || bank >= 18 {
-            return Err(native(index, &i, "indexed or root-table constant buffer"));
-        }
-        Ok(Operand::Cbuf {
-            index: bank as u8,
-            offset: i.bits(38, 16),
-        })
-    };
+    let cbuf = || cbuf_operand(&i, index);
     // Source B and its modifiers by form.
     let src_b = || -> Result<(Operand, Mods), DecodeError> {
         let m = |abs, neg| Mods {
@@ -166,7 +245,8 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
             2 | 3 => (Operand::Reg(i.reg(64)), m(74, 75)),
             4 => (Operand::Imm(i.0[1]), Mods::default()),
             5 => (cbuf()?, m(62, 63)),
-            _ => return Err(native(index, &i, "uniform register source")),
+            6 => (Operand::Reg(ureg(i.bits(32, 8))), m(62, 63)),
+            _ => (Operand::Reg(i.reg(64)), m(74, 75)), // 7: C is the uniform
         })
     };
     // Source C and its modifiers by form.
@@ -179,7 +259,8 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
             1 | 4 | 5 => (Operand::Reg(i.reg(64)), m(74, 75)),
             2 => (Operand::Imm(i.0[1]), Mods::default()),
             3 => (cbuf()?, m(62, 63)),
-            _ => return Err(native(index, &i, "uniform register source")),
+            6 => (Operand::Reg(i.reg(64)), m(74, 75)),
+            _ => (Operand::Reg(ureg(i.bits(32, 8))), m(62, 63)), // 7
         })
     };
     let bop = |at| match i.bits(at, 2) {
@@ -202,7 +283,7 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
         }
         // FADD: B sits in C's place when C is the wide operand.
         0x021 => {
-            let (b, b_mods) = if matches!(form, 2 | 3) {
+            let (b, b_mods) = if matches!(form, 2 | 3 | 7) {
                 src_c()?
             } else {
                 src_b()?
@@ -492,6 +573,16 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
             })
         }
         _ => match op {
+            // MOV R, UR (the source in bits 32..38).
+            0xC02 => one(Op::Mov {
+                dst,
+                src: Operand::Reg(ureg(i.bits(32, 6))),
+            }),
+            // R2UR: one invocation at a time, the value itself.
+            0x3C2 => one(Op::Mov {
+                dst: ureg(u32::from(dst)),
+                src: Operand::Reg(a),
+            }),
             0x94D => one(Op::Exit),
             0x95B => one(Op::Kil),
             // NOP, WARPSYNC, DEPBAR, MEMBAR: nothing to do one invocation at a time.
@@ -512,6 +603,104 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
             0x941 => one(Op::Sync),
             _ => err("opcode not decoded yet"),
         },
+    }
+}
+
+/// A constant buffer operand: banks 0-17, or NVN2 root tables (24-31,
+/// first 256 bytes) read from [`ROOT_TABLE_BANK`].
+fn cbuf_operand(i: &Instruction, index: usize) -> Result<Operand, DecodeError> {
+    let bank = i.bits(54, 5);
+    let offset = i.bits(38, 16);
+    if i.on(91) {
+        return Err(native(index, i, "indexed constant buffer"));
+    }
+    match bank {
+        0..=17 => Ok(Operand::Cbuf {
+            index: bank as u8,
+            offset,
+        }),
+        24..=31 if offset < 256 => Ok(Operand::Cbuf {
+            index: ROOT_TABLE_BANK,
+            offset: (bank - 24) * 256 + offset,
+        }),
+        _ => Err(native(index, i, "constant bank")),
+    }
+}
+
+/// Uniform-datapath instructions: their registers are URs. The ALU ones
+/// are the ordinary instruction with uniform registers (Lichii rewrites
+/// them the same way); the guard must be UPT.
+fn decode_uniform(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
+    let op = i.opcode();
+    if i.bits(12, 4) != 7 {
+        return Err(native(index, &i, "uniform predicate guard"));
+    }
+    let dst = ureg(i.bits(16, 8));
+    let one = |op: Op| Ok(vec![Inst::always(op)]);
+    match op {
+        0x882 => one(Op::Mov {
+            dst,
+            src: Operand::Imm(i.0[1]),
+        }),
+        0xC82 => one(Op::Mov {
+            dst,
+            src: Operand::Reg(ureg(i.bits(32, 6))),
+        }),
+        // ULDC: 32 bits (width 4) or a 64-bit pair (5), direct.
+        0xAB9 => {
+            let width = i.bits(73, 3);
+            let mut plain = i;
+            plain.0[2] &= !(1 << 27); // bit 91: the uniform datapath
+            let src = cbuf_operand(&plain, index)?;
+            let Operand::Cbuf {
+                index: bank,
+                offset,
+            } = src
+            else {
+                unreachable!()
+            };
+            match width {
+                4 => one(Op::Mov { dst, src }),
+                5 if dst != RZ => Ok(vec![
+                    Inst::always(Op::Mov { dst, src }),
+                    Inst::always(Op::Mov {
+                        dst: dst + 1,
+                        src: Operand::Cbuf {
+                            index: bank,
+                            offset: offset + 4,
+                        },
+                    }),
+                ]),
+                _ => Err(native(index, &i, "ULDC width")),
+            }
+        }
+        0xABB => Err(native(index, &i, "indexed ULDC")),
+        // UIADD3, ULOP3, UIMAD, USHF: the ordinary opcode with the
+        // registers rewritten to their IR homes.
+        _ => {
+            let mut r = i;
+            let set = |r: &mut Instruction, offset: u32, value: u8| {
+                let w = (offset / 32) as usize;
+                let shift = offset % 32;
+                r.0[w] = (r.0[w] & !(0xFF << shift)) | (u32::from(value) << shift);
+            };
+            set(&mut r, 16, ureg(i.bits(16, 8)));
+            set(&mut r, 24, ureg(i.bits(24, 8)));
+            set(&mut r, 64, ureg(i.bits(64, 8)));
+            if op >> 9 == 1 {
+                set(&mut r, 32, ureg(i.bits(32, 8)));
+            }
+            // ULOP3's predicate output is a uniform predicate.
+            if op & 0x1FF == 0x092 {
+                if i.bits(81, 3) != 7 {
+                    return Err(native(index, &i, "ULOP3 predicate output"));
+                }
+                r.0[2] |= 0xF << 23; // input PT (bits 87..91)
+            }
+            r.0[0] &= !0x80; // the ordinary opcode
+            r.0[2] &= !(1 << 27); // bit 91
+            decode(r, index)
+        }
     }
 }
 
@@ -756,14 +945,93 @@ mod tests {
 
     #[test]
     fn unknown_opcodes_are_reported() {
-        let code = program(&[inst(0x3C2, 0, &[]), exit()]);
+        let code = program(&[inst(0x3A1, 0, &[]), exit()]);
         match decode_program(&code[HEADER_SIZE..]) {
             Err(DecodeError::Native {
                 index: 0,
-                opcode: 0x3C2,
+                opcode: 0x3A1,
                 ..
             }) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn uniform_registers_and_root_tables() {
+        let r = exec(
+            &[
+                // UMOV UR2 = 40
+                inst(0x882, 2, &[(32, 32, 40)]),
+                // R2UR UR3 = R0
+                inst(0x3C2, 3, &[(24, 8, 0)]),
+                // UIADD3 UR4 = UR2 + UR3 + URZ
+                inst(
+                    0x290,
+                    4,
+                    &[
+                        (24, 8, 2),
+                        (32, 8, 3),
+                        (64, 8, 63),
+                        (81, 6, 0x3F),
+                        (91, 1, 1),
+                    ],
+                ),
+                // IADD3 R1 = R0 + UR4 + RZ (form 6: B uniform)
+                inst(
+                    0xC10,
+                    1,
+                    &[
+                        (24, 8, 0),
+                        (32, 8, 4),
+                        (64, 8, 255),
+                        (81, 6, 0x3F),
+                        (91, 1, 1),
+                    ],
+                ),
+                // MOV R2 = UR4
+                inst(0xC02, 2, &[(32, 6, 4), (72, 4, 15), (91, 1, 1)]),
+                exit(),
+            ],
+            &[(0, 2)],
+        );
+        assert_eq!(r.get(ureg(4)), 42);
+        assert_eq!(r.get(1), 44);
+        assert_eq!(r.get(2), 42);
+
+        // ULDC UR6 = c[0x19][0x10] (root table 1) and a 64-bit pair from bank 3.
+        let code = program(&[
+            inst(
+                0xAB9,
+                6,
+                &[(38, 16, 0x10), (54, 5, 25), (73, 3, 4), (91, 1, 1)],
+            ),
+            inst(
+                0xAB9,
+                8,
+                &[(38, 16, 0x20), (54, 5, 3), (73, 3, 5), (91, 1, 1)],
+            ),
+            exit(),
+        ]);
+        let p = decode_program(&code[HEADER_SIZE..]).unwrap();
+        assert_eq!(
+            p[0].op,
+            Op::Mov {
+                dst: ureg(6),
+                src: Operand::Cbuf {
+                    index: ROOT_TABLE_BANK,
+                    offset: 0x110
+                }
+            }
+        );
+        assert_eq!(
+            p[2].op,
+            Op::Mov {
+                dst: ureg(9),
+                src: Operand::Cbuf {
+                    index: 3,
+                    offset: 0x24
+                }
+            }
+        );
     }
 }

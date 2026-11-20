@@ -1143,15 +1143,13 @@ impl VulkanBackend {
             (p.ps.cbufs, &d.ps_cbufs, emu_gpu::shader::Stage::Pixel),
         ] {
             for i in (0..32u32).filter(|i| mask & (1 << i) != 0) {
-                let data = match bound.get(i as usize).copied().flatten() {
-                    Some(cb) => {
-                        let mut data = vec![0u8; (cb.size as usize).next_multiple_of(16).max(16)];
-                        g.read(cb.addr, &mut data[..cb.size as usize])
-                            .map_err(|f| format!("constant buffer: {f:?}"))?;
-                        data
-                    }
-                    None => vec![0u8; 16],
-                };
+                let mut data = emu_gpu::draw::cbuf_bytes(
+                    g,
+                    bound.get(i as usize).copied().flatten(),
+                    i as usize,
+                    d.root_tables.as_deref(),
+                )?;
+                data.resize(data.len().next_multiple_of(16).max(16), 0);
                 let buffer = self.transient_buffer(&data, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
                 writes.push((spirv::cbuf_binding(stage, i), buffer, data.len() as u64));
             }

@@ -94,6 +94,33 @@ pub struct Draw {
     pub depth: Depth,
     pub blend: Blend,
     pub blend_constant: [f32; 4],
+    /// Switch 2: NVN2's root tables (8 x 256 bytes), read by shaders as
+    /// constant bank [`crate::shader::sm86::ROOT_TABLE_BANK`].
+    pub root_tables: Option<Vec<u8>>,
+}
+
+/// The bytes a shader sees in constant buffer `slot`: the bound buffer,
+/// or the root tables in their bank.
+pub fn cbuf_bytes(
+    g: &GuestMemory,
+    bound: Option<ConstBuffer>,
+    slot: usize,
+    root_tables: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if slot == crate::shader::sm86::ROOT_TABLE_BANK as usize {
+        if let Some(t) = root_tables {
+            return Ok(t.to_vec());
+        }
+    }
+    match bound {
+        Some(b) => {
+            let mut data = vec![0u8; b.size as usize];
+            g.read(b.addr, &mut data)
+                .map_err(|f| format!("constant buffer: {f:?}"))?;
+            Ok(data)
+        }
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Handles (bindless constant buffer word offsets) a program samples.
@@ -252,18 +279,15 @@ impl Varyings {
 struct Cbufs(Vec<Vec<u8>>);
 
 impl Cbufs {
-    fn load(g: &GuestMemory, bound: &[Option<ConstBuffer>; CBUF_SLOTS]) -> Result<Cbufs, String> {
+    fn load(
+        g: &GuestMemory,
+        bound: &[Option<ConstBuffer>; CBUF_SLOTS],
+        root_tables: Option<&[u8]>,
+    ) -> Result<Cbufs, String> {
         bound
             .iter()
-            .map(|b| match b {
-                Some(b) => {
-                    let mut data = vec![0u8; b.size as usize];
-                    g.read(b.addr, &mut data)
-                        .map_err(|f| format!("constant buffer: {f:?}"))?;
-                    Ok(data)
-                }
-                None => Ok(Vec::new()),
-            })
+            .enumerate()
+            .map(|(slot, b)| cbuf_bytes(g, *b, slot, root_tables))
             .collect::<Result<_, _>>()
             .map(Cbufs)
     }
@@ -392,8 +416,8 @@ pub fn draw_software(g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
     let Some(target) = d.target else {
         return Ok(());
     };
-    let vs_cbufs = Cbufs::load(g, &d.vs_cbufs)?;
-    let ps_cbufs = Cbufs::load(g, &d.ps_cbufs)?;
+    let vs_cbufs = Cbufs::load(g, &d.vs_cbufs, d.root_tables.as_deref())?;
+    let ps_cbufs = Cbufs::load(g, &d.ps_cbufs, d.root_tables.as_deref())?;
     let vs_tex = bind_textures(g, &d.textures, &d.vs_cbufs, &d.vs)?;
     let ps_tex = bind_textures(g, &d.textures, &d.ps_cbufs, &d.ps)?;
     for &(first, count) in &d.ranges {
@@ -719,6 +743,7 @@ mod raster_tests {
                 depth: Default::default(),
                 blend: Default::default(),
                 blend_constant: [0.0; 4],
+                root_tables: None,
             };
             draw_software(&mut g, &d).unwrap();
             let mut px = vec![0u8; 1024];
