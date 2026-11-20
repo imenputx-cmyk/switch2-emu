@@ -7,7 +7,7 @@
 
 use super::decode::{
     sr, Bop, FCmp, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand, Pred, Round,
-    XmadMode, RZ,
+    Space, XmadMode, RZ,
 };
 
 /// What a shader reads and writes besides its registers.
@@ -45,6 +45,11 @@ pub trait ShaderIo {
     /// Global memory (GPU virtual addresses); unmapped reads give zero.
     fn load_global(&mut self, _va: u64, _buf: &mut [u8]) {}
     fn store_global(&mut self, _va: u64, _data: &[u8]) {}
+    /// Workgroup shared memory (compute); reads outside it give zero.
+    fn load_shared(&mut self, _offset: u32, buf: &mut [u8]) {
+        buf.fill(0);
+    }
+    fn store_shared(&mut self, _offset: u32, _data: &[u8]) {}
 }
 
 pub struct Regs(pub [u32; 256]);
@@ -180,6 +185,8 @@ pub fn xmad(
 struct Machine<'a> {
     regs: Regs,
     preds: [bool; 16],
+    /// Local memory (LDL/STL), grown on demand.
+    local: Vec<u8>,
     io: &'a mut dyn ShaderIo,
 }
 
@@ -220,6 +227,82 @@ impl Machine<'_> {
         };
         let u = if uaddr == RZ { 0 } else { pair(uaddr) };
         base.wrapping_add(u).wrapping_add(offset as i64 as u64)
+    }
+
+    /// A 32-bit shared/local address: register + uniform + offset.
+    fn small_address(&self, addr: u8, uaddr: u8, offset: i32) -> u32 {
+        self.regs
+            .get(addr)
+            .wrapping_add(self.regs.get(uaddr))
+            .wrapping_add(offset as u32)
+    }
+
+    fn mem_read(&mut self, space: Space, at: u64, buf: &mut [u8]) {
+        match space {
+            Space::Global => self.io.load_global(at, buf),
+            Space::Shared => self.io.load_shared(at as u32, buf),
+            Space::Local => {
+                let at = at as usize;
+                for (k, b) in buf.iter_mut().enumerate() {
+                    *b = self.local.get(at + k).copied().unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    fn mem_write(&mut self, space: Space, at: u64, data: &[u8]) {
+        match space {
+            Space::Global => self.io.store_global(at, data),
+            Space::Shared => self.io.store_shared(at as u32, data),
+            Space::Local => {
+                let at = at as usize;
+                // Local memory is small; ignore wild addresses.
+                if at + data.len() <= LOCAL_MEMORY_LIMIT {
+                    if self.local.len() < at + data.len() {
+                        self.local.resize(at + data.len(), 0);
+                    }
+                    self.local[at..at + data.len()].copy_from_slice(data);
+                }
+            }
+        }
+    }
+
+    /// Writes loaded bytes to registers by access size.
+    fn put_loaded(&mut self, dst: u8, size: u8, buf: &[u8; 16]) {
+        let word = |k: usize| u32::from_le_bytes(buf[4 * k..4 * k + 4].try_into().unwrap());
+        match size {
+            0 => self.regs.set(dst, u32::from(buf[0])),
+            1 => self.regs.set(dst, buf[0] as i8 as i32 as u32),
+            2 => self
+                .regs
+                .set(dst, u32::from(u16::from_le_bytes([buf[0], buf[1]]))),
+            3 => self
+                .regs
+                .set(dst, i16::from_le_bytes([buf[0], buf[1]]) as i32 as u32),
+            _ => {
+                for k in 0..access_bytes(size) / 4 {
+                    if dst != RZ {
+                        self.regs.set(dst.wrapping_add(k as u8), word(k));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bytes a store of `size` writes from `src` on.
+    fn stored(&self, src: u8, size: u8) -> Vec<u8> {
+        let bytes = access_bytes(size);
+        let mut buf = Vec::with_capacity(16);
+        for k in 0..bytes.div_ceil(4) {
+            let r = if src == RZ {
+                RZ
+            } else {
+                src.wrapping_add(k as u8)
+            };
+            buf.extend_from_slice(&self.regs.get(r).to_le_bytes());
+        }
+        buf.truncate(bytes);
+        buf
     }
 
     fn set_f(&mut self, dst: u8, v: f32, s: bool) {
@@ -852,10 +935,62 @@ impl Machine<'_> {
                     self.regs.set(texs_dst(dst0, dst1, k), t[c].to_bits());
                 }
             }
-            Op::Nop | Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {}
+            Op::Lds {
+                space,
+                dst,
+                addr,
+                uaddr,
+                offset,
+                size,
+            } => {
+                let at = self.small_address(addr, uaddr, offset);
+                let bytes = access_bytes(size);
+                let mut buf = [0u8; 16];
+                self.mem_read(space, u64::from(at), &mut buf[..bytes]);
+                self.put_loaded(dst, size, &buf);
+            }
+            Op::Sts {
+                space,
+                src,
+                addr,
+                uaddr,
+                offset,
+                size,
+            } => {
+                let at = self.small_address(addr, uaddr, offset);
+                let data = self.stored(src, size);
+                self.mem_write(space, u64::from(at), &data);
+            }
+            Op::Atom {
+                space,
+                dst,
+                addr,
+                wide,
+                uaddr,
+                offset,
+                src,
+                op,
+                signed,
+            } => {
+                let at = match space {
+                    Space::Global => self.address(addr, wide, uaddr, offset),
+                    _ => u64::from(self.small_address(addr, uaddr, offset)),
+                };
+                let mut w = [0u8; 4];
+                self.mem_read(space, at, &mut w);
+                let old = u32::from_le_bytes(w);
+                let new = op.apply(old, self.regs.get(src), signed);
+                self.mem_write(space, at, &new.to_le_bytes());
+                self.regs.set(dst, old);
+            }
+            Op::Nop | Op::Bar | Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {
+            }
         }
     }
 }
+
+/// Most local memory an invocation may use.
+const LOCAL_MEMORY_LIMIT: usize = 1 << 20;
 
 /// Bytes of a global access of Maxwell size `size`.
 pub fn access_bytes(size: u8) -> usize {
@@ -934,37 +1069,97 @@ fn set_value(r: bool, bf: bool) -> u32 {
 /// Runs a program to its EXIT (or past its last instruction); returns
 /// the registers, or `None` if the invocation was discarded (KIL).
 pub fn run(program: &[Inst], io: &mut dyn ShaderIo) -> Option<Regs> {
+    let mut t = Thread::new();
+    loop {
+        match resume(program, &mut t, io) {
+            Status::Exited => return Some(t.regs),
+            Status::Killed => return None,
+            // Alone, a barrier waits for nobody.
+            Status::Barrier => {}
+        }
+    }
+}
+
+/// Why [`resume`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Exited,
+    Killed,
+    /// At a workgroup barrier: resume once every invocation got there.
+    Barrier,
+}
+
+/// One invocation's state between [`resume`] calls.
+pub struct Thread {
+    pub regs: Regs,
+    preds: [bool; 16],
+    pc: usize,
+    ssy: Vec<usize>,
+    steps: usize,
+    local: Vec<u8>,
+}
+
+impl Default for Thread {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Thread {
+    pub fn new() -> Thread {
+        Thread {
+            regs: Regs([0; 256]),
+            preds: [false; 16],
+            pc: 0,
+            ssy: Vec::with_capacity(SSY_DEPTH),
+            steps: 0,
+            local: Vec::new(),
+        }
+    }
+}
+
+/// Runs an invocation until it exits, is discarded or reaches a barrier.
+pub fn resume(program: &[Inst], t: &mut Thread, io: &mut dyn ShaderIo) -> Status {
     let mut m = Machine {
-        regs: Regs([0; 256]),
-        preds: [false; 16],
+        regs: Regs(t.regs.0),
+        preds: t.preds,
+        local: std::mem::take(&mut t.local),
         io,
     };
-    let mut ssy = Vec::with_capacity(SSY_DEPTH);
-    let mut pc = 0;
-    for _ in 0..STEP_LIMIT {
-        let Some(&inst) = program.get(pc) else { break };
-        pc += 1;
+    let status = loop {
+        if t.steps >= STEP_LIMIT {
+            break Status::Exited;
+        }
+        t.steps += 1;
+        let Some(&inst) = program.get(t.pc) else {
+            break Status::Exited;
+        };
+        t.pc += 1;
         if !m.pred(inst.pred) {
             continue;
         }
         match inst.op {
-            Op::Exit => break,
-            Op::Kil => return None,
-            Op::Bra { target } => pc = target,
+            Op::Exit => break Status::Exited,
+            Op::Kil => break Status::Killed,
+            Op::Bar => break Status::Barrier,
+            Op::Bra { target } => t.pc = target,
             Op::Ssy { target } => {
-                if ssy.len() == SSY_DEPTH {
-                    ssy.pop();
+                if t.ssy.len() == SSY_DEPTH {
+                    t.ssy.pop();
                 }
-                ssy.push(target);
+                t.ssy.push(target);
             }
-            Op::Sync => match ssy.pop() {
-                Some(t) => pc = t,
-                None => break,
+            Op::Sync => match t.ssy.pop() {
+                Some(target) => t.pc = target,
+                None => break Status::Exited,
             },
             op => m.exec(op),
         }
-    }
-    Some(m.regs)
+    };
+    t.regs = m.regs;
+    t.preds = m.preds;
+    t.local = m.local;
+    status
 }
 
 /// LOP3.LUT on three words.

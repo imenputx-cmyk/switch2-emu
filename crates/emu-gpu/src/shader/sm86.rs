@@ -26,7 +26,8 @@
 //! instructions to Maxwell ones.
 
 use super::decode::{
-    Bop, DecodeError, Inst, IntFunc, IpaMode, Mods, MufuOp, Op, Operand, Pred, Round, PT, RZ,
+    AtomOp, Bop, DecodeError, Inst, IntFunc, IpaMode, Mods, MufuOp, Op, Operand, Pred, Round,
+    Space, PT, RZ,
 };
 
 /// Uniform predicates UP0-UP6 are IR predicates 8-14 (UPT is PT).
@@ -87,7 +88,10 @@ fn is_uniform_op(op: u32) -> bool {
 fn uses_uniforms(op: u32) -> bool {
     is_uniform_op(op)
         || matches!(op >> 9, 6 | 7)
-        || matches!(op, 0x3C2 | 0xC02 | 0x9C3 | 0x981 | 0x986)
+        || matches!(
+            op,
+            0x3C2 | 0xC02 | 0x9C3 | 0x981 | 0x986 | 0x9A8 | 0x98E | 0x987 | 0x988 | 0x984 | 0x983
+        )
 }
 
 /// The highest ordinary register a program names (fields 16, 24, 64, and
@@ -959,6 +963,129 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                     handle: super::decode::bank_handle(bank, i.bits(40, 14)),
                     comp: i.bits(87, 2) as u8,
                     comps: mask,
+                })
+            }
+            // BAR.SYNC 0 (the whole workgroup).
+            0xB1D => {
+                if i.0[1] != 0 || i.0[2] & !0x10000 != 0 {
+                    return err("barrier mode");
+                }
+                one(Op::Bar)
+            }
+            // LDS / STS: size at 73, address scale at 78..80, 24-bit
+            // offset at 40; with bit 91 a uniform register adds in (LDS:
+            // at 32; STS 0x988: at 64).
+            0x984 | 0x988 | 0x388 => {
+                let size = i.bits(73, 3) as u8;
+                if size > 6 || i.bits(78, 2) != 0 {
+                    return err("shared memory size or scaled address");
+                }
+                let load = op == 0x984;
+                let uaddr = match (op, i.on(91)) {
+                    (0x984, true) => ureg(i.bits(32, 8)),
+                    (0x988, true) => ureg(i.bits(64, 8)),
+                    (0x988, false) => return err("STS form"),
+                    _ => RZ,
+                };
+                let offset = i.bits(40, 24) as i32;
+                one(if load {
+                    Op::Lds {
+                        space: Space::Shared,
+                        dst,
+                        addr: a,
+                        uaddr,
+                        offset,
+                        size,
+                    }
+                } else {
+                    Op::Sts {
+                        space: Space::Shared,
+                        src: i.reg(32),
+                        addr: a,
+                        uaddr,
+                        offset,
+                        size,
+                    }
+                })
+            }
+            // LDL / STL (local memory): a uniform base with bit 91 (LDL at
+            // 32, STL at 64).
+            0x983 | 0x387 | 0x987 => {
+                let size = i.bits(73, 3) as u8;
+                if size > 6 {
+                    return err("local memory size");
+                }
+                let load = op == 0x983;
+                let uaddr = match (load, i.on(91)) {
+                    (true, true) => ureg(i.bits(32, 8)),
+                    (false, true) => ureg(i.bits(64, 8)),
+                    _ => RZ,
+                };
+                let offset = i.bits(40, 24) as i32;
+                one(if load {
+                    Op::Lds {
+                        space: Space::Local,
+                        dst,
+                        addr: a,
+                        uaddr,
+                        offset,
+                        size,
+                    }
+                } else {
+                    Op::Sts {
+                        space: Space::Local,
+                        src: i.reg(32),
+                        addr: a,
+                        uaddr,
+                        offset,
+                        size,
+                    }
+                })
+            }
+            // ATOMS: operation at 87 (Maxwell numbering), S32 at 73.
+            0x38C => {
+                let Some(op) = AtomOp::from_bits(i.bits(87, 4)) else {
+                    return err("shared atomic operation");
+                };
+                one(Op::Atom {
+                    space: Space::Shared,
+                    dst,
+                    addr: a,
+                    wide: false,
+                    uaddr: RZ,
+                    offset: i.bits(40, 24) as i32,
+                    src: i.reg(32),
+                    op,
+                    signed: i.on(73),
+                })
+            }
+            // ATOMG (register pair address, or 0x9A8: uniform, ADD) and
+            // RED (no result; type at 73: 0 U32, 1 S32).
+            0x3A8 | 0x9A8 | 0x98E => {
+                let red = op == 0x98E;
+                let bits = if op == 0x9A8 { 0 } else { i.bits(87, 4) };
+                let bits = if red { bits & 7 } else { bits };
+                let Some(atom) = AtomOp::from_bits(bits) else {
+                    return err("global atomic operation");
+                };
+                if red && i.bits(73, 3) > 1 {
+                    return err("RED type");
+                }
+                let uaddr = if op == 0x9A8 || (red && a == RZ) {
+                    ureg(i.bits(64, 6))
+                } else {
+                    RZ
+                };
+                one(Op::Atom {
+                    space: Space::Global,
+                    dst: if red { RZ } else { dst },
+                    addr: a,
+                    wide: true,
+                    uaddr,
+                    offset: ((i.bits(40, 24) << 8) as i32) >> 8,
+                    src: i.reg(32),
+                    op: atom,
+                    signed: i.on(73),
                 })
             }
             // MOV R, UR (the source in bits 32..38).

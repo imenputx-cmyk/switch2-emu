@@ -49,6 +49,8 @@ pub mod class {
 /// An engine bound to a subchannel.
 pub enum Engine {
     ThreeD(Box<Maxwell3D>),
+    /// The Switch 2 compute class.
+    Compute(Box<engines::compute::Compute>),
     /// A copy engine and the class it was bound as.
     Copy(Box<CopyEngine>, u32),
     Inline(InlineToMemory),
@@ -63,6 +65,7 @@ impl Engine {
             class::THREED => Engine::ThreeD(Box::default()),
             class::AMPERE_THREED => Engine::ThreeD(Box::new(Maxwell3D::ampere())),
             class::DMA_COPY | class::AMPERE_DMA_COPY => Engine::Copy(Box::default(), class),
+            class::AMPERE_COMPUTE => Engine::Compute(Box::default()),
             class::INLINE_TO_MEMORY => Engine::Inline(InlineToMemory::default()),
             c => Engine::Other(c),
         }
@@ -72,6 +75,7 @@ impl Engine {
         match self {
             Engine::ThreeD(e) => e.class(),
             Engine::Copy(_, c) => *c,
+            Engine::Compute(_) => class::AMPERE_COMPUTE,
             Engine::Inline(_) => class::INLINE_TO_MEMORY,
             Engine::Other(c) => *c,
         }
@@ -474,6 +478,7 @@ impl Gpu {
         let handled = match slot.as_mut() {
             Some(Engine::ThreeD(e)) => e.write(method, value, last, &mut ctx, &mut from_macros),
             Some(Engine::Copy(e, _)) => e.write(method, value, &mut ctx),
+            Some(Engine::Compute(e)) => e.write(method, value, last, &mut ctx),
             Some(Engine::Inline(e)) => e.write(method, value, &mut ctx),
             Some(Engine::Other(_)) | None => false,
         };
@@ -769,6 +774,94 @@ mod tests {
         let mut b = [0u8; 4];
         mem.read(0x100_8010, &mut b).unwrap();
         assert_eq!(u32::from_le_bytes(b), 7);
+    }
+
+    #[test]
+    fn switch2_compute_qmd_runs_a_grid() {
+        use crate::shader::sm86::asm::{exit, inst};
+        let (mut gpu, mut mem) = setup();
+        // out[ctaid * 4 + tid] = shared[3 - tid] = 3 - tid, through shared
+        // memory and a barrier.
+        let program = [
+            inst(0x919, 0, &[(72, 8, 33)]),
+            inst(0x919, 1, &[(72, 8, 37)]),
+            inst(
+                0x211,
+                5,
+                &[(24, 8, 0), (32, 8, 255), (75, 5, 2), (81, 3, 7)],
+            ),
+            inst(0x388, 0, &[(24, 8, 5), (32, 8, 0), (73, 3, 4)]),
+            inst(0xB1D, 0, &[]),
+            inst(
+                0x810,
+                6,
+                &[
+                    (24, 8, 5),
+                    (32, 32, 12),
+                    (64, 8, 255),
+                    (72, 1, 1),
+                    (81, 3, 7),
+                    (84, 3, 7),
+                ],
+            ),
+            inst(0x984, 4, &[(24, 8, 6), (73, 3, 4)]),
+            inst(0x211, 7, &[(24, 8, 1), (32, 8, 0), (75, 5, 2), (81, 3, 7)]),
+            inst(
+                0xA11,
+                2,
+                &[(24, 8, 7), (38, 16, 0), (54, 5, 0), (75, 5, 2), (81, 3, 7)],
+            ),
+            inst(0xA02, 3, &[(38, 16, 4), (54, 5, 0), (72, 4, 15)]),
+            inst(0x386, 0, &[(24, 8, 2), (32, 8, 4), (72, 1, 1), (73, 3, 4)]),
+            exit(),
+        ];
+        let code: Vec<u8> = program
+            .iter()
+            .flat_map(|i| i.0)
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        mem.write(0x100_4000, &code).unwrap();
+        // Constant buffer 0: the output address.
+        mem.write(0x100_3000, &0x1000_5000u64.to_le_bytes())
+            .unwrap();
+        let mut q = [0u32; 64];
+        q[12] = 2; // grid 2 x 1 x 1
+        q[13] = 1;
+        q[14] = 1;
+        q[17] = 16; // shared memory bytes
+        q[18] = 0x30 | 4 << 16; // QMD 3.0, block x = 4
+        q[19] = 1 | 1 << 16;
+        q[20] = 1; // constant buffer 0 valid
+        q[32] = 0x1000_3000;
+        q[33] = 1 << 19; // 16 bytes
+        q[48] = 0x1000_4000;
+        q[24] = 0x1000_8000; // release slot 0: one word, 0x55
+        q[25] = 1 << 23 | 1 << 30;
+        q[26] = 0x55;
+        let qb: Vec<u8> = q.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write(0x100_2000, &qb).unwrap();
+        run(
+            &mut gpu,
+            &mut mem,
+            &[
+                incr(1, 0, 1),
+                class::AMPERE_COMPUTE,
+                incr(1, 0x2B4, 1),
+                0x1000_2000 >> 8,
+                incr(1, 0x2C0, 1),
+                3, // load and schedule (no dependencies): runs
+            ],
+        );
+        let mut out = [0u8; 32];
+        mem.read(0x100_5000, &mut out).unwrap();
+        let words: Vec<u32> = out
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, [3, 2, 1, 0, 3, 2, 1, 0]);
+        let mut b = [0u8; 4];
+        mem.read(0x100_8000, &mut b).unwrap();
+        assert_eq!(u32::from_le_bytes(b), 0x55);
     }
 
     #[test]

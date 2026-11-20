@@ -17,7 +17,7 @@
 //! can fall back to the software renderer.
 
 use super::decode::{
-    Bop, FCmp, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand, Pred, Round,
+    Bop, FCmp, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand, Pred, Round, Space,
     XmadMode, PT, RZ,
 };
 use super::interp::{SSY_DEPTH, STEP_LIMIT};
@@ -274,6 +274,8 @@ struct Translator {
     /// Texture variables by handle, in binding order.
     textures: Vec<(u32, u32)>,
     stage: Stage,
+    /// Local memory (LDL/STL): a private array of words.
+    local: Option<u32>,
 }
 
 impl Translator {
@@ -511,6 +513,44 @@ impl Translator {
         let v = self.m.id();
         inst(&mut self.m.globals, op::VARIABLE, &[ptr, v, PRIVATE, init]);
         v
+    }
+
+    /// Words of local memory a translated shader has.
+    const LOCAL_WORDS: u32 = 1024;
+
+    fn local_var(&mut self) -> u32 {
+        if let Some(v) = self.local {
+            return v;
+        }
+        let (len, arr, ptr, null, v) = (
+            self.m.id(),
+            self.m.id(),
+            self.m.id(),
+            self.m.id(),
+            self.m.id(),
+        );
+        let g = &mut self.m.globals;
+        inst(g, op::CONSTANT, &[self.c.uint, len, Self::LOCAL_WORDS]);
+        inst(g, op::TYPE_ARRAY, &[arr, self.c.uint, len]);
+        inst(g, op::TYPE_POINTER, &[ptr, PRIVATE, arr]);
+        inst(g, op::CONSTANT_NULL, &[arr, null]);
+        inst(g, op::VARIABLE, &[ptr, v, PRIVATE, null]);
+        self.local = Some(v);
+        v
+    }
+
+    /// Pointer to local word `index` (clamped into the array).
+    fn local_word(&mut self, index: u32) -> u32 {
+        let var = self.local_var();
+        let last = self.constant_u(Self::LOCAL_WORDS - 1);
+        let i = self.glsl(self.c.uint, GLSL_UMIN, &[index, last]);
+        let p = self.m.id();
+        inst(
+            &mut self.m.body,
+            op::ACCESS_CHAIN,
+            &[self.c.p_private_uint, p, var, i],
+        );
+        p
     }
 
     fn load(&mut self, ty: u32, var: u32) -> u32 {
@@ -811,6 +851,18 @@ impl Translator {
         let img = self.m.id();
         inst(&mut self.m.body, op::IMAGE, &[self.c.image_t, img, sampled]);
         Ok((sampled, img))
+    }
+
+    /// The local word index of register + uniform + offset (bytes).
+    fn local_index(&mut self, addr: u8, uaddr: u8, offset: i32) -> u32 {
+        let uint = self.c.uint;
+        let a = self.load_reg(addr);
+        let u = self.load_reg(uaddr);
+        let o = self.constant_u(offset as u32);
+        let at = self.op2(op::I_ADD, uint, a, u);
+        let at = self.op2(op::I_ADD, uint, at, o);
+        let two = self.constant_u(2);
+        self.op2(op::SHIFT_RIGHT_LOGICAL, uint, at, two)
     }
 
     /// Truth table of three booleans (bit i for (a, b, c) = (i >> 2, i >> 1, i) & 1).
@@ -1491,6 +1543,48 @@ impl Translator {
                     self.store_reg(target, v);
                 }
             }
+            Op::Lds {
+                space: Space::Local,
+                dst,
+                addr,
+                uaddr,
+                offset,
+                size,
+            } if size >= 4 => {
+                let words = super::interp::access_bytes(size) as u32 / 4;
+                let base = self.local_index(addr, uaddr, offset);
+                for k in 0..words {
+                    let kk = self.constant_u(k);
+                    let i = self.op2(op::I_ADD, uint, base, kk);
+                    let p = self.local_word(i);
+                    let v = self.load(uint, p);
+                    if dst != RZ {
+                        self.store_reg(dst + k as u8, v);
+                    }
+                }
+            }
+            Op::Sts {
+                space: Space::Local,
+                src,
+                addr,
+                uaddr,
+                offset,
+                size,
+            } if size >= 4 => {
+                let words = super::interp::access_bytes(size) as u32 / 4;
+                let base = self.local_index(addr, uaddr, offset);
+                for k in 0..words {
+                    let kk = self.constant_u(k);
+                    let i = self.op2(op::I_ADD, uint, base, kk);
+                    let p = self.local_word(i);
+                    let r = if src == RZ { RZ } else { src + k as u8 };
+                    let v = self.load_reg(r);
+                    self.store(p, v);
+                }
+            }
+            Op::Lds { .. } | Op::Sts { .. } | Op::Atom { .. } | Op::Bar => {
+                return Err("shared memory, atomics and barriers are not translated yet".into());
+            }
             Op::Ldg { .. } | Op::Stg { .. } => {
                 return Err("global memory access is not translated yet".into());
             }
@@ -1988,6 +2082,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         cbufs: BTreeMap::new(),
         preds: BTreeMap::new(),
         textures: Vec::new(),
+        local: None,
         stage,
     };
     let main = t.m.id();

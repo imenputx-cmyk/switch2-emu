@@ -1,10 +1,12 @@
 //! Engines (GPU classes).
 
+pub mod compute;
 pub mod copy;
 pub mod inline;
 pub mod maxwell3d;
 pub mod mme;
 pub mod mme64;
+pub mod qmd;
 
 use crate::backend::{Backend, GuestMemory};
 

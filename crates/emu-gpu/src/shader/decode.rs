@@ -528,6 +528,40 @@ pub enum Op {
         comp: u8,
         comps: u8,
     },
+    /// Shared or local memory load (LDS/LDL), `size` as for LDG, at
+    /// register `addr` + `uaddr` + `offset`.
+    Lds {
+        space: Space,
+        dst: u8,
+        addr: u8,
+        uaddr: u8,
+        offset: i32,
+        size: u8,
+    },
+    /// Shared or local memory store (STS/STL).
+    Sts {
+        space: Space,
+        src: u8,
+        addr: u8,
+        uaddr: u8,
+        offset: i32,
+        size: u8,
+    },
+    /// Atomic on a 32-bit word (ATOMS/ATOMG/RED): `dst` gets the old
+    /// value; global addresses as for LDG (`wide` register pair).
+    Atom {
+        space: Space,
+        dst: u8,
+        addr: u8,
+        wide: bool,
+        uaddr: u8,
+        offset: i32,
+        src: u8,
+        op: AtomOp,
+        signed: bool,
+    },
+    /// Workgroup barrier (BAR.SYNC).
+    Bar,
     Bra {
         target: usize,
     },
@@ -541,6 +575,74 @@ pub enum Op {
     Kil,
     Exit,
     Nop,
+}
+
+/// Memory spaces of LDS/STS-style accesses and atomics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Space {
+    Shared,
+    Local,
+    Global,
+}
+
+/// Atomic operations, numbered as Maxwell's ATOM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomOp {
+    Add,
+    Min,
+    Max,
+    Inc,
+    Dec,
+    And,
+    Or,
+    Xor,
+    Exch,
+}
+
+impl AtomOp {
+    pub fn from_bits(v: u32) -> Option<AtomOp> {
+        Some(match v {
+            0 => AtomOp::Add,
+            1 => AtomOp::Min,
+            2 => AtomOp::Max,
+            3 => AtomOp::Inc,
+            4 => AtomOp::Dec,
+            5 => AtomOp::And,
+            6 => AtomOp::Or,
+            7 => AtomOp::Xor,
+            8 => AtomOp::Exch,
+            _ => return None,
+        })
+    }
+
+    /// The new value of a word holding `old` after the operation.
+    pub fn apply(self, old: u32, v: u32, signed: bool) -> u32 {
+        match self {
+            AtomOp::Add => old.wrapping_add(v),
+            AtomOp::Min if signed => (old as i32).min(v as i32) as u32,
+            AtomOp::Min => old.min(v),
+            AtomOp::Max if signed => (old as i32).max(v as i32) as u32,
+            AtomOp::Max => old.max(v),
+            AtomOp::Inc => {
+                if old >= v {
+                    0
+                } else {
+                    old + 1
+                }
+            }
+            AtomOp::Dec => {
+                if old == 0 || old > v {
+                    v
+                } else {
+                    old - 1
+                }
+            }
+            AtomOp::And => old & v,
+            AtomOp::Or => old | v,
+            AtomOp::Xor => old ^ v,
+            AtomOp::Exch => v,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
