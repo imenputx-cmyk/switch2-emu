@@ -107,6 +107,8 @@ pub struct System {
     pub vblank_events: Vec<usize>,
     /// Switch 2 GPU memory (nx2:gpu and its sub-sessions share it).
     pub nx2_gpu: nx2::GpuMemory,
+    /// Switch 2 native memory and images (gsv), shown by vi2 presents.
+    pub nx2_native: nx2::NativeObjects,
 }
 
 impl System {

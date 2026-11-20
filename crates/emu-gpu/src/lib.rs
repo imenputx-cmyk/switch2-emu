@@ -200,6 +200,17 @@ impl Gpu {
         self.shared_maps.push((va, Some(cpu), size));
     }
 
+    /// The CPU address of GPU address `va` under the shared mappings (the
+    /// latest mapping covering it wins).
+    pub fn shared_translate(&self, va: u64) -> Option<u64> {
+        let &(base, cpu, _) = self
+            .shared_maps
+            .iter()
+            .rev()
+            .find(|&&(base, _, size)| va >= base && va - base < size)?;
+        cpu.map(|cpu| cpu + (va - base))
+    }
+
     /// Unmaps `[va, va + size)` in every address space.
     pub fn unmap_shared(&mut self, va: u64, size: u64) {
         for a in &mut self.address_spaces {

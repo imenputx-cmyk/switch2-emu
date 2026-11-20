@@ -86,19 +86,38 @@ impl Service for Nx2Stub {
 #[derive(Default)]
 pub struct Gsv {
     syncpt_events: [Option<usize>; 2],
-    /// Native memory by id: (size, bound address).
-    memories: HashMap<u32, (u64, u64)>,
     next_memory: u32,
-    /// Native images (pools) by first handle.
-    images: std::collections::BTreeMap<u32, NativeImage>,
     next_image: u32,
     client_registered: bool,
+}
+
+/// Native memory and images, shared by gsv and the display (vi2).
+#[derive(Default)]
+pub struct NativeObjects {
+    /// Native memory by id: (size, bound address).
+    pub memories: HashMap<u32, (u64, u64)>,
+    /// Native images (pools) by first handle.
+    pub images: std::collections::BTreeMap<u32, NativeImage>,
+}
+
+impl NativeObjects {
+    /// Image `handle`: its pool's preference words and its address (as
+    /// bound: a GPU address, equal to the CPU one for registered memory).
+    pub fn image(&self, handle: u32) -> Option<([u32; 16], u64)> {
+        let (&first, img) = self
+            .images
+            .range(..=handle)
+            .next_back()
+            .filter(|(&first, img)| handle - first < img.count)?;
+        let base = self.memories.get(&img.memory)?.1;
+        Some((img.preference, base + u64::from(handle - first) * img.size))
+    }
 }
 
 /// A native image pool (gsv 429): `count` images of `size` bytes each in
 /// `memory`, described by 16 preference words.
 #[derive(Clone, Copy)]
-struct NativeImage {
+pub struct NativeImage {
     preference: [u32; 16],
     count: u32,
     memory: u32,
@@ -198,16 +217,24 @@ impl Service for Gsv {
             111 => {
                 self.next_memory += 1;
                 let id = self.next_memory;
-                self.memories.insert(id, (ctx.in_u64(4), 0));
+                ctx.system
+                    .nx2_native
+                    .memories
+                    .insert(id, (ctx.in_u64(4), 0));
                 words(ctx, &[id]);
             }
             112 => {
-                self.memories.remove(&ctx.in_u32(0));
+                ctx.system.nx2_native.memories.remove(&ctx.in_u32(0));
             }
             // BindNativeMemory / BindNativeGpuMemory(id, address, size, ..).
             114 | 423 => {
                 let (id, addr, size) = (ctx.in_u32(0), ctx.in_u64(4), ctx.in_u64(12));
-                let m = self.memories.entry(id).or_insert((size, 0));
+                let m = ctx
+                    .system
+                    .nx2_native
+                    .memories
+                    .entry(id)
+                    .or_insert((size, 0));
                 m.1 = addr;
                 if m.0 == 0 {
                     m.0 = size;
@@ -231,7 +258,7 @@ impl Service for Gsv {
                 let id = self.next_image;
                 self.next_image += count;
                 let size = native_image_layout(&p).4;
-                self.images.insert(
+                ctx.system.nx2_native.images.insert(
                     id,
                     NativeImage {
                         preference: p,
@@ -243,7 +270,7 @@ impl Service for Gsv {
                 words(ctx, &[id]);
             }
             430 | 312 | 612 | 912 => {
-                self.images.remove(&ctx.in_u32(0));
+                ctx.system.nx2_native.images.remove(&ctx.in_u32(0));
             }
             // Destroy/CreateNativeWindowAliasImagePool, UnmapNativeImage.
             314 | 315 | 427 => {}
@@ -253,7 +280,9 @@ impl Service for Gsv {
             // in GOBs, depth/levels 1, size).
             426 | 428 => {
                 let handle = ctx.in_u32(0);
-                let found = self
+                let found = ctx
+                    .system
+                    .nx2_native
                     .images
                     .range(..=handle)
                     .next_back()
@@ -263,7 +292,11 @@ impl Service for Gsv {
                     Some((first, img)) => (
                         img.preference,
                         u64::from(handle - first) * img.size,
-                        self.memories.get(&img.memory).map_or(0, |m| m.1),
+                        ctx.system
+                            .nx2_native
+                            .memories
+                            .get(&img.memory)
+                            .map_or(0, |m| m.1),
                     ),
                     None => ([0; 16], 0, 0),
                 };
@@ -630,6 +663,87 @@ fn unmap_or_back(ctx: &mut Ctx, m: &GpuMemory, va: u64, size: u64) {
     }
 }
 
+/// The frame of a vi2 present (Lichii INx2Vi2Session::Composite): native
+/// image `image` (block linear), cropped to the drawn area (`shown`: width
+/// minus one, height minus one, 16 bits each) and to the handheld panel
+/// (1080p); flag bit 18 flips it vertically.
+fn composite(ctx: &mut Ctx, image: u32, shown: u32, flags: u32) -> Option<super::Frame> {
+    let (p, address) = ctx.system.nx2_native.image(image)?;
+    let (width, height, pitch, _, _) = native_image_layout(&p);
+    // Preference word 4 is log2 of the block height in rows (3 = 1 GOB);
+    // out of range means the fallback of 128 rows.
+    let gobs_log2 = match p[4] {
+        3..=8 if pitch == u64::from(p[5]) * 64 => p[4] - 3,
+        _ => 4,
+    };
+    let address = ctx.system.gpu.shared_translate(address).unwrap_or(address);
+    let pitch = u32::try_from(pitch).ok()?;
+    let mut raw = vec![0u8; crate::display::block_linear_size(pitch, height, gobs_log2)];
+    ctx.mem.read(address, &mut raw).ok()?;
+    let linear = crate::display::deswizzle(&raw, pitch, height, gobs_log2);
+    let (mut w, mut h) = (width, height);
+    let (sw, sh) = ((shown & 0xFFFF) + 1, (shown >> 16) + 1);
+    if shown != 0 && sw <= width && sh <= height {
+        (w, h) = (sw, sh);
+    }
+    (w, h) = (w.min(1920), h.min(1080));
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        let y = if flags & (1 << 18) != 0 { h - 1 - y } else { y };
+        let row = &linear[(y * pitch) as usize..];
+        for x in 0..w as usize {
+            rgba.extend_from_slice(&match p[6] {
+                // RGBA16F, linear: to sRGB.
+                5 => {
+                    let c = |i: usize| {
+                        let h = u16::from_le_bytes([row[x * 8 + 2 * i], row[x * 8 + 2 * i + 1]]);
+                        f16_to_f32(h)
+                    };
+                    [
+                        linear_to_srgb(c(0)),
+                        linear_to_srgb(c(1)),
+                        linear_to_srgb(c(2)),
+                        (c(3).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ]
+                }
+                // RGB10A2.
+                4 => {
+                    let v = u32::from_le_bytes(row[x * 4..x * 4 + 4].try_into().unwrap());
+                    let c = |s: u32| ((v >> s & 0x3FF) >> 2) as u8;
+                    [c(0), c(10), c(20), ((v >> 30) * 85) as u8]
+                }
+                _ => row[x * 4..x * 4 + 4].try_into().unwrap(),
+            });
+        }
+    }
+    Some(super::Frame {
+        width: w,
+        height: h,
+        rgba,
+    })
+}
+
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from(h >> 10 & 0x1F);
+    let mant = f32::from(h & 0x3FF);
+    sign * match exp {
+        0 => mant * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        _ => (1.0 + mant / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+fn linear_to_srgb(v: f32) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    let s = if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0).round() as u8
+}
+
 /// gsv 305: the display (nn::vi2), from Lichii's INx2Vi2Session.
 #[derive(Default)]
 pub struct Vi2 {
@@ -694,6 +808,16 @@ impl Service for Vi2 {
             228 | 229 => {
                 if command == 229 {
                     self.presents += 1;
+                    // Words: token (0-1), slot, image (3), .., shown size
+                    // (5), flags (6).
+                    let (image, shown, flags) = (ctx.in_u32(12), ctx.in_u32(20), ctx.in_u32(24));
+                    match composite(ctx, image, shown, flags) {
+                        Some(frame) => ctx.system.present(frame),
+                        None if self.presents <= 3 => {
+                            eprintln!("[nx2] vi2 present: image {image} not found or unmapped")
+                        }
+                        None => {}
+                    }
                     for e in ctx.system.vblank_events.clone() {
                         ctx.kernel.events[e] = true;
                     }
@@ -711,5 +835,20 @@ impl Service for Vi2 {
             _ => zeroed("vi2", command, ctx),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+
+    #[test]
+    fn half_floats() {
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xC000), -2.0);
+        assert_eq!(f16_to_f32(0), 0.0);
+        assert_eq!(linear_to_srgb(1.0), 255);
+        assert_eq!(linear_to_srgb(0.0), 0);
+        assert_eq!(linear_to_srgb(0.2159), 128);
     }
 }
