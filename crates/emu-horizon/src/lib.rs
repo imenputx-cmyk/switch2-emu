@@ -150,6 +150,8 @@ pub struct Horizon {
     pub recent_svcs: std::collections::VecDeque<(u16, u64)>,
     /// The last QueryMemory calls: (address, base, size, state).
     pub recent_queries: std::collections::VecDeque<(u64, u64, u64, u32)>,
+    /// The last service requests: (service, command, result).
+    pub recent_ipc: std::collections::VecDeque<(String, u32, u32)>,
     pub mem: Memory,
     pub cpu: Cpu,
     pub map: MemoryMap,
@@ -200,6 +202,7 @@ impl Horizon {
             modules: Vec::new(),
             recent_svcs: Default::default(),
             recent_queries: Default::default(),
+            recent_ipc: Default::default(),
             mem: Memory::new(),
             cpu: Cpu::new(),
             map: MemoryMap::new(),
@@ -557,6 +560,9 @@ impl Horizon {
                 }
             }
             s += "\n";
+        }
+        for (service, command, result) in &self.recent_ipc {
+            s += &format!("ipc {service} command {command} -> result {result:#x}\n");
         }
         for (addr, base, size, state) in &self.recent_queries {
             s += &format!("query {addr:#x} -> base {base:#x} size {size:#x} state {state:#x}\n");
@@ -1173,6 +1179,7 @@ impl Horizon {
             system: &mut self.system,
         };
         let outcome = object.borrow_mut().call(req.command, &mut ctx);
+        let service_name = object.borrow().name().to_string();
         let services::Ctx {
             out,
             out_objects,
@@ -1181,6 +1188,16 @@ impl Horizon {
             ..
         } = ctx;
         let mut reply = ipc::Reply::default();
+        if self.recent_ipc.len() == 12 {
+            self.recent_ipc.pop_front();
+        }
+        let result_code = match &outcome {
+            Ok(()) => 0,
+            Err(services::CallError::Result(r)) => *r,
+            Err(_) => u32::MAX,
+        };
+        self.recent_ipc
+            .push_back((service_name, req.command, result_code));
         match outcome {
             Ok(()) => {
                 reply.data = out;

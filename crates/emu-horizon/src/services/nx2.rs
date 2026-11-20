@@ -56,6 +56,32 @@ fn event(ctx: &mut Ctx, slot: &mut Option<usize>) {
     ctx.push_event(slot, false);
 }
 
+/// A Switch 2 session whose commands are not known yet: the TIPC
+/// handshake, then zeroed replies.
+pub struct Nx2Stub {
+    name: &'static str,
+}
+
+impl Nx2Stub {
+    pub fn new(name: &'static str) -> Self {
+        Nx2Stub { name }
+    }
+}
+
+impl Service for Nx2Stub {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            0 => handshake(ctx),
+            _ => zeroed(self.name, command, ctx),
+        }
+        Ok(())
+    }
+}
+
 /// `ISelfController` 2000: the graphics system server.
 #[derive(Default)]
 pub struct Gsv {
@@ -107,6 +133,14 @@ impl Service for Gsv {
             }
             305 => ctx.push_session(obj(Vi2::default())),
             497 => ctx.push_session(obj(Gpu::default())),
+            // Sessions Lichii hands out (the SDK aborts with InvalidHandle,
+            // 0xE401, when the reply carries none): GPU time (1121),
+            // video decoders (902, 905, 906, 1002), camera (602) and
+            // chat (1202). Their commands get zeroed replies for now.
+            1121 => ctx.push_session(obj(Nx2Stub::new("nx2:gpu_time"))),
+            902 | 905 | 906 | 1002 => ctx.push_session(obj(Nx2Stub::new("nx2:video"))),
+            602 => ctx.push_session(obj(Nx2Stub::new("nx2:camera"))),
+            1202 => ctx.push_session(obj(Nx2Stub::new("nx2:chat"))),
             // OpenNvsrvSession: NVIDIA's driver server, which speaks the
             // nvdrv protocol (Lichii).
             1402 => ctx.push_session(obj(super::nv::NvDrv::nvsrv())),
