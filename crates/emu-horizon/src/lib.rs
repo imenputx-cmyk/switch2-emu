@@ -1179,7 +1179,17 @@ impl Horizon {
             system: &mut self.system,
         };
         let outcome = object.borrow_mut().call(req.command, &mut ctx);
-        let service_name = object.borrow().name().to_string();
+        let mut service_name = object.borrow().name().to_string();
+        if service_name == "sm:" && req.command == 1 {
+            // GetServiceHandle: note which service.
+            let word = req
+                .data
+                .get(..8)
+                .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+            if let Some(name) = services::sm::decode_name(word) {
+                service_name = format!("sm: GetServiceHandle(\"{name}\")");
+            }
+        }
         let services::Ctx {
             out,
             out_objects,

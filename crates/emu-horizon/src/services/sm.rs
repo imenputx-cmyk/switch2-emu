@@ -31,8 +31,12 @@ impl Service for ServiceManager {
             1 => {
                 let name = decode_name(ctx.in_u64(0))
                     .ok_or(CallError::Result(RESULT_INVALID_SERVICE_NAME))?;
-                let service =
-                    create(&name, ctx.config).ok_or(CallError::Result(RESULT_NOT_REGISTERED))?;
+                let Some(service) = create(&name, ctx.config) else {
+                    // Homebrew probes alternatives (vi:m, vi:s, vi:u), so
+                    // this is not fatal; say which one is missing.
+                    eprintln!("[sm] service \"{name}\" is not available");
+                    return Err(CallError::Result(RESULT_NOT_REGISTERED));
+                };
                 ctx.push_object(service);
                 Ok(())
             }
