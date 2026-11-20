@@ -7,7 +7,7 @@ fn main() -> ExitCode {
     let trace = args.iter().any(|a| a == "--trace-svc");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
         eprintln!(
-            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] <program.elf | homebrew.nro | game.nso | exefs-dir>\n\
+            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] [--keys=prod.keys] <program.elf | homebrew.nro | game.nso | exefs-dir | game.nsp | game.xci>\n\
              (built with --features window, frames are shown in a window unless --frames is given)"
         );
         return ExitCode::from(2);
@@ -16,7 +16,11 @@ fn main() -> ExitCode {
     let p = std::path::Path::new(&path);
     let is_elf = !p.is_dir() && std::fs::read(p).is_ok_and(|d| d.starts_with(b"\x7fELF"));
     if !is_elf {
-        let program = match emu_run::Program::open(p) {
+        let keys = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--keys="))
+            .map(std::path::Path::new);
+        let program = match emu_run::Program::open(p, keys) {
             Ok(program) => program,
             Err(e) => {
                 eprintln!("[emu-run] {e}");

@@ -164,18 +164,48 @@ pub enum Program {
 }
 
 impl Program {
-    /// Reads an NRO or NSO file, or an ExeFS directory (rtld, main,
-    /// subsdk0-9, sdk).
-    pub fn open(path: &std::path::Path) -> Result<Program, String> {
+    /// The ExeFS module names, in load order.
+    fn module_names() -> Vec<String> {
+        let mut names = vec!["rtld".to_string(), "main".to_string()];
+        names.extend((0..10).map(|i| format!("subsdk{i}")));
+        names.push("sdk".into());
+        names
+    }
+
+    /// Reads an NRO or NSO file, an ExeFS directory (rtld, main,
+    /// subsdk0-9, sdk), or a game package (NSP, XCI, or a program NCA),
+    /// which needs the user's console keys (`keys`, by default
+    /// `~/.switch/prod.keys`).
+    pub fn open(path: &std::path::Path, keys: Option<&std::path::Path>) -> Result<Program, String> {
         let parse = |data: &[u8], name: &str| {
             emu_loader::nso::parse_nso(data).map_err(|e| format!("{name}: {e}"))
         };
-        if path.is_dir() {
-            let mut names = vec!["rtld".to_string(), "main".to_string()];
-            names.extend((0..10).map(|i| format!("subsdk{i}")));
-            names.push("sdk".into());
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(ext.as_str(), "nsp" | "xci" | "nca") {
+            let keys_path = match keys {
+                Some(k) => k.to_path_buf(),
+                None => std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(|h| std::path::Path::new(&h).join(".switch/prod.keys"))
+                    .ok_or("no --keys and no home directory")?,
+            };
+            let keys = emu_loader::nca::Keys::load(&keys_path).map_err(|e| format!("keys: {e}"))?;
+            let exefs = emu_loader::nca::find_exefs(path, &keys).map_err(|e| e.to_string())?;
             let mut modules = Vec::new();
-            for name in names {
+            for name in Program::module_names() {
+                if let Some(s) = exefs.open(&name) {
+                    let data = s.read_vec(0, s.len() as usize).map_err(|e| e.to_string())?;
+                    modules.push(parse(&data, &name)?);
+                }
+            }
+            return Ok(Program::Application(modules));
+        }
+        if path.is_dir() {
+            let mut modules = Vec::new();
+            for name in Program::module_names() {
                 let p = path.join(&name);
                 if let Ok(data) = std::fs::read(&p) {
                     modules.push(parse(&data, &name)?);

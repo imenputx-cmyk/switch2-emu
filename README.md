@@ -58,6 +58,7 @@ cargo run --release -p emu-run --features window -- tests/programs/hb_breakout.n
 cargo run --release -p emu-run --features window -- tests/programs/hb_gpu.nro  # frames drawn by GPU commands
 cargo run --release -p emu-run --features window -- --gpu=vulkan tests/programs/hb_gpu.nro  # ... on the host GPU
 cargo run --release -p emu-run --features window -- tests/programs/hb_triangle.nro  # triangles with Maxwell shaders
+cargo run --release -p emu-run -- --keys=prod.keys game.nsp  # an application (NSP/XCI/NCA, NSO or ExeFS dir); keys from your own console
 ```
 
 ### How correctness is checked
