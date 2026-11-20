@@ -822,8 +822,10 @@ impl Horizon {
         if dst < sb || dst + size > sb + ss {
             return self.ret(INVALID_MEMORY_RANGE);
         }
+        // Heap and module data (.bss) can be aliased: the SDK maps
+        // static thread stacks from .bss into the stack region.
         if !self.map.all(src, size, |b| {
-            b.state == MemState::Heap && b.perm == 3 && b.attr == 0
+            matches!(b.state, MemState::Heap | MemState::CodeMutable) && b.perm == 3 && b.attr == 0
         }) {
             return self.ret(INVALID_MEMORY_STATE);
         }

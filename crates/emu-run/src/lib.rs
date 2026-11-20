@@ -344,6 +344,17 @@ pub fn run_program_presenting(
     ) {
         eprintln!("[emu-run] stopped: {stop:?}");
         eprintln!("[emu-run] at: {}", hos.status());
+        if let emu_horizon::Stop::Break { arg, info, .. } = stop {
+            // The break's info buffer (often a result code).
+            let mut buf = vec![0u8; info.min(0x40) as usize];
+            if hos.mem.read(arg, &mut buf).is_ok() {
+                let words: Vec<String> = buf
+                    .chunks(4)
+                    .map(|w| format!("{:#x}", u32::from_le_bytes(w.try_into().unwrap_or([0; 4]))))
+                    .collect();
+                eprintln!("[emu-run] break info: {}", words.join(" "));
+            }
+        }
         eprintln!("{}", hos.dump());
     }
     Ok(HomebrewResult {

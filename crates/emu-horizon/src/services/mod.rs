@@ -253,6 +253,39 @@ pub trait Service {
     fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError>;
 }
 
+/// `lm`: the log manager. Log messages are dropped.
+pub struct LogManager;
+
+impl Service for LogManager {
+    fn name(&self) -> &str {
+        "lm"
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            0 => ctx.push_object(obj(Logger)), // OpenLogger
+            _ => return Err(CallError::Unimplemented),
+        }
+        Ok(())
+    }
+}
+
+/// `lm::ILogger`.
+pub struct Logger;
+
+impl Service for Logger {
+    fn name(&self) -> &str {
+        "lm::ILogger"
+    }
+
+    fn call(&mut self, command: u32, _ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            0 | 1 => Ok(()), // Log, SetDestination
+            _ => Err(CallError::Unimplemented),
+        }
+    }
+}
+
 /// A service or interface that answers every command with an empty
 /// success (`Config::auto_stub`).
 pub struct AutoStub(pub String);
@@ -282,6 +315,7 @@ fn create_known(name: &str, config: &Config) -> Option<ServiceRef> {
     Some(match name {
         "sm:" => Rc::new(RefCell::new(sm::ServiceManager)),
         "set:sys" => Rc::new(RefCell::new(set::SystemSettings)),
+        "lm" => Rc::new(RefCell::new(LogManager)),
         "apm" | "apm:p" => Rc::new(RefCell::new(apm::Manager)),
         "appletOE" => Rc::new(RefCell::new(am::AppletOE)),
         "vi:u" => Rc::new(RefCell::new(vi::RootService)),

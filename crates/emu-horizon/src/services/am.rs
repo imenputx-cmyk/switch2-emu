@@ -43,7 +43,7 @@ impl Service for ApplicationProxy {
             3 => obj(Empty("am::IAudioController")),
             4 => obj(Empty("am::IDisplayController")),
             11 => obj(Empty("am::ILibraryAppletCreator")),
-            20 => obj(ApplicationFunctions),
+            20 => obj(ApplicationFunctions::default()),
             // Switch 2 getters (Lichii): 40 is unknown (every command
             // succeeds), 60 the graphics scale controller.
             40 => obj(super::AutoStub("nx2:IApplicationProxy40".into())),
@@ -142,7 +142,10 @@ impl Service for WindowController {
     }
 }
 
-pub struct ApplicationFunctions;
+#[derive(Default)]
+pub struct ApplicationFunctions {
+    gpu_error_event: Option<usize>,
+}
 
 impl Service for ApplicationFunctions {
     fn name(&self) -> &str {
@@ -160,6 +163,8 @@ impl Service for ApplicationFunctions {
             40 => ctx.push_u8(0),  // NotifyRunning: no exit requested
             // GetPseudoDeviceId: a fixed 16-byte id.
             50 => ctx.push_bytes(b"switch2-emu-dev\0"),
+            // GetGpuErrorDetectedSystemEvent: never signalled.
+            130 => ctx.push_event(&mut self.gpu_error_event, false),
             // Switch 2 (Lichii): empty successes.
             320 | 321 => {}
             _ => return Err(CallError::Unimplemented),
