@@ -10,3 +10,8 @@ emu-cpu = { path = "../emu-cpu" }
 emu-memory = { path = "../emu-memory" }
 emu-loader = { path = "../emu-loader" }
 emu-gpu = { path = "../emu-gpu" }
+emu-jit = { path = "../emu-jit", optional = true }
+
+[features]
+# Run guest code with the dynarmic JIT (needs CMake and a C++20 compiler).
+jit = ["dep:emu-jit"]
