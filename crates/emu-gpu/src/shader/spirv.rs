@@ -111,9 +111,14 @@ mod op {
     pub const BRANCH_CONDITIONAL: u16 = 250;
     pub const SWITCH: u16 = 251;
     pub const KILL: u16 = 252;
+    pub const TYPE_IMAGE: u16 = 25;
+    pub const TYPE_SAMPLED_IMAGE: u16 = 27;
+    pub const COMPOSITE_EXTRACT: u16 = 81;
+    pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
 }
 
 // Storage classes, decorations, built-ins, GLSL.std.450 instructions.
+const UNIFORM_CONSTANT: u32 = 0;
 const INPUT: u32 = 1;
 const OUTPUT: u32 = 3;
 const PRIVATE: u32 = 6;
@@ -205,6 +210,9 @@ struct Common {
     p_private_bool: u32,
     p_private_stack: u32,
     null_stack: u32,
+    vec2: u32,
+    sampled_image: u32,
+    p_sampled_image: u32,
 }
 
 /// Descriptor binding of constant buffer `index` for a stage.
@@ -215,11 +223,26 @@ pub fn cbuf_binding(stage: Stage, index: u32) -> u32 {
     }
 }
 
+/// Most textures a stage may sample.
+pub const MAX_TEXTURES: usize = 16;
+
+/// Descriptor binding of the `i`-th texture a stage samples (a combined
+/// image sampler).
+pub fn texture_binding(stage: Stage, i: u32) -> u32 {
+    match stage {
+        Stage::Pixel => 36 + MAX_TEXTURES as u32 + i,
+        _ => 36 + i,
+    }
+}
+
 /// A translated shader.
 pub struct Translated {
     pub words: Vec<u32>,
     /// Bit `i` set: constant buffer `i` is read.
     pub cbufs: u32,
+    /// Handles (bindless constant buffer word offsets) of the textures
+    /// sampled; the `i`-th is at [`texture_binding`]`(stage, i)`.
+    pub textures: Vec<u32>,
 }
 
 struct Translator {
@@ -231,6 +254,8 @@ struct Translator {
     flat: BTreeSet<u32>,
     cbufs: BTreeMap<u8, u32>,
     preds: BTreeMap<u8, u32>,
+    /// Texture variables by handle, in binding order.
+    textures: Vec<(u32, u32)>,
     stage: Stage,
 }
 
@@ -657,6 +682,62 @@ impl Translator {
         self.branch(merge);
         self.label(merge);
         Ok(())
+    }
+
+    fn texture_var(&mut self, handle: u32) -> Result<u32, String> {
+        if let Some(&(_, v)) = self.textures.iter().find(|t| t.0 == handle) {
+            return Ok(v);
+        }
+        if self.textures.len() == MAX_TEXTURES {
+            return Err("too many textures".into());
+        }
+        let v = self.m.id();
+        inst(
+            &mut self.m.globals,
+            op::VARIABLE,
+            &[self.c.p_sampled_image, v, UNIFORM_CONSTANT],
+        );
+        let binding = texture_binding(self.stage, self.textures.len() as u32);
+        inst(
+            &mut self.m.annotations,
+            op::DECORATE,
+            &[v, DESCRIPTOR_SET, 0],
+        );
+        inst(
+            &mut self.m.annotations,
+            op::DECORATE,
+            &[v, BINDING, binding],
+        );
+        self.textures.push((handle, v));
+        Ok(v)
+    }
+
+    /// Samples level 0 of a texture; returns the RGBA components (floats).
+    fn sample(&mut self, handle: u32, u: u32, v: u32) -> Result<[u32; 4], String> {
+        let var = self.texture_var(handle)?;
+        let img = self.load(self.c.sampled_image, var);
+        let coord = self.m.id();
+        inst(
+            &mut self.m.body,
+            op::COMPOSITE_CONSTRUCT,
+            &[self.c.vec2, coord, u, v],
+        );
+        let texel = self.m.id();
+        // Image operand Lod (0x2) = 0.
+        inst(
+            &mut self.m.body,
+            op::IMAGE_SAMPLE_EXPLICIT_LOD,
+            &[self.c.vec4, texel, img, coord, 0x2, self.c.zero_f],
+        );
+        Ok([0, 1, 2, 3].map(|k| {
+            let id = self.m.id();
+            inst(
+                &mut self.m.body,
+                op::COMPOSITE_EXTRACT,
+                &[self.c.float, id, texel, k],
+            );
+            id
+        }))
     }
 
     /// Translates a non-control-flow instruction.
@@ -1111,6 +1192,38 @@ impl Translator {
                 let f = self.load(float, p);
                 self.store_float(dst, f, sat);
             }
+            Op::Texs {
+                dst0,
+                dst1,
+                a,
+                b,
+                handle,
+                comps,
+                ..
+            } => {
+                let u = self.reg_float(a, no);
+                let v = self.reg_float(b, no);
+                let t = self.sample(handle, u, v)?;
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    self.store_float(super::interp::texs_dst(dst0, dst1, k), t[c], false);
+                }
+            }
+            Op::Tex {
+                dst,
+                a,
+                handle,
+                comps,
+                ..
+            } => {
+                let u = self.reg_float(a, no);
+                let v = self.reg_float(a.wrapping_add(1), no);
+                let t = self.sample(handle, u, v)?;
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    if dst != RZ {
+                        self.store_float(dst.wrapping_add(k as u8), t[c], false);
+                    }
+                }
+            }
             Op::Nop => {}
             Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {
                 unreachable!("control flow is translated by the caller")
@@ -1350,6 +1463,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     inst(g, op::TYPE_POINTER, &[p_uniform_uint, UNIFORM, uint]);
     let (bool_t, true_c, false_c, p_private_bool) = (m.id(), m.id(), m.id(), m.id());
     let (len_ssy, stack_t, p_private_stack, null_stack) = (m.id(), m.id(), m.id(), m.id());
+    let (vec2, image_t, sampled_image, p_sampled_image) = (m.id(), m.id(), m.id(), m.id());
     let g = &mut m.globals;
     inst(g, op::TYPE_BOOL, &[bool_t]);
     inst(g, op::CONSTANT_TRUE, &[bool_t, true_c]);
@@ -1359,6 +1473,15 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     inst(g, op::TYPE_ARRAY, &[stack_t, uint, len_ssy]);
     inst(g, op::TYPE_POINTER, &[p_private_stack, PRIVATE, stack_t]);
     inst(g, op::CONSTANT_NULL, &[stack_t, null_stack]);
+    inst(g, op::TYPE_VECTOR, &[vec2, float, 2]);
+    // 2D, not depth, not arrayed, single-sampled, sampled, format unknown.
+    inst(g, op::TYPE_IMAGE, &[image_t, float, 1, 0, 0, 0, 1, 0]);
+    inst(g, op::TYPE_SAMPLED_IMAGE, &[sampled_image, image_t]);
+    inst(
+        g,
+        op::TYPE_POINTER,
+        &[p_sampled_image, UNIFORM_CONSTANT, sampled_image],
+    );
     let a = &mut m.annotations;
     inst(a, op::DECORATE, &[arr, ARRAY_STRIDE, 16]);
     inst(a, op::DECORATE, &[cbuf_struct, BLOCK]);
@@ -1385,6 +1508,9 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         p_private_bool,
         p_private_stack,
         null_stack,
+        vec2,
+        sampled_image,
+        p_sampled_image,
     };
     let mut t = Translator {
         m,
@@ -1395,6 +1521,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         flat: BTreeSet::new(),
         cbufs: BTreeMap::new(),
         preds: BTreeMap::new(),
+        textures: Vec::new(),
         stage,
     };
     let main = t.m.id();
@@ -1469,6 +1596,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     Ok(Translated {
         words,
         cbufs: t.cbufs.keys().fold(0, |m, &i| m | 1 << i),
+        textures: t.textures.iter().map(|t| t.0).collect(),
     })
 }
 

@@ -16,8 +16,10 @@
 use ash::vk;
 use emu_gpu::backend::{Backend, GuestMemory, Rect, SoftwareBackend, Surface};
 use emu_gpu::draw::{topology, Draw};
+use emu_gpu::pipeline::{Blend, BlendFactor, BlendOp, Compare, DepthFormat, DepthSurface};
 use emu_gpu::shader::spirv;
 use emu_gpu::surface::ColorFormat;
+use emu_gpu::texture::{self, Texture, Tsc};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -35,6 +37,71 @@ fn vk_format(f: ColorFormat) -> vk::Format {
     }
 }
 
+fn depth_format(f: DepthFormat) -> Option<vk::Format> {
+    match f {
+        DepthFormat::Z32Float => Some(vk::Format::D32_SFLOAT),
+        DepthFormat::Z16Unorm => Some(vk::Format::D16_UNORM),
+        // The packed stencil/depth layout differs from Vulkan's copies.
+        DepthFormat::S8Z24Unorm => None,
+    }
+}
+
+fn compare_op(c: Compare) -> vk::CompareOp {
+    match c {
+        Compare::Never => vk::CompareOp::NEVER,
+        Compare::Less => vk::CompareOp::LESS,
+        Compare::Equal => vk::CompareOp::EQUAL,
+        Compare::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
+        Compare::Greater => vk::CompareOp::GREATER,
+        Compare::NotEqual => vk::CompareOp::NOT_EQUAL,
+        Compare::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
+        Compare::Always => vk::CompareOp::ALWAYS,
+    }
+}
+
+fn blend_op(o: BlendOp) -> vk::BlendOp {
+    match o {
+        BlendOp::Add => vk::BlendOp::ADD,
+        BlendOp::Subtract => vk::BlendOp::SUBTRACT,
+        BlendOp::ReverseSubtract => vk::BlendOp::REVERSE_SUBTRACT,
+        BlendOp::Min => vk::BlendOp::MIN,
+        BlendOp::Max => vk::BlendOp::MAX,
+    }
+}
+
+fn blend_factor(f: BlendFactor) -> vk::BlendFactor {
+    use BlendFactor::*;
+    match f {
+        Zero => vk::BlendFactor::ZERO,
+        One => vk::BlendFactor::ONE,
+        SrcColor => vk::BlendFactor::SRC_COLOR,
+        OneMinusSrcColor => vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+        SrcAlpha => vk::BlendFactor::SRC_ALPHA,
+        OneMinusSrcAlpha => vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        DstAlpha => vk::BlendFactor::DST_ALPHA,
+        OneMinusDstAlpha => vk::BlendFactor::ONE_MINUS_DST_ALPHA,
+        DstColor => vk::BlendFactor::DST_COLOR,
+        OneMinusDstColor => vk::BlendFactor::ONE_MINUS_DST_COLOR,
+        SrcAlphaSaturate => vk::BlendFactor::SRC_ALPHA_SATURATE,
+        ConstColor => vk::BlendFactor::CONSTANT_COLOR,
+        OneMinusConstColor => vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR,
+        ConstAlpha => vk::BlendFactor::CONSTANT_ALPHA,
+        OneMinusConstAlpha => vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA,
+    }
+}
+
+fn blend_attachment(b: &Blend) -> vk::PipelineColorBlendAttachmentState {
+    vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(b.enabled)
+        .color_blend_op(blend_op(b.op_rgb))
+        .src_color_blend_factor(blend_factor(b.src_rgb))
+        .dst_color_blend_factor(blend_factor(b.dst_rgb))
+        .alpha_blend_op(blend_op(b.op_alpha))
+        .src_alpha_blend_factor(blend_factor(b.src_alpha))
+        .dst_alpha_blend_factor(blend_factor(b.dst_alpha))
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+}
+
 fn err(what: &str) -> impl Fn(vk::Result) -> String + '_ {
     move |e| format!("{what}: {e}")
 }
@@ -44,6 +111,21 @@ struct Buffer {
     memory: vk::DeviceMemory,
     ptr: *mut u8,
     size: usize,
+}
+
+/// A texture uploaded for the current batch.
+struct TexImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+}
+
+/// A texture a draw samples: its descriptor binding and contents.
+struct BoundTexture {
+    binding: u32,
+    texture: Texture,
+    sampler: Tsc,
 }
 
 /// A guest surface on the host GPU.
@@ -69,10 +151,18 @@ pub struct VulkanBackend {
     /// Is `cmd` recording?
     recording: bool,
     images: HashMap<(usize, Surface), Image>,
+    depth_images: HashMap<(usize, DepthSurface), Image>,
+    /// Is depth clamping available (and enabled)?
+    depth_clamp: bool,
     software: SoftwareBackend,
     /// Descriptor set and pipeline layouts by the constant buffers the
     /// vertex and pixel shaders read (bit masks).
-    layouts: HashMap<(u32, u32), (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    /// (and how many textures each samples).
+    layouts: HashMap<(u32, u32, usize, usize), (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    /// Textures of the current batch, freed at flush.
+    textures: Vec<TexImage>,
+    /// Can RGBA32F textures be filtered linearly?
+    linear_f32: bool,
     /// Descriptor sets of the current batch come from here; reset at flush.
     descriptor_pool: vk::DescriptorPool,
     /// Pipelines by a hash of their shaders and fixed state.
@@ -141,11 +231,14 @@ impl VulkanBackend {
             .queue_family_index(qf)
             .queue_priorities(&priorities)];
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        let depth_clamp = instance.get_physical_device_features(pd).depth_clamp != 0;
+        let features = vk::PhysicalDeviceFeatures::default().depth_clamp(depth_clamp);
         let device = instance
             .create_device(
                 pd,
                 &vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queues)
+                    .enabled_features(&features)
                     .push_next(&mut v13),
                 None,
             )
@@ -169,10 +262,20 @@ impl VulkanBackend {
         let fence = device
             .create_fence(&vk::FenceCreateInfo::default(), None)
             .map_err(err("fence"))?;
-        let pool_sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: 8192,
-        }];
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 8192,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 4096,
+            },
+        ];
+        let linear_f32 = instance
+            .get_physical_device_format_properties(pd, vk::Format::R32G32B32A32_SFLOAT)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
         let descriptor_pool = device
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -193,8 +296,12 @@ impl VulkanBackend {
             device_name,
             recording: false,
             images: HashMap::new(),
+            depth_images: HashMap::new(),
+            depth_clamp,
             software: SoftwareBackend,
             layouts: HashMap::new(),
+            textures: Vec::new(),
+            linear_f32,
             descriptor_pool,
             pipelines: HashMap::new(),
             transient: Vec::new(),
@@ -229,6 +336,16 @@ impl VulkanBackend {
     }
 
     unsafe fn barrier(&self, image: vk::Image, from: vk::ImageLayout, to: vk::ImageLayout) {
+        self.barrier_aspect(image, vk::ImageAspectFlags::COLOR, from, to);
+    }
+
+    unsafe fn barrier_aspect(
+        &self,
+        image: vk::Image,
+        aspect: vk::ImageAspectFlags,
+        from: vk::ImageLayout,
+        to: vk::ImageLayout,
+    ) {
         let b = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
@@ -239,7 +356,7 @@ impl VulkanBackend {
             .image(image)
             .subresource_range(
                 vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .aspect_mask(aspect)
                     .level_count(1)
                     .layer_count(1),
             );
@@ -252,12 +369,20 @@ impl VulkanBackend {
 
     /// Orders color writes of earlier rendering before the next one.
     unsafe fn color_barrier(&self) {
+        let tests = vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
         let mb = [vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | tests)
+            .src_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | tests)
             .dst_access_mask(
-                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
             )];
         self.device.cmd_pipeline_barrier2(
             self.cmd,
@@ -412,6 +537,105 @@ impl VulkanBackend {
         Ok(view)
     }
 
+    /// The image for a depth buffer, created and filled from guest
+    /// memory if not cached. Left in DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
+    unsafe fn depth_image(
+        &mut self,
+        g: &GuestMemory,
+        s: &DepthSurface,
+    ) -> Result<vk::ImageView, String> {
+        if let Some(img) = self.depth_images.get(&(g.asid, *s)) {
+            return Ok(img.view);
+        }
+        let format = depth_format(s.format).ok_or("depth format")?;
+        let image = self
+            .device
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D {
+                        width: s.width,
+                        height: s.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(
+                        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                            | vk::ImageUsageFlags::TRANSFER_SRC
+                            | vk::ImageUsageFlags::TRANSFER_DST,
+                    ),
+                None,
+            )
+            .map_err(err("depth image"))?;
+        let req = self.device.get_image_memory_requirements(image);
+        let ty = self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let memory = self
+            .device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(ty),
+                None,
+            )
+            .map_err(err("depth memory"))?;
+        self.device
+            .bind_image_memory(image, memory, 0)
+            .map_err(err("bind depth image"))?;
+        let view = self
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )
+            .map_err(err("depth view"))?;
+        let linear = s.read_linear(g)?;
+        let staging = self.create_buffer(linear.len())?;
+        std::ptr::copy_nonoverlapping(linear.as_ptr(), staging.ptr, linear.len());
+        self.begin()?;
+        self.barrier_aspect(
+            image,
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        self.device.cmd_copy_buffer_to_image(
+            self.cmd,
+            staging.buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[depth_copy_region(s)],
+        );
+        self.barrier_aspect(
+            image,
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        );
+        self.depth_images.insert(
+            (g.asid, *s),
+            Image {
+                image,
+                memory,
+                view,
+                staging,
+            },
+        );
+        Ok(view)
+    }
+
     fn copy_region(&self, s: &Surface) -> vk::BufferImageCopy {
         vk::BufferImageCopy::default()
             .image_subresource(
@@ -454,6 +678,23 @@ impl VulkanBackend {
                 &[self.copy_region(&key.1)],
             );
         }
+        let depth_keys: Vec<(usize, DepthSurface)> = self.depth_images.keys().copied().collect();
+        for key in &depth_keys {
+            let img = &self.depth_images[key];
+            self.barrier_aspect(
+                img.image,
+                vk::ImageAspectFlags::DEPTH,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            self.device.cmd_copy_image_to_buffer(
+                self.cmd,
+                img.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                img.staging.buffer,
+                &[depth_copy_region(&key.1)],
+            );
+        }
         let mb = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
@@ -489,6 +730,9 @@ impl VulkanBackend {
             self.device.destroy_buffer(b.buffer, None);
             self.device.free_memory(b.memory, None);
         }
+        for t in std::mem::take(&mut self.textures) {
+            self.destroy_texture(t);
+        }
         self.device
             .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
             .map_err(err("reset descriptor pool"))?;
@@ -499,6 +743,16 @@ impl VulkanBackend {
             if key.0 == g.asid {
                 if let Err(f) = key.1.write_linear(g, data) {
                     result = Err(format!("writing surface back: {f:?}"));
+                }
+            }
+            self.destroy_image(img);
+        }
+        for key in depth_keys {
+            let img = self.depth_images.remove(&key).unwrap();
+            let data = std::slice::from_raw_parts(img.staging.ptr, img.staging.size);
+            if key.0 == g.asid {
+                if let Err(e) = key.1.write_linear(g, data) {
+                    result = Err(format!("writing depth buffer back: {e}"));
                 }
             }
             self.destroy_image(img);
@@ -517,6 +771,8 @@ struct Plan {
     /// (stream, stride)
     bindings: Vec<(u32, u32)>,
     viewport: vk::Viewport,
+    /// Depth buffer format, if the depth test is on.
+    depth: Option<vk::Format>,
 }
 
 fn vertex_format(widths: u32, kind: u32) -> Option<vk::Format> {
@@ -595,6 +851,10 @@ fn plan(d: &Draw) -> Result<Plan, String> {
         min_depth: near,
         max_depth: far,
     };
+    let depth = match (&d.depth.target, d.depth.test) {
+        (Some(t), true) => Some(depth_format(t.format).ok_or("depth format")?),
+        _ => None,
+    };
     Ok(Plan {
         vs,
         ps,
@@ -602,6 +862,7 @@ fn plan(d: &Draw) -> Result<Plan, String> {
         attributes,
         bindings,
         viewport,
+        depth,
     })
 }
 
@@ -617,8 +878,11 @@ impl VulkanBackend {
         &mut self,
         vs: u32,
         ps: u32,
+        vs_textures: usize,
+        ps_textures: usize,
     ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), String> {
-        if let Some(&l) = self.layouts.get(&(vs, ps)) {
+        let key = (vs, ps, vs_textures, ps_textures);
+        if let Some(&l) = self.layouts.get(&key) {
             return Ok(l);
         }
         let mut bindings = Vec::new();
@@ -643,6 +907,20 @@ impl VulkanBackend {
                         .stage_flags(flags),
                 );
             }
+            let count = if flags == vk::ShaderStageFlags::VERTEX {
+                vs_textures
+            } else {
+                ps_textures
+            };
+            for i in 0..count as u32 {
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(spirv::texture_binding(stage, i))
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(flags),
+                );
+            }
         }
         let dsl = self
             .device
@@ -659,7 +937,7 @@ impl VulkanBackend {
                 None,
             )
             .map_err(err("pipeline layout"))?;
-        self.layouts.insert((vs, ps), (dsl, layout));
+        self.layouts.insert(key, (dsl, layout));
         Ok((dsl, layout))
     }
 
@@ -676,13 +954,22 @@ impl VulkanBackend {
         Ok(buffer)
     }
 
-    unsafe fn pipeline(&mut self, p: &Plan, format: vk::Format) -> Result<vk::Pipeline, String> {
+    unsafe fn pipeline(
+        &mut self,
+        p: &Plan,
+        d: &Draw,
+        format: vk::Format,
+    ) -> Result<vk::Pipeline, String> {
         let mut h = DefaultHasher::new();
         (
             &p.vs.words,
             &p.ps.words,
             p.topology.as_raw(),
             format.as_raw(),
+            p.depth.map(|f| f.as_raw()),
+            d.depth.write,
+            d.depth.func,
+            d.blend,
         )
             .hash(&mut h);
         for a in &p.attributes {
@@ -690,7 +977,12 @@ impl VulkanBackend {
         }
         p.bindings.hash(&mut h);
         let key = h.finish();
-        let (_, layout) = self.layout(p.vs.cbufs, p.ps.cbufs)?;
+        let (_, layout) = self.layout(
+            p.vs.cbufs,
+            p.ps.cbufs,
+            p.vs.textures.len(),
+            p.ps.textures.len(),
+        )?;
         if let Some((pipe, _)) = self.pipelines.get(&key) {
             return Ok(*pipe);
         }
@@ -735,20 +1027,29 @@ impl VulkanBackend {
             .viewport_count(1)
             .scissor_count(1);
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(self.depth_clamp)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::NONE)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let blend_attachments = [blend_attachment(&d.blend)];
         let blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(p.depth.is_some())
+            .depth_write_enable(p.depth.is_some() && d.depth.write)
+            .depth_compare_op(compare_op(d.depth.func));
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let formats = [format];
-        let mut rendering =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+        let mut rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&formats)
+            .depth_attachment_format(p.depth.unwrap_or(vk::Format::UNDEFINED));
         let info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
@@ -757,6 +1058,7 @@ impl VulkanBackend {
             .rasterization_state(&raster)
             .multisample_state(&multisample)
             .color_blend_state(&blend)
+            .depth_stencil_state(&depth_stencil)
             .dynamic_state(&dynamic)
             .layout(layout)
             .push_next(&mut rendering);
@@ -774,9 +1076,19 @@ impl VulkanBackend {
         d: &Draw,
         target: &Surface,
         p: Plan,
+        textures: Vec<BoundTexture>,
     ) -> Result<(), String> {
         let view = self.image(g, target)?;
-        let pipe = self.pipeline(&p, vk_format(target.format))?;
+        let mut tex_writes = Vec::new();
+        for t in &textures {
+            let (view, sampler) = self.upload_texture(t)?;
+            tex_writes.push((t.binding, view, sampler));
+        }
+        let pipe = self.pipeline(&p, d, vk_format(target.format))?;
+        let depth_view = match (&d.depth.target, p.depth) {
+            (Some(ds), Some(_)) => Some((self.depth_image(g, ds)?, *ds)),
+            _ => None,
+        };
         // Indices (as u32) of all runs, and how many vertices are used.
         let mut indices = Vec::new();
         let mut runs = Vec::new(); // (first vertex or index, count)
@@ -819,7 +1131,12 @@ impl VulkanBackend {
             None
         };
         // Constant buffers: uploaded and bound in one descriptor set.
-        let (dsl, layout) = self.layout(p.vs.cbufs, p.ps.cbufs)?;
+        let (dsl, layout) = self.layout(
+            p.vs.cbufs,
+            p.ps.cbufs,
+            p.vs.textures.len(),
+            p.ps.textures.len(),
+        )?;
         let mut writes = Vec::new();
         for (mask, bound, stage) in [
             (p.vs.cbufs, &d.vs_cbufs, emu_gpu::shader::Stage::Vertex),
@@ -839,7 +1156,7 @@ impl VulkanBackend {
                 writes.push((spirv::cbuf_binding(stage, i), buffer, data.len() as u64));
             }
         }
-        let set = if writes.is_empty() {
+        let set = if writes.is_empty() && tex_writes.is_empty() {
             None
         } else {
             let layouts = [dsl];
@@ -861,7 +1178,17 @@ impl VulkanBackend {
                     }]
                 })
                 .collect();
-            let w: Vec<_> = writes
+            let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = tex_writes
+                .iter()
+                .map(|&(_, view, sampler)| {
+                    [vk::DescriptorImageInfo {
+                        sampler,
+                        image_view: view,
+                        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    }]
+                })
+                .collect();
+            let mut w: Vec<_> = writes
                 .iter()
                 .zip(&infos)
                 .map(|(&(binding, ..), info)| {
@@ -872,6 +1199,18 @@ impl VulkanBackend {
                         .buffer_info(info)
                 })
                 .collect();
+            w.extend(
+                tex_writes
+                    .iter()
+                    .zip(&image_infos)
+                    .map(|(&(binding, ..), info)| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(binding)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(info)
+                    }),
+            );
             self.device.update_descriptor_sets(&w, &[]);
             Some(set)
         };
@@ -881,26 +1220,38 @@ impl VulkanBackend {
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::LOAD)
             .store_op(vk::AttachmentStoreOp::STORE)];
+        // With a depth buffer, only pixels inside both are drawn.
+        let (w, h) = match &depth_view {
+            Some((_, ds)) => (target.width.min(ds.width), target.height.min(ds.height)),
+            None => (target.width, target.height),
+        };
         let area = vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent: vk::Extent2D {
-                width: target.width,
-                height: target.height,
+                width: w,
+                height: h,
             },
         };
+        let depth_attachment = depth_view.map(|(view, _)| {
+            vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE)
+        });
         self.color_barrier();
-        self.device.cmd_begin_rendering(
-            self.cmd,
-            &vk::RenderingInfo::default()
-                .render_area(area)
-                .layer_count(1)
-                .color_attachments(&attachments),
-        );
-        let (x0, y0) = (d.clip.x0.min(target.width), d.clip.y0.min(target.height));
-        let (x1, y1) = (
-            d.clip.x1.min(target.width).max(x0),
-            d.clip.y1.min(target.height).max(y0),
-        );
+        let mut info = vk::RenderingInfo::default()
+            .render_area(area)
+            .layer_count(1)
+            .color_attachments(&attachments);
+        if let Some(da) = &depth_attachment {
+            info = info.depth_attachment(da);
+        }
+        self.device.cmd_begin_rendering(self.cmd, &info);
+        self.device
+            .cmd_set_blend_constants(self.cmd, &d.blend_constant);
+        let (x0, y0) = (d.clip.x0.min(w), d.clip.y0.min(h));
+        let (x1, y1) = (d.clip.x1.min(w).max(x0), d.clip.y1.min(h).max(y0));
         let scissor = vk::Rect2D {
             offset: vk::Offset2D {
                 x: x0 as i32,
@@ -946,6 +1297,227 @@ impl VulkanBackend {
         }
         self.device.cmd_end_rendering(self.cmd);
         Ok(())
+    }
+}
+
+fn depth_copy_region(s: &DepthSurface) -> vk::BufferImageCopy {
+    vk::BufferImageCopy::default()
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                .layer_count(1),
+        )
+        .image_extent(vk::Extent3D {
+            width: s.width,
+            height: s.height,
+            depth: 1,
+        })
+}
+
+/// Vulkan's fixed border colors; others are not supported.
+fn border_color(c: [f32; 4]) -> Option<vk::BorderColor> {
+    Some(match c {
+        [0.0, 0.0, 0.0, 0.0] => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+        [0.0, 0.0, 0.0, 1.0] => vk::BorderColor::FLOAT_OPAQUE_BLACK,
+        [1.0, 1.0, 1.0, 1.0] => vk::BorderColor::FLOAT_OPAQUE_WHITE,
+        _ => return None,
+    })
+}
+
+fn address_mode(mode: u8) -> Option<vk::SamplerAddressMode> {
+    Some(match mode {
+        texture::wrap::REPEAT => vk::SamplerAddressMode::REPEAT,
+        texture::wrap::MIRRORED_REPEAT => vk::SamplerAddressMode::MIRRORED_REPEAT,
+        texture::wrap::CLAMP_TO_EDGE | texture::wrap::CLAMP => {
+            vk::SamplerAddressMode::CLAMP_TO_EDGE
+        }
+        texture::wrap::CLAMP_TO_BORDER => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+        _ => return None,
+    })
+}
+
+impl VulkanBackend {
+    /// Resolves and decodes the textures a draw samples. Textures that
+    /// overlap images rendered in this batch are read after a flush.
+    fn bind_textures(
+        &mut self,
+        g: &mut GuestMemory,
+        d: &Draw,
+        p: &Plan,
+    ) -> Result<Vec<BoundTexture>, String> {
+        let mut resolved = Vec::new();
+        for (handles, cbufs, stage) in [
+            (&p.vs.textures, &d.vs_cbufs, emu_gpu::shader::Stage::Vertex),
+            (&p.ps.textures, &d.ps_cbufs, emu_gpu::shader::Stage::Pixel),
+        ] {
+            for (i, &handle) in handles.iter().enumerate() {
+                let word = emu_gpu::draw::texture_handle_word(g, &d.textures, cbufs, handle)?;
+                let (tic, tsc) = texture::resolve(g, &d.textures, word)?;
+                if tsc.wrap.iter().take(2).any(|&m| address_mode(m).is_none()) {
+                    return Err("sampler address mode".into());
+                }
+                if tsc.wrap.contains(&texture::wrap::CLAMP_TO_BORDER)
+                    && border_color(tsc.border).is_none()
+                {
+                    return Err("sampler border color".into());
+                }
+                if tsc.linear && !self.linear_f32 {
+                    return Err("linear filtering of float textures".into());
+                }
+                resolved.push((spirv::texture_binding(stage, i as u32), tic, tsc));
+            }
+        }
+        // Render-to-texture: write rendered images back first.
+        let overlaps = resolved.iter().any(|(_, tic, _)| {
+            let size = u64::from(tic.width * tic.bytes_per_texel()) * u64::from(tic.height) * 2;
+            self.images.keys().any(|(asid, s)| {
+                *asid == g.asid
+                    && s.addr < tic.addr + size
+                    && tic.addr < s.addr + s.size_bytes() as u64
+            })
+        });
+        if overlaps {
+            self.flush(g)?;
+        }
+        resolved
+            .into_iter()
+            .map(|(binding, tic, tsc)| {
+                Ok(BoundTexture {
+                    binding,
+                    texture: Texture::decode(g, &tic)?,
+                    sampler: tsc,
+                })
+            })
+            .collect()
+    }
+
+    /// Uploads a texture (as RGBA32F) and creates its sampler, both
+    /// freed at the next flush.
+    unsafe fn upload_texture(
+        &mut self,
+        t: &BoundTexture,
+    ) -> Result<(vk::ImageView, vk::Sampler), String> {
+        let format = vk::Format::R32G32B32A32_SFLOAT;
+        let (w, h) = (t.texture.width, t.texture.height);
+        let image = self
+            .device
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D {
+                        width: w,
+                        height: h,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
+                None,
+            )
+            .map_err(err("texture image"))?;
+        let req = self.device.get_image_memory_requirements(image);
+        let ty = self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let memory = self
+            .device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(ty),
+                None,
+            )
+            .map_err(err("texture memory"))?;
+        self.device
+            .bind_image_memory(image, memory, 0)
+            .map_err(err("bind texture"))?;
+        let view = self
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )
+            .map_err(err("texture view"))?;
+        let s = &t.sampler;
+        let filter = if s.linear {
+            vk::Filter::LINEAR
+        } else {
+            vk::Filter::NEAREST
+        };
+        let sampler = self
+            .device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(filter)
+                    .min_filter(filter)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .address_mode_u(address_mode(s.wrap[0]).unwrap())
+                    .address_mode_v(address_mode(s.wrap[1]).unwrap())
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .border_color(border_color(s.border).unwrap_or_default())
+                    .max_lod(0.0),
+                None,
+            )
+            .map_err(err("sampler"))?;
+        self.textures.push(TexImage {
+            image,
+            memory,
+            view,
+            sampler,
+        });
+        let bytes: Vec<u8> = t
+            .texture
+            .texels
+            .iter()
+            .flat_map(|c| c.iter().flat_map(|f| f.to_le_bytes()))
+            .collect();
+        let staging = self.transient_buffer(&bytes, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        self.begin()?;
+        self.barrier(
+            image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        self.device.cmd_copy_buffer_to_image(
+            self.cmd,
+            staging,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                })],
+        );
+        self.barrier(
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        Ok((view, sampler))
+    }
+
+    unsafe fn destroy_texture(&self, t: TexImage) {
+        self.device.destroy_sampler(t.sampler, None);
+        self.device.destroy_image_view(t.view, None);
+        self.device.destroy_image(t.image, None);
+        self.device.free_memory(t.memory, None);
     }
 }
 
@@ -1028,6 +1600,20 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
+    fn clear_depth(
+        &mut self,
+        g: &mut GuestMemory,
+        t: &DepthSurface,
+        r: Rect,
+        z: f32,
+    ) -> Result<(), String> {
+        // Cleared in guest memory; a cached copy is written back first.
+        if self.depth_images.contains_key(&(g.asid, *t)) {
+            self.flush(g)?;
+        }
+        emu_gpu::backend::clear_depth_software(g, t, r, z)
+    }
+
     fn draw(&mut self, g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
         let Some(target) = d.target else {
             return Ok(());
@@ -1043,8 +1629,16 @@ impl Backend for VulkanBackend {
                 return self.software.draw(g, d);
             }
         };
+        let textures = match self.bind_textures(g, d, &plan) {
+            Ok(t) => t,
+            Err(_why) => {
+                self.fallback_draws += 1;
+                self.flush(g)?;
+                return self.software.draw(g, d);
+            }
+        };
         // SAFETY: see `clear`.
-        unsafe { self.draw_gpu(g, d, &target, plan) }?;
+        unsafe { self.draw_gpu(g, d, &target, plan, textures) }?;
         self.gpu_draws += 1;
         Ok(())
     }
@@ -1063,9 +1657,15 @@ impl Drop for VulkanBackend {
             for (_, img) in std::mem::take(&mut self.images) {
                 self.destroy_image(img);
             }
+            for (_, img) in std::mem::take(&mut self.depth_images) {
+                self.destroy_image(img);
+            }
             for b in std::mem::take(&mut self.transient) {
                 self.device.destroy_buffer(b.buffer, None);
                 self.device.free_memory(b.memory, None);
+            }
+            for t in std::mem::take(&mut self.textures) {
+                self.destroy_texture(t);
             }
             for (_, (pipe, modules)) in std::mem::take(&mut self.pipelines) {
                 self.device.destroy_pipeline(pipe, None);

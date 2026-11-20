@@ -183,7 +183,7 @@ fn draws_with_translated_shaders() {
             asm::exit(),
         ],
     );
-    shaded_draw(vs, ps, 8);
+    shaded_draw(vs, ps, 8, &[]);
 }
 
 #[test]
@@ -199,13 +199,176 @@ fn control_flow_shaders() {
             asm::exit(),
         ],
     );
-    shaded_draw(vs, asm::control_flow_sample(), 16);
+    shaded_draw(vs, asm::control_flow_sample(), 16, &[]);
+}
+
+#[test]
+fn depth_test_and_blending() {
+    use emu_gpu::shader::{asm, attr};
+    let vs = asm::program(
+        &asm::vertex_header(),
+        &[
+            asm::ald(0, attr::generic(0), 4),
+            asm::ald(4, attr::generic(1), 4),
+            asm::ast(0, attr::POSITION, 4),
+            asm::ast(4, attr::generic(0), 4),
+            asm::exit(),
+        ],
+    );
+    // Color with alpha 0.75 so blending shows.
+    let ps = asm::program(
+        &asm::pixel_header(),
+        &[
+            asm::ipa(0, 0x80),
+            asm::ipa(1, 0x84),
+            asm::ipa(2, 0x88),
+            asm::mov32i(3, 0.75f32.to_bits()),
+            asm::exit(),
+        ],
+    );
+    let zt = GPU_VA + 0x5_0000;
+    let extra = [
+        // Z32F depth buffer, 96x64, cleared to 1.0; test LESS with writes.
+        incr(0, 0xFE0, 5),
+        (zt >> 32) as u32,
+        zt as u32,
+        0x0A,
+        2 << 4,
+        0,
+        incr(0, 0x1228, 3),
+        96,
+        64,
+        1,
+        incr(0, 0x1538, 1),
+        1,
+        incr(0, 0xD90, 1),
+        1.0f32.to_bits(),
+        incr(0, 0x19D0, 1),
+        1,
+        incr(0, 0x12CC, 1),
+        1,
+        incr(0, 0x12E8, 1),
+        1,
+        incr(0, 0x130C, 1),
+        2,
+        // Alpha blending (D3D-style values) on target 0.
+        incr(0, 0x12E4, 1),
+        1,
+        incr(0, 0x1360, 1),
+        1,
+        incr(0, 0x1E04, 6),
+        1,
+        5,
+        6,
+        1,
+        2,
+        1,
+    ];
+    let Some((soft, hard)) = shaded_draw(vs, ps, 16, &extra) else {
+        return;
+    };
+    // The depth buffers must match too.
+    let zt = 0x5_0000 - 0x1_0000;
+    let size = emu_gpu::blocklinear::size(96 * 4, 64, 2);
+    let (a, b) = (&soft[zt..zt + size], &hard[zt..zt + size]);
+    let differing = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x != y).count();
+    eprintln!("depth: {differing} values differ");
+    assert!(differing <= 16, "{differing} depth values differ");
+    let lin = emu_gpu::blocklinear::deswizzle_width(a, 96 * 4, 96 * 4, 64, 2);
+    let written = lin
+        .chunks(4)
+        .filter(|v| f32::from_le_bytes((*v).try_into().unwrap()) == 0.0)
+        .count();
+    assert!(written > 500, "only {written} depth values written");
+}
+
+/// Two textures for `shaded_draw`: handle word 0 is an 8x8 pitch-linear
+/// checkerboard sampled nearest with repeat, handle word 1 a 4x4
+/// block-linear gradient sampled linearly with clamp to edge.
+fn texture_setup(mem: &mut Memory) {
+    use emu_gpu::texture::{build, wrap};
+    let (t0, t1) = (GPU_VA + 0x3_8000, GPU_VA + 0x3_9000);
+    let mut tics = build::rgba8_tic(t0, 8, 8, Some(32), 0).to_vec();
+    tics.extend(build::rgba8_tic(t1, 4, 4, None, 0));
+    mem.write(GUEST + 0x3_5000, &tics).unwrap();
+    let mut tscs = build::tsc(wrap::REPEAT, false, [0.0; 4]).to_vec();
+    tscs.extend(build::tsc(wrap::CLAMP_TO_EDGE, true, [0.0; 4]));
+    mem.write(GUEST + 0x3_6000, &tscs).unwrap();
+    let handles: Vec<u8> = [0u32, 1 | 1 << 20]
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    mem.write(GUEST + 0x3_7000, &handles).unwrap();
+    // Checkerboard: colors chosen away from unorm rounding ties.
+    let mut checker = Vec::new();
+    for y in 0..8 {
+        for x in 0..8 {
+            checker.extend(if (x + y) % 2 == 0 {
+                [230, 40, 20, 255]
+            } else {
+                [20, 90, 210, 255]
+            });
+        }
+    }
+    mem.write(GUEST + 0x3_8000, &checker).unwrap();
+    // 4x4 gradient (16 bytes per row: one GOB wide, rows in GOB order).
+    let mut gob = vec![0u8; 512];
+    for y in 0..4u32 {
+        for x in 0..4u32 {
+            let o = emu_gpu::blocklinear::offset(4 * x, y, 16, 0);
+            gob[o..o + 4].copy_from_slice(&[(60 * x) as u8 + 10, (60 * y) as u8 + 10, 128, 255]);
+        }
+    }
+    mem.write(GUEST + 0x3_9000, &gob).unwrap();
+}
+
+#[test]
+fn textured_draws() {
+    use emu_gpu::shader::{asm, attr};
+    let vs = asm::program(
+        &asm::vertex_header(),
+        &[
+            asm::ald(0, attr::generic(0), 4),
+            asm::ald(4, attr::generic(1), 4),
+            asm::ast(0, attr::POSITION, 4),
+            asm::ast(4, attr::generic(0), 4),
+            asm::exit(),
+        ],
+    );
+    // Average of the checkerboard (repeated 2.5 times) and the gradient.
+    let ps = asm::program(
+        &asm::pixel_header(),
+        &[
+            asm::ipa(0, 0x80),
+            asm::ipa(1, 0x84),
+            asm::fmul32i(4, 0, 2.5),
+            asm::fmul32i(5, 1, 2.5),
+            asm::texs(0, 2, 4, 5, 0, 4, false),
+            asm::ipa(4, 0x80),
+            asm::ipa(5, 0x84),
+            asm::tex(8, 4, 1, 0xF, false),
+            asm::fadd(0, 0, 8),
+            asm::fmul32i(0, 0, 0.5),
+            asm::fadd(1, 1, 9),
+            asm::fmul32i(1, 1, 0.5),
+            asm::fadd(2, 2, 10),
+            asm::fmul32i(2, 2, 0.5),
+            asm::mov32i(3, 0x3F80_0000),
+            asm::exit(),
+        ],
+    );
+    shaded_draw(vs, ps, 64, &[]);
 }
 
 /// Draws a triangle and a strip with the given shaders in software and
 /// on Vulkan and compares the results.
-fn shaded_draw(vs: Vec<u8>, ps: Vec<u8>, max_differing: usize) {
-    let Some(vk) = vulkan() else { return };
+fn shaded_draw(
+    vs: Vec<u8>,
+    ps: Vec<u8>,
+    max_differing: usize,
+    extra: &[u32],
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let vk = vulkan()?;
     let verts: Vec<f32> = vec![
         -0.9, -0.8, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, //
         0.8, -0.9, 0.0, 2.0, 0.0, 1.0, 0.0, 1.0, // w = 2: perspective
@@ -216,9 +379,11 @@ fn shaded_draw(vs: Vec<u8>, ps: Vec<u8>, max_differing: usize) {
         mem.write(GUEST + 0x3_0200, &ps).unwrap();
         let bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_le_bytes()).collect();
         mem.write(GUEST + 0x3_1000, &bytes).unwrap();
+        texture_setup(mem);
     };
     let code = GPU_VA + 0x3_0000;
     let vtx = GPU_VA + 0x3_1000;
+    let (tic, tsc, handles) = (GPU_VA + 0x3_5000, GPU_VA + 0x3_6000, GPU_VA + 0x3_7000);
     let mut w = target(0x4_0000, 96, 64, RGBA8, 2 << 4);
     w.extend(clear([0.2, 0.2, 0.2, 1.0], None, 0x3C));
     w.extend([
@@ -251,6 +416,27 @@ fn shaded_draw(vs: Vec<u8>, ps: Vec<u8>, max_differing: usize) {
         1,
         4 | 90 << 16,
         2 | 60 << 16, // scissor
+        // Textures: header and sampler pools, handles in PS constant
+        // buffer 0 (the bindless slot).
+        incr(0, 0x1574, 3),
+        (tic >> 32) as u32,
+        tic as u32,
+        1,
+        incr(0, 0x155C, 3),
+        (tsc >> 32) as u32,
+        tsc as u32,
+        1,
+        incr(0, 0x2608, 1),
+        0,
+        incr(0, 0x2380, 3),
+        256,
+        (handles >> 32) as u32,
+        handles as u32,
+        incr(0, 0x2410 + 4 * 32, 1),
+        1, // stage 4 (PS), slot 0
+    ]);
+    w.extend(extra);
+    w.extend([
         // A triangle, then a strip over vertices 1..4.
         incr(0, 0x1618, 1),
         4,
@@ -280,8 +466,14 @@ fn shaded_draw(vs: Vec<u8>, ps: Vec<u8>, max_differing: usize) {
     let size = emu_gpu::blocklinear::size(96 * 4, 64, 2);
     let (a, b) = (&soft[rt..rt + size], &hard[rt..rt + size]);
     let worst = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
-    let differing = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x != y).count();
-    eprintln!("software vs Vulkan: {differing} pixels differ, by at most {worst}");
+    // Pixels differing by more than rounding (blending and
+    // interpolation precision varies between implementations).
+    let differing = a
+        .chunks(4)
+        .zip(b.chunks(4))
+        .filter(|(x, y)| x.iter().zip(y.iter()).any(|(p, q)| p.abs_diff(*q) > 2))
+        .count();
+    eprintln!("software vs Vulkan: {differing} pixels differ by more than 2, by at most {worst}");
     assert!(
         worst <= 2 || differing <= max_differing,
         "worst {worst}, {differing} pixels differ"
@@ -290,6 +482,7 @@ fn shaded_draw(vs: Vec<u8>, ps: Vec<u8>, max_differing: usize) {
         a.chunks(4).filter(|p| p[..3] != [51, 51, 51]).count() > 500,
         "the draw covered little"
     );
+    Some((soft, hard))
 }
 
 #[test]

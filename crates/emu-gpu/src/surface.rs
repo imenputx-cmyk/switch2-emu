@@ -85,6 +85,52 @@ impl ColorFormat {
         }
     }
 
+    /// Decodes one pixel to RGBA floats (inverse of `encode`).
+    pub fn decode(self, p: &[u8]) -> [f32; 4] {
+        let n = |v: u32, max: f32| v as f32 / max;
+        let srgb = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        match self {
+            ColorFormat::Rgba32Float => {
+                std::array::from_fn(|i| f32::from_le_bytes(p[4 * i..4 * i + 4].try_into().unwrap()))
+            }
+            ColorFormat::Rgba16Unorm => std::array::from_fn(|i| {
+                n(
+                    u32::from(u16::from_le_bytes([p[2 * i], p[2 * i + 1]])),
+                    65535.0,
+                )
+            }),
+            ColorFormat::Bgra8Unorm => [p[2], p[1], p[0], p[3]].map(|b| n(u32::from(b), 255.0)),
+            ColorFormat::Rgba8Unorm => [p[0], p[1], p[2], p[3]].map(|b| n(u32::from(b), 255.0)),
+            ColorFormat::Rgba8Srgb => {
+                let c = [p[0], p[1], p[2], p[3]].map(|b| n(u32::from(b), 255.0));
+                [srgb(c[0]), srgb(c[1]), srgb(c[2]), c[3]]
+            }
+            ColorFormat::Rgbx8Unorm => {
+                let c = [p[0], p[1], p[2]].map(|b| n(u32::from(b), 255.0));
+                [c[0], c[1], c[2], 1.0]
+            }
+            ColorFormat::A2B10G10R10Unorm => {
+                let v = u32::from_le_bytes(p[..4].try_into().unwrap());
+                [
+                    n(v & 1023, 1023.0),
+                    n(v >> 10 & 1023, 1023.0),
+                    n(v >> 20 & 1023, 1023.0),
+                    n(v >> 30, 3.0),
+                ]
+            }
+            ColorFormat::B5G6R5Unorm => {
+                let v = u32::from(u16::from_le_bytes([p[0], p[1]]));
+                [n(v >> 11, 31.0), n(v >> 5 & 63, 63.0), n(v & 31, 31.0), 1.0]
+            }
+        }
+    }
+
     /// Bytes of each pixel that belong to the enabled RGBA components,
     /// for partial (masked) writes; `None` if the format packs channels
     /// below byte granularity.

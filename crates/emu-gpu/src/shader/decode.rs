@@ -338,6 +338,28 @@ pub enum Op {
         mode: IpaMode,
         sat: bool,
     },
+    /// Samples a 2D texture at (a, b); the enabled components (`comps`,
+    /// RGBA bits) go to dst0, dst0 + 1, dst1, dst1 + 1 in order.
+    Texs {
+        dst0: u8,
+        dst1: u8,
+        a: u8,
+        b: u8,
+        /// Word offset of the handle in the bindless constant buffer.
+        handle: u32,
+        comps: u8,
+        /// Level 0 explicitly ("LZ").
+        lz: bool,
+    },
+    /// Samples a 2D texture at (a, a + 1); the enabled components go to
+    /// consecutive registers from dst.
+    Tex {
+        dst: u8,
+        a: u8,
+        handle: u32,
+        comps: u8,
+        lz: bool,
+    },
     Bra {
         target: usize,
     },
@@ -879,6 +901,51 @@ pub fn decode(v: u64, at: usize) -> Result<Inst, DecodeError> {
                 Round::Pass
             },
             sat: on(v, 50),
+        }
+    } else if top(0xf600, 0xd000) {
+        // TEXS (bit 59: f16 results, not supported).
+        let lz = match bits(v, 53, 4) {
+            1 => false,
+            2 => true,
+            _ => return unknown, // other targets and LOD modes
+        };
+        let dst1 = reg(v, 28);
+        let sel = bits(v, 50, 3) as usize;
+        let comps = if dst1 == RZ {
+            [1, 2, 4, 8, 3, 9, 10, 12][sel]
+        } else {
+            *[7, 11, 13, 14, 15]
+                .get(sel)
+                .ok_or(DecodeError::Unknown(v))?
+        };
+        if on(v, 59) {
+            return unknown;
+        }
+        Op::Texs {
+            dst0: dst,
+            dst1,
+            a,
+            b: reg(v, 20),
+            handle: bits(v, 36, 13) as u32,
+            comps,
+            lz,
+        }
+    } else if top(0xfc38, 0xc038) {
+        // TEX: 2D only, no offsets, depth compare or arrays.
+        let lz = match bits(v, 55, 3) {
+            0 => false,
+            1 => true,
+            _ => return unknown,
+        };
+        if on(v, 54) || on(v, 50) || on(v, 28) || bits(v, 29, 2) != 1 {
+            return unknown;
+        }
+        Op::Tex {
+            dst,
+            a,
+            handle: bits(v, 36, 13) as u32,
+            comps: bits(v, 31, 4) as u8,
+            lz,
         }
     } else if top(0xfff8, 0xefd8) {
         Op::Ald {

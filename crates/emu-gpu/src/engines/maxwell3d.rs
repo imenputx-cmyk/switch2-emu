@@ -11,9 +11,11 @@ use crate::backend::{Layout, Rect, Surface};
 use crate::draw::{
     ConstBuffer, Draw, IndexBuffer, VertexAttribute, VertexStream, Viewport, CBUF_SLOTS,
 };
+use crate::pipeline::{Blend, BlendFactor, BlendOp, Compare, Depth, DepthFormat, DepthSurface};
 use crate::shader::decode::{decode_program, is_complete, Inst};
 use crate::shader::{Header, Stage, HEADER_SIZE};
 use crate::surface::ColorFormat;
+use crate::texture::Pools;
 
 /// Register file size in words: methods 0x0000..0x3800 (bytes).
 const REGS: usize = 0xE00;
@@ -60,6 +62,22 @@ mod reg {
     pub const LOAD_CBUF_OFFSET: u32 = 0x238C;
     pub const LOAD_CBUF: u32 = 0x2390; // ..0x23CC
     pub const BIND_GROUP_CBUF: u32 = 0x2410; // + 32 * stage
+    pub const TEX_SAMPLER_POOL: u32 = 0x155C; // address upper, lower, maximum index
+    pub const TEX_HEADER_POOL: u32 = 0x1574; // address upper, lower, maximum index
+    pub const BINDLESS_TEXTURE_SLOT: u32 = 0x2608;
+    pub const DEPTH_TARGET: u32 = 0xFE0; // address upper, lower, format, tile mode
+    pub const DEPTH_TARGET_WIDTH: u32 = 0x1228;
+    pub const DEPTH_TARGET_HEIGHT: u32 = 0x122C;
+    pub const DEPTH_TARGET_ENABLE: u32 = 0x1538;
+    pub const DEPTH_TEST_ENABLE: u32 = 0x12CC;
+    pub const DEPTH_WRITE_ENABLE: u32 = 0x12E8;
+    pub const DEPTH_TEST_FUNC: u32 = 0x130C;
+    pub const CLEAR_DEPTH: u32 = 0xD90;
+    pub const BLEND_CONSTANT: u32 = 0x131C; // RGBA floats
+    pub const INDEPENDENT_BLEND_ENABLE: u32 = 0x12E4;
+    pub const BLEND_COMMON: u32 = 0x1340; // op, src, dst (RGB), op, src (alpha), -, dst (alpha)
+    pub const BLEND_ENABLE: u32 = 0x1360; // + 4 * target
+    pub const BLEND_PER_TARGET: u32 = 0x1E00; // + 32 * target: -, op, src, dst, op, src, dst
 }
 
 /// Draws that are not emulated yet (indexed, auto, inline indices).
@@ -355,6 +373,83 @@ impl Maxwell3D {
         })
     }
 
+    /// The depth buffer, if enabled.
+    fn depth_target(&self) -> Result<Option<DepthSurface>, String> {
+        if self.reg(reg::DEPTH_TARGET_ENABLE) & 1 == 0 {
+            return Ok(None);
+        }
+        let raw = self.reg(reg::DEPTH_TARGET + 8);
+        let format = DepthFormat::from_raw(raw).ok_or_else(|| format!("depth format {raw:#x}"))?;
+        Ok(Some(DepthSurface {
+            addr: u64::from(self.reg(reg::DEPTH_TARGET) & 0xFF) << 32
+                | u64::from(self.reg(reg::DEPTH_TARGET + 4)),
+            width: self.reg(reg::DEPTH_TARGET_WIDTH) & 0xFFFFF,
+            height: self.reg(reg::DEPTH_TARGET_HEIGHT) & 0xFFFF,
+            format,
+            block_height_log2: bits(self.reg(reg::DEPTH_TARGET + 12), 7, 4),
+        }))
+    }
+
+    fn depth_state(&self) -> Result<Depth, String> {
+        let test = self.reg(reg::DEPTH_TEST_ENABLE) & 1 != 0;
+        if !test {
+            return Ok(Depth::default());
+        }
+        let raw = self.reg(reg::DEPTH_TEST_FUNC);
+        Ok(Depth {
+            target: self.depth_target()?,
+            test,
+            write: self.reg(reg::DEPTH_WRITE_ENABLE) & 1 != 0,
+            func: Compare::from_raw(raw).ok_or_else(|| format!("depth function {raw:#x}"))?,
+        })
+    }
+
+    /// Blending of color target 0.
+    fn blend_state(&self) -> Result<Blend, String> {
+        if self.reg(reg::BLEND_ENABLE) & 1 == 0 {
+            return Ok(Blend::default());
+        }
+        let base = if self.reg(reg::INDEPENDENT_BLEND_ENABLE) & 1 != 0 {
+            reg::BLEND_PER_TARGET + 4
+        } else {
+            reg::BLEND_COMMON
+        };
+        let op = |o: u32| {
+            let v = self.reg(base + o);
+            BlendOp::from_raw(v).ok_or_else(|| format!("blend equation {v:#x}"))
+        };
+        let factor = |o: u32| {
+            let v = self.reg(base + o);
+            BlendFactor::from_raw(v).ok_or_else(|| format!("blend factor {v:#x}"))
+        };
+        // The common registers have a gap before the alpha destination.
+        let dst_alpha = if base == reg::BLEND_COMMON {
+            0x18
+        } else {
+            0x14
+        };
+        Ok(Blend {
+            enabled: true,
+            op_rgb: op(0)?,
+            src_rgb: factor(4)?,
+            dst_rgb: factor(8)?,
+            op_alpha: op(0xC)?,
+            src_alpha: factor(0x10)?,
+            dst_alpha: factor(dst_alpha)?,
+        })
+    }
+
+    fn texture_pools(&self) -> Pools {
+        let addr = |r: u32| u64::from(self.reg(r) & 0xFF) << 32 | u64::from(self.reg(r + 4));
+        Pools {
+            tic: addr(reg::TEX_HEADER_POOL),
+            tic_max: self.reg(reg::TEX_HEADER_POOL + 8),
+            tsc: addr(reg::TEX_SAMPLER_POOL),
+            tsc_max: self.reg(reg::TEX_SAMPLER_POOL + 8),
+            cbuf_slot: self.reg(reg::BINDLESS_TEXTURE_SLOT) & 0x1F,
+        }
+    }
+
     /// The constant buffer named by the selector registers.
     fn selected_cbuf(&self) -> ConstBuffer {
         ConstBuffer {
@@ -468,6 +563,11 @@ impl Maxwell3D {
             streams,
             viewport,
             clip: Rect { x0, y0, x1, y1 },
+            textures: self.texture_pools(),
+            depth: self.depth_state()?,
+            blend: self.blend_state()?,
+            blend_constant: [0, 1, 2, 3]
+                .map(|i| f32::from_bits(self.reg(reg::BLEND_CONSTANT + 4 * i))),
         };
         ctx.backend.draw(&mut ctx.guest, &d)?;
         self.draws += 1;
@@ -497,12 +597,66 @@ impl Maxwell3D {
         }
     }
 
+    /// The rectangle a clear covers: the surface clip, scissor 0 and the
+    /// clear rect, within `width` x `height`.
+    fn clear_rect(&self, width: u32, height: u32) -> Option<Rect> {
+        let (mut x0, mut y0, mut x1, mut y1) = (0, 0, width, height);
+        let clip = |lo: u32, hi: u32, a: &mut u32, b: &mut u32| {
+            *a = (*a).max(lo);
+            *b = (*b).min(hi);
+        };
+        let ch = self.reg(reg::SURFACE_CLIP_HORIZONTAL);
+        let cv = self.reg(reg::SURFACE_CLIP_VERTICAL);
+        if ch >> 16 != 0 && cv >> 16 != 0 {
+            clip(ch & 0xFFFF, (ch & 0xFFFF) + (ch >> 16), &mut x0, &mut x1);
+            clip(cv & 0xFFFF, (cv & 0xFFFF) + (cv >> 16), &mut y0, &mut y1);
+        }
+        if self.reg(reg::SCISSOR_ENABLE) & 1 != 0 {
+            let (h, vv) = (
+                self.reg(reg::SCISSOR_HORIZONTAL),
+                self.reg(reg::SCISSOR_VERTICAL),
+            );
+            clip(h & 0xFFFF, h >> 16, &mut x0, &mut x1);
+            clip(vv & 0xFFFF, vv >> 16, &mut y0, &mut y1);
+        }
+        let (rh, rv) = (
+            self.reg(reg::CLEAR_RECT_HORIZONTAL),
+            self.reg(reg::CLEAR_RECT_VERTICAL),
+        );
+        if rh >> 16 != 0 && rv >> 16 != 0 {
+            clip(rh & 0xFFFF, rh >> 16, &mut x0, &mut x1);
+            clip(rv & 0xFFFF, rv >> 16, &mut y0, &mut y1);
+        }
+        (x0 < x1 && y0 < y1).then_some(Rect { x0, y0, x1, y1 })
+    }
+
+    fn clear_depth(&mut self, ctx: &mut EngineCtx) {
+        let target = match self.depth_target() {
+            Ok(Some(t)) => t,
+            Ok(None) => return,
+            Err(e) => {
+                ctx.faults.push(format!("depth clear: {e}"));
+                return;
+            }
+        };
+        let Some(rect) = self.clear_rect(target.width, target.height) else {
+            return;
+        };
+        let z = f32::from_bits(self.reg(reg::CLEAR_DEPTH));
+        if let Err(e) = ctx.backend.clear_depth(&mut ctx.guest, &target, rect, z) {
+            ctx.faults.push(format!("depth clear: {e}"));
+        }
+    }
+
     /// CLEAR_SURFACE: fills the selected render target with the clear
     /// color, limited by the surface clip, scissor 0 and the clear rect.
     fn clear(&mut self, v: u32, ctx: &mut EngineCtx) {
         let mask = [v & 4 != 0, v & 8 != 0, v & 16 != 0, v & 32 != 0];
+        if v & 1 != 0 {
+            self.clear_depth(ctx);
+        }
         if !mask.iter().any(|&m| m) {
-            return; // depth/stencil only: no depth buffers yet
+            return;
         }
         let rt = reg::COLOR_TARGET + 64 * bits(v, 9, 6);
         let Some(format) = ColorFormat::from_raw(self.reg(rt + 0x10)) else {

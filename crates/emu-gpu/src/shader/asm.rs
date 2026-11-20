@@ -391,6 +391,33 @@ pub fn frnd(dst: u8, a: u8, round: u8) -> u64 {
     op(0x5ca8) | r(dst, 0) | r(a, 20) | 2 << 10 | 2 << 8 | 1 << 42 | u64::from(round) << 39
 }
 
+/// TEXS: samples texture `handle` (bindless constant buffer word) at
+/// (a, b). `sel` picks the components: with dst1 = RZ 0..=7 for R, G,
+/// B, A, RG, RA, GA, BA; otherwise 0..=4 for RGB, RGA, RBA, GBA, RGBA.
+pub fn texs(dst0: u8, dst1: u8, a: u8, b: u8, handle: u32, sel: u8, lz: bool) -> u64 {
+    op(0xd000)
+        | r(dst0, 0)
+        | r(a, 8)
+        | r(b, 20)
+        | r(dst1, 28)
+        | u64::from(handle) << 36
+        | u64::from(sel) << 50
+        | (if lz { 2 } else { 1 }) << 53
+}
+
+/// TEX (2D): samples texture `handle` at (a, a + 1); the `comps` (RGBA
+/// bits) go to consecutive registers from dst.
+pub fn tex(dst: u8, a: u8, handle: u32, comps: u8, lz: bool) -> u64 {
+    op(0xc038)
+        | r(dst, 0)
+        | r(a, 8)
+        | r(255, 20)
+        | 1 << 29
+        | u64::from(comps) << 31
+        | u64::from(handle) << 36
+        | u64::from(lz) << 55
+}
+
 /// A neutral scheduling control word (no stalls, no barriers).
 pub const SCHED: u64 = 0x001f_8000_fc00_07e0;
 

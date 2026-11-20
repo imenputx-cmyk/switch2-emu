@@ -157,11 +157,40 @@ pub trait Backend {
         mask: [bool; 4],
     ) -> Result<(), String>;
 
+    /// Fills `rect` of a depth buffer with depth `z`.
+    fn clear_depth(
+        &mut self,
+        g: &mut GuestMemory,
+        target: &crate::pipeline::DepthSurface,
+        rect: Rect,
+        z: f32,
+    ) -> Result<(), String> {
+        clear_depth_software(g, target, rect, z)
+    }
+
     /// Executes a draw.
     fn draw(&mut self, g: &mut GuestMemory, d: &crate::draw::Draw) -> Result<(), String>;
 
     /// Makes all results visible in guest memory (end of a submission).
     fn flush(&mut self, g: &mut GuestMemory) -> Result<(), String>;
+}
+
+/// Clears a depth buffer in guest memory (keeping stencil bits).
+pub fn clear_depth_software(
+    g: &mut GuestMemory,
+    t: &crate::pipeline::DepthSurface,
+    r: Rect,
+    z: f32,
+) -> Result<(), String> {
+    let mut data = t.read_linear(g)?;
+    let bpp = t.format.bytes_per_pixel() as usize;
+    for y in r.y0..r.y1.min(t.height) {
+        for x in r.x0..r.x1.min(t.width) {
+            let i = (y * t.width + x) as usize * bpp;
+            t.format.encode(z, &mut data[i..i + bpp]);
+        }
+    }
+    t.write_linear(g, &data)
 }
 
 /// The reference backend: works directly on guest memory.

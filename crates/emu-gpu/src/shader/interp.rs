@@ -18,6 +18,11 @@ pub trait ShaderIo {
     /// Interpolated input (PS).
     fn interpolate(&self, addr: u32, mode: IpaMode) -> f32;
     fn cbuf(&self, index: u8, offset: u32) -> u32;
+    /// Samples the 2D texture whose handle is at word `handle` of the
+    /// bindless constant buffer.
+    fn texture(&self, _handle: u32, _u: f32, _v: f32) -> [f32; 4] {
+        [0.0; 4]
+    }
 }
 
 pub struct Regs(pub [u32; 256]);
@@ -537,8 +542,48 @@ impl Machine<'_> {
                 let v = self.io.interpolate(addr, mode);
                 self.set_f(dst, v, s);
             }
+            Op::Texs {
+                dst0,
+                dst1,
+                a,
+                b,
+                handle,
+                comps,
+                ..
+            } => {
+                let t = self.io.texture(handle, self.regs.f(a), self.regs.f(b));
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    self.regs.set(texs_dst(dst0, dst1, k), t[c].to_bits());
+                }
+            }
+            Op::Tex {
+                dst,
+                a,
+                handle,
+                comps,
+                ..
+            } => {
+                let t = self
+                    .io
+                    .texture(handle, self.regs.f(a), self.regs.f(a.wrapping_add(1)));
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    if dst != RZ {
+                        self.regs.set(dst.wrapping_add(k as u8), t[c].to_bits());
+                    }
+                }
+            }
             Op::Nop | Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {}
         }
+    }
+}
+
+/// Register of the `k`-th written component of a TEXS (RZ: discarded).
+pub fn texs_dst(dst0: u8, dst1: u8, k: usize) -> u8 {
+    let (base, i) = if k < 2 { (dst0, k) } else { (dst1, k - 2) };
+    if base == RZ {
+        RZ
+    } else {
+        base.wrapping_add(i as u8)
     }
 }
 

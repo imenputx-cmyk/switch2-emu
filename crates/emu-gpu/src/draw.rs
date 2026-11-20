@@ -4,13 +4,18 @@
 //! perspective-correct interpolation, the pixel shader, and the color
 //! write). The software renderer is the reference for the Vulkan one.
 //!
-//! Not yet: instancing, textures, depth/stencil, blending, culling,
-//! clipping against the near plane.
+//! Not yet: instancing, stencil, culling, clipping against the near
+//! plane (depth is clamped to the viewport's range instead, like Vulkan
+//! with depth clamping); textures are 2D, level 0 only; blending and the
+//! depth test apply to color target 0.
 
 use crate::backend::{GuestMemory, Rect, Surface};
+use crate::pipeline::{Blend, Depth};
+use crate::shader::decode::Op;
 use crate::shader::decode::{Inst, IpaMode};
 use crate::shader::interp::{self, ShaderIo};
 use crate::shader::{attr, Header};
+use crate::texture::{self, Pools};
 
 /// Primitive topologies (BEGIN op).
 pub mod topology {
@@ -85,6 +90,64 @@ pub struct Draw {
     pub viewport: Viewport,
     /// Pixels that may be written (scissor and surface clip).
     pub clip: Rect,
+    pub textures: Pools,
+    pub depth: Depth,
+    pub blend: Blend,
+    pub blend_constant: [f32; 4],
+}
+
+/// Handles (bindless constant buffer word offsets) a program samples.
+pub fn texture_handles(program: &[Inst]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for i in program {
+        if let Op::Texs { handle, .. } | Op::Tex { handle, .. } = i.op {
+            if !out.contains(&handle) {
+                out.push(handle);
+            }
+        }
+    }
+    out
+}
+
+/// The handle word a stage's texture `handle` refers to.
+pub fn texture_handle_word(
+    g: &GuestMemory,
+    pools: &Pools,
+    cbufs: &[Option<ConstBuffer>; CBUF_SLOTS],
+    handle: u32,
+) -> Result<u32, String> {
+    let cb = cbufs
+        .get(pools.cbuf_slot as usize)
+        .copied()
+        .flatten()
+        .ok_or("texture handle constant buffer not bound")?;
+    if 4 * handle + 4 > cb.size {
+        return Err(format!(
+            "texture handle {handle} outside its constant buffer"
+        ));
+    }
+    let mut w = [0u8; 4];
+    g.read(cb.addr + 4 * u64::from(handle), &mut w)
+        .map_err(|f| format!("texture handle: {f:?}"))?;
+    Ok(u32::from_le_bytes(w))
+}
+
+/// Decodes the textures a program samples.
+fn bind_textures(
+    g: &GuestMemory,
+    pools: &Pools,
+    cbufs: &[Option<ConstBuffer>; CBUF_SLOTS],
+    program: &[Inst],
+) -> Result<texture::Bound, String> {
+    let mut bound = texture::Bound::default();
+    for handle in texture_handles(program) {
+        let word = texture_handle_word(g, pools, cbufs, handle)?;
+        let (tic, tsc) = texture::resolve(g, pools, word)?;
+        bound
+            .0
+            .insert(handle, (texture::Texture::decode(g, &tic)?, tsc));
+    }
+    Ok(bound)
 }
 
 /// Reads one vertex attribute as 4 words (floats as their bits; integer
@@ -152,7 +215,7 @@ fn fetch(
     Ok(out)
 }
 
-fn half_to_f32(h: u16) -> f32 {
+pub fn half_to_f32(h: u16) -> f32 {
     let (s, e, m) = (
         (h >> 15) as u32,
         ((h >> 10) & 0x1F) as u32,
@@ -218,6 +281,7 @@ struct VertexIo<'a> {
     inputs: &'a [[u32; 4]],
     out: Varyings,
     cbufs: &'a Cbufs,
+    tex: &'a texture::Bound,
 }
 
 impl ShaderIo for VertexIo<'_> {
@@ -242,11 +306,15 @@ impl ShaderIo for VertexIo<'_> {
     fn cbuf(&self, index: u8, offset: u32) -> u32 {
         self.cbufs.get(index, offset)
     }
+    fn texture(&self, handle: u32, u: f32, v: f32) -> [f32; 4] {
+        self.tex.sample(handle, u, v)
+    }
 }
 
 struct PixelIo<'a> {
     v: [&'a Varyings; 3],
     cbufs: &'a Cbufs,
+    tex: &'a texture::Bound,
     /// Perspective-correct barycentrics, and screen-space ones.
     persp: [f32; 3],
     frag: [f32; 4],
@@ -268,6 +336,9 @@ impl ShaderIo for PixelIo<'_> {
     }
     fn cbuf(&self, index: u8, offset: u32) -> u32 {
         self.cbufs.get(index, offset)
+    }
+    fn texture(&self, handle: u32, u: f32, v: f32) -> [f32; 4] {
+        self.tex.sample(handle, u, v)
     }
 }
 
@@ -323,6 +394,8 @@ pub fn draw_software(g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
     };
     let vs_cbufs = Cbufs::load(g, &d.vs_cbufs)?;
     let ps_cbufs = Cbufs::load(g, &d.ps_cbufs)?;
+    let vs_tex = bind_textures(g, &d.textures, &d.vs_cbufs, &d.vs)?;
+    let ps_tex = bind_textures(g, &d.textures, &d.ps_cbufs, &d.ps)?;
     for &(first, count) in &d.ranges {
         // The vertices to shade, in order.
         let vertices: Vec<u32> = match &d.index {
@@ -351,13 +424,14 @@ pub fn draw_software(g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
                 inputs: &inputs,
                 out: Varyings { words: [0; 128] },
                 cbufs: &vs_cbufs,
+                tex: &vs_tex,
             };
             interp::run(&d.vs, &mut io);
             shaded.push(io.out);
         }
         for tri in triangles(d.topology, count)? {
             let v = tri.map(|i| &shaded[i as usize]);
-            rasterize(g, d, &target, v, &ps_cbufs)?;
+            rasterize(g, d, &target, v, &ps_cbufs, &ps_tex)?;
         }
     }
     Ok(())
@@ -369,6 +443,7 @@ fn rasterize(
     target: &Surface,
     v: [&Varyings; 3],
     cbufs: &Cbufs,
+    tex: &texture::Bound,
 ) -> Result<(), String> {
     // Clip space -> window space.
     let mut win = [[0f32; 4]; 3];
@@ -418,6 +493,9 @@ fn rasterize(
 
     let bpp = target.format.bytes_per_pixel();
     let regs_per_target = d.ps_header.omap_targets[0];
+    let near = d.viewport.offset[2];
+    let far = near + d.viewport.scale[2];
+    let (z_lo, z_hi) = (near.min(far), near.max(far));
     for y in y0..y1 {
         for x in x0..x1 {
             let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -438,15 +516,42 @@ fn rasterize(
             let inv_w: f32 = (0..3).map(|i| b[i] * win[i][3]).sum();
             let persp = [0, 1, 2].map(|i| b[i] * win[i][3] / inv_w);
             let z: f32 = (0..3).map(|i| b[i] * win[i][2]).sum();
+            let z = z.clamp(z_lo, z_hi);
             let mut io = PixelIo {
                 v,
                 cbufs,
+                tex,
                 persp,
                 frag: [px, py, z, inv_w],
             };
             let Some(regs) = interp::run(&d.ps, &mut io) else {
                 continue; // discarded
             };
+            // Depth test against the stored value (in the buffer's
+            // precision), then the depth write.
+            if let (Some(ds), true) = (&d.depth.target, d.depth.test) {
+                if x >= ds.width || y >= ds.height {
+                    continue;
+                }
+                let bpp = ds.format.bytes_per_pixel() as usize;
+                let at = ds.byte_addr(x, y);
+                let mut cur = [0u8; 4];
+                g.read(at, &mut cur[..bpp])
+                    .map_err(|f| format!("depth read: {f:?}"))?;
+                let mut new = cur;
+                ds.format.encode(z, &mut new);
+                if !d
+                    .depth
+                    .func
+                    .test(ds.format.decode(&new), ds.format.decode(&cur))
+                {
+                    continue;
+                }
+                if d.depth.write {
+                    g.write(at, &new[..bpp])
+                        .map_err(|f| format!("depth write: {f:?}"))?;
+                }
+            }
             // Outputs: enabled components of target 0 in r0, r1, ...
             let mut color = [0f32; 4];
             let mut next = 0u8;
@@ -456,8 +561,18 @@ fn rasterize(
                     next += 1;
                 }
             }
+            let at = target.byte_addr(x * bpp, y);
+            if d.blend.enabled {
+                let mut cur = vec![0u8; bpp as usize];
+                g.read(at, &mut cur)
+                    .map_err(|f| format!("blend read: {f:?}"))?;
+                let unorm = target.format != crate::surface::ColorFormat::Rgba32Float;
+                color = d
+                    .blend
+                    .apply(color, target.format.decode(&cur), d.blend_constant, unorm);
+            }
             let pixel = target.format.encode(color);
-            g.write(target.byte_addr(x * bpp, y), &pixel)
+            g.write(at, &pixel)
                 .map_err(|f| format!("color write: {f:?}"))?;
         }
     }
@@ -600,6 +715,10 @@ mod raster_tests {
                     x1: 16,
                     y1: 16,
                 },
+                textures: Default::default(),
+                depth: Default::default(),
+                blend: Default::default(),
+                blend_constant: [0.0; 4],
             };
             draw_software(&mut g, &d).unwrap();
             let mut px = vec![0u8; 1024];

@@ -17,8 +17,10 @@ pub mod blocklinear;
 pub mod draw;
 pub mod engines;
 pub mod mmu;
+pub mod pipeline;
 pub mod shader;
 pub mod surface;
+pub mod texture;
 
 use emu_memory::Memory;
 use engines::{copy::CopyEngine, inline::InlineToMemory, maxwell3d::Maxwell3D, EngineCtx};
