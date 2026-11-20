@@ -312,11 +312,25 @@ pub fn run_program_presenting(
     if let Program::Application(_, _, Some(romfs)) = program {
         hos.config.romfs = Some(romfs.clone());
     }
-    match program {
+    if let Program::Application(modules, npdm, _) = program {
+        if let Some(n) = npdm {
+            eprintln!(
+                "[emu-run] program {:016X} \"{}\", main thread priority {}, stack {:#x}",
+                n.program_id,
+                n.name(),
+                n.main_thread_priority,
+                n.main_stack_size
+            );
+        }
+        let total: usize = modules.iter().map(|m| m.image.len()).sum();
+        eprintln!("[emu-run] {} modules, {:#x} bytes", modules.len(), total);
+    }
+    let result = match program {
         Program::Homebrew(nro) => hos.boot_homebrew(nro),
         Program::Application(modules, npdm, _) => hos.boot_application(modules, npdm.as_ref()),
-    }
-    .map_err(RunError::Load)?;
+    };
+    result.map_err(RunError::Load)?;
+    eprintln!("[emu-run] booted; running");
     let stop = hos.run(max_steps);
     Ok(HomebrewResult {
         stop,

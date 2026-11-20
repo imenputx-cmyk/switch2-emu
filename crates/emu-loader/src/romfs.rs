@@ -35,7 +35,10 @@ fn hash_table_count(n: usize) -> usize {
         return n | 1;
     }
     let mut count = n;
-    while [2, 3, 5, 7, 11, 13, 17].iter().any(|p| count.is_multiple_of(*p)) {
+    while [2, 3, 5, 7, 11, 13, 17]
+        .iter()
+        .any(|p| count.is_multiple_of(*p))
+    {
         count += 1;
     }
     count

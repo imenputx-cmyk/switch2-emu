@@ -3,6 +3,23 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 fn main() -> ExitCode {
+    // Run on a thread with a large stack (Windows gives the main thread
+    // 1 MiB), and report how it ended even if it panics.
+    let worker = std::thread::Builder::new()
+        .name("emu".into())
+        .stack_size(256 << 20)
+        .spawn(real_main)
+        .expect("thread");
+    match worker.join() {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("[emu-run] the emulator crashed (panic above)");
+            ExitCode::from(101)
+        }
+    }
+}
+
+fn real_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let trace = args.iter().any(|a| a == "--trace-svc");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
