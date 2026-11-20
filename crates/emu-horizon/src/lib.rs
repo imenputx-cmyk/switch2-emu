@@ -1244,7 +1244,10 @@ impl Horizon {
                 });
             }
         };
-        let out = ipc::write_reply(&reply, is_domain && req.kind != ipc::TYPE_CONTROL);
+        // Control requests (with or without context) are answered on the
+        // session itself, never as domain messages.
+        let control = matches!(req.kind, ipc::TYPE_CONTROL | ipc::TYPE_CONTROL_WITH_CONTEXT);
+        let out = ipc::write_reply(&reply, is_domain && !control);
         self.mem.write(tls, &out).expect("TLS is mapped");
         self.ret(SUCCESS);
         Ok(())
@@ -1254,6 +1257,11 @@ impl Horizon {
     /// messages).
     fn control(&mut self, id: usize, req: &ipc::Request) -> Result<ipc::Reply, Stop> {
         let mut reply = ipc::Reply::default();
+        if self.recent_ipc.len() == 12 {
+            self.recent_ipc.pop_front();
+        }
+        let name = format!("{} (control)", self.sessions[id].object.borrow().name());
+        self.recent_ipc.push_back((name, req.command, 0));
         match req.command {
             0 => {
                 // ConvertCurrentObjectToDomain: the object becomes id 1.
