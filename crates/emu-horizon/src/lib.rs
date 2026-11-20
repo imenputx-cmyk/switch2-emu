@@ -590,6 +590,10 @@ impl Horizon {
             }
             match self.run_cpu(budget.min(threads::TIME_SLICE)) {
                 None => {
+                    // GPU channels waiting on a semaphore the CPU releases.
+                    if self.system.gpu.has_stalled() {
+                        self.system.gpu.poll(&mut self.mem);
+                    }
                     let pc = self.cpu.pc();
                     if self.mem.read_uint(pc, 4) == Ok(0x1400_0000) && self.threads.len() == 1 {
                         return Stop::Halted { pc };

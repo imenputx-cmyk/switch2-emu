@@ -338,15 +338,19 @@ pub fn channel(ch: usize, kind: u32, nr: u32, data: &mut [u8], extra: &[u8], ctx
             }
             let entries: Vec<u64> = (0..count).map(|i| u64_at(src, 8 * i)).collect();
             ctx.system.gpu.trace = ctx.config.trace_unimplemented;
-            let (id, mut value) = ctx.system.gpu.submit(ch, &entries, flags, ctx.mem);
-            // INCREMENT_VALUE (bit 8, Switch 2): raise the syncpoint by the
-            // fence value given. NVN2 signals completion only through
-            // semaphores, so the increments are ours to do (Lichii row 32).
-            if flags & 0x100 != 0 {
-                let sp = &mut ctx.system.gpu.syncpoints[id as usize];
-                *sp = sp.wrapping_add(u32_at(data, 20));
-                value = *sp;
-            }
+            // INCREMENT_VALUE (bit 8, Switch 2): the syncpoint rises by the
+            // given fence value once the work is done. NVN2 signals
+            // completion only through semaphores, so the increments are
+            // ours to do (Lichii row 32).
+            let increment = if flags & 0x100 != 0 {
+                u32_at(data, 20)
+            } else {
+                0
+            };
+            let (id, value) = ctx
+                .system
+                .gpu
+                .submit_with_increment(ch, &entries, flags, increment, ctx.mem);
             for f in ctx.system.gpu.faults.drain(..) {
                 if ctx.config.trace_unimplemented {
                     eprintln!("[gpu] fault: {f}");

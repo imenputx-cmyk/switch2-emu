@@ -101,6 +101,24 @@ struct HostState {
     syncpoint_payload: u32,
 }
 
+/// Queued work on a channel.
+#[derive(Debug, Clone, Copy)]
+enum Work {
+    /// Command words at a GPU address.
+    Words { va: u64, words: usize },
+    /// Raise the channel's syncpoint (a fence) once the work before is done.
+    Increment(u32),
+}
+
+/// A semaphore acquire the channel waits on.
+#[derive(Debug, Clone, Copy)]
+struct Acquire {
+    va: u64,
+    value: u32,
+    /// SEMAPHORED operation: 1 equal, 4 greater or equal, 8 mask.
+    op: u32,
+}
+
 pub struct Channel {
     pub address_space: Option<usize>,
     /// The syncpoint this channel's fences use.
@@ -108,6 +126,13 @@ pub struct Channel {
     subchannels: [Option<Engine>; 8],
     pending: Option<Pending>,
     host: HostState,
+    /// Work not run yet (behind an unmet semaphore acquire).
+    queue: std::collections::VecDeque<Work>,
+    stalled: Option<Acquire>,
+    /// A Switch 2 (Ampere) class was bound: semaphore acquires wait.
+    ampere: bool,
+    /// Host (GPFIFO class) method values, by method index.
+    host_regs: [u32; 0x40],
 }
 
 pub struct Gpu {
@@ -161,42 +186,129 @@ impl Gpu {
             subchannels: Default::default(),
             pending: None,
             host: HostState::default(),
+            queue: Default::default(),
+            stalled: None,
+            ampere: false,
+            host_regs: [0; 0x40],
         });
         id
     }
 
-    /// Processes GPFIFO entries on a channel. Returns the channel's
-    /// syncpoint id and its value afterwards.
-    pub fn submit(
-        &mut self,
-        channel: usize,
-        entries: &[u64],
-        flags: u32,
-        mem: &mut Memory,
-    ) -> (u32, u32) {
-        for &entry in entries {
-            // Entry: address bits 31:2 in the low word, 39:32 in bits
-            // 7:0 of the high word; length in words in bits 30:10.
-            let va = (entry & 0xFFFF_FFFC) | ((entry >> 32) & 0xFF) << 32;
-            let words = ((entry >> 42) & 0x1F_FFFF) as usize;
-            if words == 0 {
-                continue; // control entry (NOP etc.)
+    /// Whether a channel waits on a semaphore acquire.
+    pub fn has_stalled(&self) -> bool {
+        self.channels.iter().any(|c| c.stalled.is_some())
+    }
+
+    /// Runs channels whose semaphore acquire is met by now (the CPU or
+    /// another channel released it). Returns whether any made progress.
+    pub fn poll(&mut self, mem: &mut Memory) -> bool {
+        let mut progress = false;
+        for c in 0..self.channels.len() {
+            if self.channels[c].stalled.is_some() && self.acquire_met(c, mem) {
+                self.pump(c, mem);
+                progress = true;
             }
+        }
+        progress
+    }
+
+    fn acquire_met(&self, channel: usize, mem: &Memory) -> bool {
+        let ch = &self.channels[channel];
+        let (Some(a), Some(asid)) = (ch.stalled, ch.address_space) else {
+            return true;
+        };
+        let mut b = [0u8; 4];
+        if self.address_spaces[asid].read(mem, a.va, &mut b).is_err() {
+            return true; // nothing to wait on
+        }
+        let word = u32::from_le_bytes(b);
+        match a.op {
+            1 => word == a.value,
+            4 => word >= a.value,
+            8 => word & a.value != 0,
+            _ => true,
+        }
+    }
+
+    /// Runs queued work on a channel until it is empty or an acquire is
+    /// not met.
+    fn pump(&mut self, channel: usize, mem: &mut Memory) {
+        loop {
+            if self.channels[channel].stalled.is_some() {
+                if !self.acquire_met(channel, mem) {
+                    return;
+                }
+                self.channels[channel].stalled = None;
+            }
+            let Some(work) = self.channels[channel].queue.pop_front() else {
+                return;
+            };
+            let (va, words) = match work {
+                Work::Increment(n) => {
+                    let sp = self.channels[channel].syncpoint as usize;
+                    self.syncpoints[sp] = self.syncpoints[sp].wrapping_add(n);
+                    continue;
+                }
+                Work::Words { va, words } => (va, words),
+            };
             let Some(asid) = self.channels[channel].address_space else {
                 self.faults
                     .push("submit on a channel without an address space".into());
-                break;
+                self.channels[channel].queue.clear();
+                return;
             };
+            // Read when run, not when submitted: NVN2 writes the commands
+            // behind an acquire after submitting them.
             let mut raw = vec![0u8; words * 4];
             if let Err(f) = self.address_spaces[asid].read(mem, va, &mut raw) {
                 self.faults
                     .push(format!("pushbuffer fetch at {va:#x}: {f:?}"));
                 continue;
             }
-            for w in raw.chunks_exact(4) {
+            for (i, w) in raw.chunks_exact(4).enumerate() {
                 self.process_word(channel, u32::from_le_bytes(w.try_into().unwrap()), mem);
+                if self.channels[channel].stalled.is_some() && i + 1 < words {
+                    // Resume after this word; the method in progress (if
+                    // any) stays pending.
+                    self.channels[channel].queue.push_front(Work::Words {
+                        va: va + 4 * (i as u64 + 1),
+                        words: words - i - 1,
+                    });
+                    break;
+                }
             }
         }
+    }
+
+    /// Queues GPFIFO entries on a channel and runs them (all of them,
+    /// unless a semaphore acquire is not met yet). `increment` raises the
+    /// syncpoint after the work (FENCE_INCREMENT adds one more). Returns
+    /// the channel's syncpoint id and the value it reaches once the work
+    /// is done.
+    pub fn submit_with_increment(
+        &mut self,
+        channel: usize,
+        entries: &[u64],
+        flags: u32,
+        increment: u32,
+        mem: &mut Memory,
+    ) -> (u32, u32) {
+        let ch = &mut self.channels[channel];
+        for &entry in entries {
+            // Entry: address bits 31:2 in the low word, 39:32 in bits
+            // 7:0 of the high word; length in words in bits 30:10.
+            let va = (entry & 0xFFFF_FFFC) | ((entry >> 32) & 0xFF) << 32;
+            let words = ((entry >> 42) & 0x1F_FFFF) as usize;
+            if words != 0 {
+                ch.queue.push_back(Work::Words { va, words });
+            } // else a control entry (NOP etc.)
+        }
+        let increment =
+            increment.wrapping_add(u32::from(flags & submit_flags::FENCE_INCREMENT != 0));
+        if increment != 0 {
+            ch.queue.push_back(Work::Increment(increment));
+        }
+        self.pump(channel, mem);
         // Results must be in memory before the fence signals.
         if let Some(asid) = self.channels[channel].address_space {
             let mut g = backend::GuestMemory {
@@ -209,11 +321,28 @@ impl Gpu {
                     .push(format!("{} backend: {e}", self.backend.name()));
             }
         }
-        let sp = self.channels[channel].syncpoint as usize;
-        if flags & submit_flags::FENCE_INCREMENT != 0 {
-            self.syncpoints[sp] = self.syncpoints[sp].wrapping_add(1);
-        }
-        (sp as u32, self.syncpoints[sp])
+        let ch = &self.channels[channel];
+        let sp = ch.syncpoint as usize;
+        let queued: u32 = ch
+            .queue
+            .iter()
+            .map(|w| match w {
+                Work::Increment(n) => *n,
+                Work::Words { .. } => 0,
+            })
+            .fold(0, u32::wrapping_add);
+        (sp as u32, self.syncpoints[sp].wrapping_add(queued))
+    }
+
+    /// [`Gpu::submit_with_increment`] without an extra increment.
+    pub fn submit(
+        &mut self,
+        channel: usize,
+        entries: &[u64],
+        flags: u32,
+        mem: &mut Memory,
+    ) -> (u32, u32) {
+        self.submit_with_increment(channel, entries, flags, 0, mem)
     }
 
     fn process_word(&mut self, channel: usize, word: u32, mem: &mut Memory) {
@@ -327,10 +456,16 @@ impl Gpu {
         mem: &mut Memory,
     ) {
         let ch = &mut self.channels[channel];
+        if let Some(r) = ch.host_regs.get_mut(method as usize) {
+            *r = value;
+        }
         match method * 4 {
             // SET_OBJECT: bind a class to the subchannel.
             0x00 => {
                 let class = value & 0xFFFF;
+                if class >> 8 >= 0xC5 {
+                    ch.ampere = true; // Ampere-era classes (C5xx and later)
+                }
                 if ch.subchannels[subchannel].as_ref().map(Engine::class) != Some(class) {
                     ch.subchannels[subchannel] = Some(Engine::new(class));
                 }
@@ -360,7 +495,40 @@ impl Gpu {
                         }
                     }
                 }
-                // Acquires are always satisfied: work is synchronous.
+                // Acquires: on Switch 2 the CPU releases them once it has
+                // written the commands that follow, so the channel waits
+                // (Lichii NX2_NOTES row 50). Elsewhere work is synchronous
+                // and they count as met.
+                let op = value & 0xF;
+                if ch.ampere && matches!(op, 1 | 4 | 8) {
+                    ch.stalled = Some(Acquire {
+                        va: ch.host.semaphore_va,
+                        value: ch.host.semaphore_payload,
+                        op,
+                    });
+                }
+            }
+            // Ampere SEM_ADDR_LO/HI, SEM_PAYLOAD_LO/HI, SEM_EXECUTE.
+            0x5C | 0x60 | 0x64 | 0x68 => {}
+            0x6C => {
+                // Release (operation 1) writes the payload, 8 bytes with
+                // PAYLOAD_SIZE (bit 24). Acquires do not wait here, as in
+                // Lichii's ProcessSemaphoreExecute.
+                if value & 7 == 1 {
+                    let regs = &ch.host_regs;
+                    let va = (u64::from(regs[0x60 / 4] & 0x1FF_FFFF) << 32)
+                        | u64::from(regs[0x5C / 4] & !3);
+                    let mut data = regs[0x64 / 4].to_le_bytes().to_vec();
+                    if value & (1 << 24) != 0 {
+                        data.extend_from_slice(&regs[0x68 / 4].to_le_bytes());
+                    }
+                    if let Some(asid) = ch.address_space {
+                        if let Err(f) = self.address_spaces[asid].write(mem, va, &data) {
+                            self.faults
+                                .push(format!("semaphore release at {va:#x}: {f:?}"));
+                        }
+                    }
+                }
             }
             0x70 => ch.host.syncpoint_payload = value,
             // SYNCPOINTB: operation 1:0 (1 = increment), index 15:8.
@@ -510,5 +678,53 @@ mod tests {
         assert_eq!(e.reg(0x0d80), 42);
         assert_eq!(e.data_ram[3], 0xABCD);
         assert_eq!(e.macro_calls, 1);
+    }
+
+    #[test]
+    fn switch2_acquire_waits_for_the_cpu() {
+        let (mut gpu, mut mem) = setup();
+        // Bind Ampere 3D; acquire (GEQ 1) on 0x1000_8000, which holds 0;
+        // then write a 3D register and release 7 via SEM_EXECUTE.
+        let words = [
+            incr(0, 0, 1),
+            class::AMPERE_THREED,
+            incr(0, 0x10, 4),
+            0,
+            0x1000_8000,
+            1,
+            4, // acquire >=
+            incr(0, 0x0d80, 1),
+            5,
+            incr(0, 0x5C, 3),
+            0x1000_8010,
+            0,
+            7,
+            incr(0, 0x6C, 1),
+            1, // release, 4 bytes
+        ];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write(0x100_0000, &bytes).unwrap();
+        let entry = 0x1000_0000u64 | ((words.len() as u64) << 42);
+        let sp = gpu.channels[0].syncpoint as usize;
+        let (_, fence) = gpu.submit(0, &[entry], submit_flags::FENCE_INCREMENT, &mut mem);
+        assert!(gpu.faults.is_empty(), "{:?}", gpu.faults);
+        assert!(gpu.has_stalled());
+        assert_eq!(fence, 1);
+        assert_eq!(gpu.syncpoints[sp], 0);
+        let reg = |gpu: &Gpu| match &gpu.channels[0].subchannels[0] {
+            Some(Engine::ThreeD(e)) => e.reg(0x0d80),
+            _ => panic!(),
+        };
+        assert_eq!(reg(&gpu), 0);
+        assert!(!gpu.poll(&mut mem));
+        // The CPU releases the semaphore.
+        mem.write(0x100_8000, &1u32.to_le_bytes()).unwrap();
+        assert!(gpu.poll(&mut mem));
+        assert!(!gpu.has_stalled());
+        assert_eq!(reg(&gpu), 5);
+        assert_eq!(gpu.syncpoints[sp], 1);
+        let mut b = [0u8; 4];
+        mem.read(0x100_8010, &mut b).unwrap();
+        assert_eq!(u32::from_le_bytes(b), 7);
     }
 }
