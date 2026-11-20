@@ -25,8 +25,8 @@ use emu_loader::LoadError;
 use emu_memory::{Memory, Perm};
 use handles::{HandleTable, KObject, CURRENT_PROCESS};
 use memmap::{
-    Block, MemState, MemoryMap, ATTR_GPU_ACCESSIBLE, ATTR_LOCKED, ATTR_UNCACHED, PERM_R, PERM_W,
-    PERM_X,
+    Block, MemState, MemoryMap, ATTR_GPU_ACCESSIBLE, ATTR_LOCKED, ATTR_PERMISSION_LOCKED,
+    ATTR_UNCACHED, PERM_R, PERM_W, PERM_X,
 };
 use result::*;
 
@@ -945,11 +945,25 @@ impl Horizon {
         if let Some(err) = Self::page_range_ok(addr, size) {
             return self.ret(err);
         }
-        // Only the Uncached attribute can be changed from user mode.
-        if (mask | value) & !ATTR_UNCACHED != 0 || value & !mask != 0 {
+        // User mode may change Uncached and (firmware 17+) set, but never
+        // clear, PermissionLocked (mesosphere svc_memory.cpp).
+        if (mask | value) & !(ATTR_UNCACHED | ATTR_PERMISSION_LOCKED) != 0
+            || value & !mask != 0
+            || (mask & ATTR_PERMISSION_LOCKED) != (value & ATTR_PERMISSION_LOCKED)
+        {
             return self.ret(INVALID_COMBINATION);
         }
-        if !self.map.all(addr, size, |b| b.state == MemState::Heap) {
+        let lock = mask & ATTR_PERMISSION_LOCKED != 0;
+        if !self.map.all(addr, size, |b| {
+            if lock {
+                matches!(
+                    b.state,
+                    MemState::Heap | MemState::CodeStatic | MemState::CodeMutable
+                )
+            } else {
+                b.state == MemState::Heap
+            }
+        }) {
             return self.ret(INVALID_MEMORY_STATE);
         }
         self.map
