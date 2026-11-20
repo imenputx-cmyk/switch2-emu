@@ -900,10 +900,12 @@ impl Horizon {
         if !matches!(perm, 0 | PERM_R | 3) {
             return self.ret(INVALID_MEMORY_PERMISSIONS);
         }
-        if !self
-            .map
-            .all(addr, size, |b| b.state == MemState::Heap && b.attr == 0)
-        {
+        // States that can be reprotected: heap and module data (CodeData;
+        // the SDK makes its relocated read-only data read-only after
+        // relocation).
+        if !self.map.all(addr, size, |b| {
+            matches!(b.state, MemState::Heap | MemState::CodeMutable) && b.attr == 0
+        }) {
             return self.ret(INVALID_MEMORY_STATE);
         }
         self.map.update(addr, size, |b| b.perm = perm);
