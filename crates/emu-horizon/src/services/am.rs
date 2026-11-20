@@ -81,6 +81,9 @@ pub mod message {
 pub struct CommonStateGetter {
     message_event: Option<usize>,
     messages: std::collections::VecDeque<u32>,
+    sleep_lock_event: Option<usize>,
+    resolution_event: Option<usize>,
+    hdcp_event: Option<usize>,
 }
 
 impl Default for CommonStateGetter {
@@ -88,6 +91,9 @@ impl Default for CommonStateGetter {
         CommonStateGetter {
             message_event: None,
             messages: [message::FOCUS_STATE_CHANGED].into(),
+            sleep_lock_event: None,
+            resolution_event: None,
+            hdcp_event: None,
         }
     }
 }
@@ -118,13 +124,37 @@ impl Service for CommonStateGetter {
             }
             5 => ctx.push_u8(0),  // GetOperationMode: handheld
             6 => ctx.push_u32(0), // GetPerformanceMode: normal
+            8 => ctx.push_u8(0),  // GetBootMode: normal
             9 => ctx.push_u8(1),  // GetCurrentFocusState: in focus
+            // Sleep locks, VR mode, LCD backlight, home button handling,
+            // startup logo and next-program exit requests: accepted.
+            10..=12 | 51..=54 | 80 | 100 | 130 | 900 => {}
+            13 => ctx.push_event(&mut self.sleep_lock_event, true),
+            50 => ctx.push_u8(0), // IsVrModeEnabled
+            55 => ctx.push_u8(0), // IsInControllerFirmwareUpdateSection
             // GetDefaultDisplayResolution: handheld 1280x720.
             60 => {
                 ctx.push_u32(1280);
                 ctx.push_u32(720);
             }
-            66 => {} // SetCpuBoostMode
+            61 => ctx.push_event(&mut self.resolution_event, false),
+            62 => ctx.push_u32(1), // GetHdcpAuthenticationState: authenticated
+            63 => ctx.push_event(&mut self.hdcp_event, false),
+            66 => {}                // SetCpuBoostMode
+            68 => ctx.push_u32(0),  // GetBuiltInDisplayType
+            120 => ctx.push_u32(0), // GetAppletLaunchedHistory: none
+            200 => ctx.push_u32(0), // GetOperationModeSystemInfo
+            300 => ctx.push_u32(1), // GetSettingsPlatformRegion: global
+            // GetPanelPhysicalSizeForSpecificTitle (mm) and
+            // GetPanelResolutionForSpecificTitle, as Lichii reports them.
+            1004 => {
+                ctx.push_u32(137.25f32.to_bits());
+                ctx.push_u32(77.2f32.to_bits());
+            }
+            1005 => {
+                ctx.push_u32(1280);
+                ctx.push_u32(720);
+            }
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())
@@ -147,7 +177,15 @@ impl Service for SelfController {
             // Set{OperationMode,PerformanceMode}ChangedNotification,
             // SetFocusHandlingMode, SetRestartMessageEnabled,
             // SetOutOfFocusSuspendingEnabled: accepted.
-            1 | 2 | 10 | 11 | 12 | 13 | 14 | 16 => {}
+            // Exit locks, fatal sections, screenshot and notification
+            // settings, display approval, sleep/dimming, idle detection,
+            // input detection, album and recording options: accepted.
+            1..=4 | 10..=16 | 19 | 50 | 51 | 60..=62 | 65 | 68 | 72 | 100 | 130 => {}
+            41 => ctx.push_u8(0),  // IsSystemBufferSharingEnabled: no
+            63 => ctx.push_u32(0), // GetIdleTimeDetectionExtension
+            67 => ctx.push_u8(0),  // IsIlluminanceAvailable
+            69 => ctx.push_u8(0),  // IsAutoSleepDisabled
+            90 => ctx.push_u64(0), // GetAccumulatedSuspendedTickValue
             40 => ctx.push_u64(vi::MANAGED_LAYER_ID), // CreateManagedDisplayLayer
             91 => ctx.push_event(&mut self.suspended_tick_event, false),
             // Switch 2: a raw session to the graphics system server (gsv).
@@ -178,6 +216,10 @@ impl Service for WindowController {
 #[derive(Default)]
 pub struct ApplicationFunctions {
     gpu_error_event: Option<usize>,
+    friend_invitation_event: Option<usize>,
+    notification_event: Option<usize>,
+    health_warning_event: Option<usize>,
+    operation_mode_refresh_event: Option<usize>,
 }
 
 impl Service for ApplicationFunctions {
@@ -198,8 +240,33 @@ impl Service for ApplicationFunctions {
             50 => ctx.push_bytes(b"switch2-emu-dev\0"),
             // GetGpuErrorDetectedSystemEvent: never signalled.
             130 => ctx.push_event(&mut self.gpu_error_event, false),
+            // GetDisplayVersion: 16 NUL-padded bytes.
+            23 => ctx.push_bytes(b"1.0.0\0\0\0\0\0\0\0\0\0\0\0"),
+            25 => ctx.push_u64(0), // ExtendSaveData: nothing to extend
+            // GetSaveDataSize: (normal, journal).
+            26 => {
+                ctx.push_u64(0);
+                ctx.push_u64(0);
+            }
+            // GetSaveDataSizeMax, GetCacheStorageMax (Lichii's values).
+            28 | 29 => {
+                ctx.push_u64(0xFFF_FFFF);
+                ctx.push_u64(0xFFF_FFFF);
+            }
+            // Home button blocking, media playback state, game play
+            // recording, crash reports, copyright frame buffer, user
+            // channel: accepted.
+            30..=33 | 60 | 66 | 67 | 90 | 100..=102 | 121 | 122 => {}
+            65 => ctx.push_u8(0), // IsGamePlayRecordingSupported
+            // QueryApplicationPlayStatistics(ByUid): no entries.
+            110 | 111 => ctx.push_u32(0),
+            123 => ctx.push_u32(u32::MAX), // GetPreviousProgramIndex: none (-1)
+            140 => ctx.push_event(&mut self.friend_invitation_event, false),
+            150 => ctx.push_event(&mut self.notification_event, false),
+            160 => ctx.push_event(&mut self.health_warning_event, false),
+            210 => ctx.push_event(&mut self.operation_mode_refresh_event, false),
             // Switch 2 (Lichii): empty successes.
-            320 | 321 => {}
+            320 | 321 | 330 => {}
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())
