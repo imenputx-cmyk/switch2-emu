@@ -550,6 +550,7 @@ impl Horizon {
         loop {
             self.expire_timeouts();
             self.vblank();
+            self.audio_frame();
             self.check_syncpoint_waits();
             let n = self.threads.len();
             let next = (1..=n)
@@ -577,7 +578,14 @@ impl Horizon {
             // With vblank events, the next vblank can wake someone.
             let next_vblank = (!self.system.vblank_events.is_empty())
                 .then(|| (self.cpu.counter / VBLANK_PERIOD + 1) * VBLANK_PERIOD);
-            match earliest.into_iter().chain(next_vblank).min() {
+            let next_audio = (!self.system.audio_events.is_empty())
+                .then(|| (self.cpu.counter / AUDIO_PERIOD + 1) * AUDIO_PERIOD);
+            match earliest
+                .into_iter()
+                .chain(next_vblank)
+                .chain(next_audio)
+                .min()
+            {
                 Some(d) => self.cpu.counter = self.cpu.counter.max(d),
                 None => return Err(Stop::Deadlock { pc }),
             }
@@ -593,6 +601,19 @@ impl Horizon {
         }
         self.last_vblank = due;
         for &e in &self.system.vblank_events {
+            self.kobjects.events[e] = true;
+        }
+        self.recheck_sync_waiters();
+    }
+
+    /// Signals the audio renderers' events once per audio frame.
+    fn audio_frame(&mut self) {
+        let due = self.cpu.counter / AUDIO_PERIOD;
+        if due <= self.last_audio_frame || self.system.audio_events.is_empty() {
+            return;
+        }
+        self.last_audio_frame = due;
+        for &e in &self.system.audio_events {
             self.kobjects.events[e] = true;
         }
         self.recheck_sync_waiters();
@@ -664,3 +685,5 @@ impl Horizon {
 
 /// Guest ticks (19.2 MHz) per vblank at 60 Hz.
 pub const VBLANK_PERIOD: u64 = 19_200_000 / 60;
+/// One audio frame: 5 ms of guest time.
+pub const AUDIO_PERIOD: u64 = 19_200_000 / 200;

@@ -193,6 +193,7 @@ pub struct Horizon {
     last_input_sample: u64,
     /// Guest-time period index of the last vblank.
     last_vblank: u64,
+    last_audio_frame: u64,
     /// MapMemory aliases: destination -> (source, size).
     aliases: Vec<(u64, u64, u64)>,
     /// Text written with svcOutputDebugString.
@@ -247,6 +248,7 @@ impl Horizon {
             yield_requested: false,
             last_input_sample: 0,
             last_vblank: 0,
+            last_audio_frame: 0,
             aliases: Vec::new(),
             debug_output: Vec::new(),
             sessions: Vec::new(),
@@ -611,6 +613,14 @@ impl Horizon {
         }
         for (i, t) in self.threads.iter().enumerate() {
             s += &format!("thread {i}: {:?}", t.state);
+            if t.state == threads::ThreadState::Runnable {
+                let cpu = if i == self.current { &self.cpu } else { &t.cpu };
+                s += &format!(
+                    " at {} (lr {})",
+                    self.locate(cpu.pc()),
+                    self.locate(cpu.read_xzr(30))
+                );
+            }
             if let threads::ThreadState::Waiting {
                 on: threads::WaitOn::Sync(handles),
                 ..

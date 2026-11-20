@@ -208,8 +208,7 @@ impl Service for AudioRenderer {
             2 => ctx.push_u32(self.params.mixes),
             3 => ctx.push_u32(u32::from(!self.running)), // GetState: 0 started, 1 stopped
             // RequestUpdate(Auto): input buffer -> output and performance
-            // buffers. Each update counts as a rendered frame and wakes
-            // the game's audio thread.
+            // buffers. Each update counts as a rendered frame.
             4 | 10 => {
                 let input = ctx.read_in_buffer(0)?;
                 if self.running {
@@ -220,14 +219,18 @@ impl Service for AudioRenderer {
                 if let Some(b) = ctx.out_buffer(1) {
                     ctx.write_out_buffer(1, &vec![0; b.size as usize])?;
                 }
-                if let Some(e) = self.event {
-                    ctx.kernel.events[e] = true;
-                }
             }
             5 => self.running = true,
             6 => self.running = false,
-            // QuerySystemEvent: signalled once per update; starts so.
-            7 => ctx.push_event(&mut self.event, true),
+            // QuerySystemEvent: the DSP signals it once per audio frame
+            // (5 ms of guest time); starts signalled.
+            7 => {
+                let new = self.event.is_none();
+                ctx.push_event(&mut self.event, true);
+                if let (true, Some(e)) = (new, self.event) {
+                    ctx.system.audio_events.push(e);
+                }
+            }
             8 | 11 | 12 => {} // SetRenderingTimeLimit, ExecuteAudioRendererRendering, SetVoiceDropParameter
             9 => ctx.push_u32(100),
             13 => ctx.push_u32(0), // GetVoiceDropParameter
@@ -346,9 +349,6 @@ impl Service for AudioOut {
             // AppendAudioOutBuffer(Auto)(tag; buffer).
             3 | 7 => {
                 self.released.push(ctx.in_u64(0));
-                if let Some(e) = self.event {
-                    ctx.kernel.events[e] = true;
-                }
             }
             4 => ctx.push_event(&mut self.event, false), // RegisterBufferEvent
             // GetReleasedAudioOutBuffers(Auto): tags into the buffer.

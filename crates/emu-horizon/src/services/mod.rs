@@ -105,6 +105,9 @@ pub struct System {
     pub frames_presented: u64,
     /// Events signalled every emulated vblank (60 Hz of guest time).
     pub vblank_events: Vec<usize>,
+    /// Events signalled every audio frame (5 ms of guest time): the audio
+    /// renderers' system events.
+    pub audio_events: Vec<usize>,
     /// Switch 2 GPU memory (nx2:gpu and its sub-sessions share it).
     pub nx2_gpu: nx2::GpuMemory,
     /// nx2:syncpt slot requests: (syncpoint, value, event) signalled
