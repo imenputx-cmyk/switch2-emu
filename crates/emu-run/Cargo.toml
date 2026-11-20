@@ -13,6 +13,7 @@ emu-horizon = { path = "../emu-horizon" }
 emu-gpu-vk = { path = "../emu-gpu-vk" }
 png = "0.17"
 minifb = { version = "0.28", optional = true }
+ctrlc = "3"
 
 [features]
 # Show presented frames in a window (minifb). Off by default so headless

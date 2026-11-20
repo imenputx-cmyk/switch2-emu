@@ -3,6 +3,14 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 fn main() -> ExitCode {
+    // Ctrl+C stops the emulation cleanly, reporting where it was.
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = emu_run::INTERRUPT.set(flag.clone());
+    let _ = ctrlc::set_handler(move || {
+        if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            std::process::exit(130); // a second Ctrl+C: quit at once
+        }
+    });
     // Run on a thread with a large stack (Windows gives the main thread
     // 1 MiB), and report how it ended even if it panics.
     let worker = std::thread::Builder::new()

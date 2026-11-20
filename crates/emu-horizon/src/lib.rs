@@ -103,6 +103,8 @@ pub enum Stop {
     /// The CPU stopped (fault, undefined instruction, BRK, ...).
     Cpu(Exit),
     StepLimit,
+    /// The host interrupted the emulation (Ctrl+C).
+    Interrupted,
 }
 
 /// Values of the homebrew loader config (https://switchbrew.org/wiki/Homebrew_ABI).
@@ -133,6 +135,14 @@ pub struct Horizon {
     pub program_id: u64,
     /// Commands answered by the auto stub, with counts.
     pub stubbed: std::collections::HashMap<(String, u32), u64>,
+    /// Set by the host to stop the emulation (checked between slices).
+    pub interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Print a status line every few seconds.
+    pub heartbeat: bool,
+    /// Loaded modules: (base, size).
+    pub modules: Vec<(u64, u64)>,
+    /// The last SVCs: (id, pc).
+    pub recent_svcs: std::collections::VecDeque<(u16, u64)>,
     pub mem: Memory,
     pub cpu: Cpu,
     pub map: MemoryMap,
@@ -175,6 +185,10 @@ impl Horizon {
         Horizon {
             program_id: 0x0100_0000_0000_1000,
             stubbed: Default::default(),
+            interrupt: None,
+            heartbeat: false,
+            modules: Vec::new(),
+            recent_svcs: Default::default(),
             mem: Memory::new(),
             cpu: Cpu::new(),
             map: MemoryMap::new(),
@@ -389,6 +403,7 @@ impl Horizon {
             self.mem
                 .write_privileged(base, &m.image)
                 .map_err(|e| LoadError::Memory(format!("{e:?}")))?;
+            self.modules.push((base, size));
             base += size.next_multiple_of(PAGE);
         }
         let stack_top = self.create_main_thread(priority);
@@ -404,9 +419,62 @@ impl Horizon {
     }
 
     /// Runs until the process stops or `max_steps` instructions ran.
+    /// Where an address is: "module N + offset" or the raw address.
+    pub fn locate(&self, addr: u64) -> String {
+        match self
+            .modules
+            .iter()
+            .position(|&(b, s)| (b..b + s).contains(&addr))
+        {
+            Some(i) => format!("{addr:#x} (module {i} + {:#x})", addr - self.modules[i].0),
+            None => format!("{addr:#x}"),
+        }
+    }
+
+    /// A summary of where the emulation is: PC, threads, recent SVCs.
+    pub fn status(&self) -> String {
+        let mut s = format!(
+            "{} instructions; thread {} at pc {}, lr {}",
+            self.cpu.counter,
+            self.current,
+            self.locate(self.cpu.pc()),
+            self.locate(self.cpu.read_xzr(30))
+        );
+        let waiting = self
+            .threads
+            .iter()
+            .filter(|t| matches!(t.state, threads::ThreadState::Waiting { .. }))
+            .count();
+        s += &format!("; {} threads ({waiting} waiting)", self.threads.len());
+        if !self.recent_svcs.is_empty() {
+            s += "; recent SVCs:";
+            for (id, pc) in &self.recent_svcs {
+                s += &format!(" {id:#x}@{pc:#x}");
+            }
+        }
+        s
+    }
+
     pub fn run(&mut self, max_steps: u64) -> Stop {
         let start = self.cpu.counter;
+        let mut last_beat = std::time::Instant::now();
+        let mut last_count = self.cpu.counter;
         loop {
+            if self
+                .interrupt
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Stop::Interrupted;
+            }
+            if self.heartbeat && last_beat.elapsed().as_secs() >= 5 {
+                let mips = (self.cpu.counter - last_count) as f64
+                    / last_beat.elapsed().as_secs_f64()
+                    / 1e6;
+                eprintln!("[emu] {mips:.1} MIPS; {}", self.status());
+                last_beat = std::time::Instant::now();
+                last_count = self.cpu.counter;
+            }
             let budget = max_steps.saturating_sub(self.cpu.counter - start);
             if budget == 0 {
                 return Stop::StepLimit;
@@ -468,6 +536,10 @@ impl Horizon {
     /// Dispatches one SVC. Arguments and results follow
     /// https://switchbrew.org/wiki/SVC (W0 holds the result code).
     fn svc(&mut self, id: u16) -> Result<(), Stop> {
+        if self.recent_svcs.len() == 8 {
+            self.recent_svcs.pop_front();
+        }
+        self.recent_svcs.push_back((id, self.cpu.pc()));
         if self.trace_svcs {
             eprintln!(
                 "[svc] 0x{id:02X} x0={:#x} x1={:#x} x2={:#x}",

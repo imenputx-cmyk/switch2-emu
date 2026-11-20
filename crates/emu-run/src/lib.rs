@@ -155,6 +155,10 @@ pub fn run_nro_with(
     run_nro_presenting(nro, max_steps, trace_svcs, config, None)
 }
 
+/// Set by the host (Ctrl+C) to stop a running program.
+pub static INTERRUPT: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
 /// What to boot on the Horizon HLE kernel.
 pub enum Program {
     /// A homebrew NRO.
@@ -331,7 +335,16 @@ pub fn run_program_presenting(
     };
     result.map_err(RunError::Load)?;
     eprintln!("[emu-run] booted; running");
+    hos.interrupt = INTERRUPT.get().cloned();
+    hos.heartbeat = matches!(program, Program::Application(..));
     let stop = hos.run(max_steps);
+    if !matches!(
+        stop,
+        emu_horizon::Stop::ReturnedToLoader(_) | emu_horizon::Stop::ExitProcess
+    ) {
+        eprintln!("[emu-run] stopped: {stop:?}");
+        eprintln!("[emu-run] at: {}", hos.status());
+    }
     Ok(HomebrewResult {
         stop,
         debug_output: hos.debug_output,
