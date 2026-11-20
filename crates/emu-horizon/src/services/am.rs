@@ -20,7 +20,8 @@ impl Service for AppletOE {
 
     fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
         match command {
-            0 => ctx.push_object(obj(ApplicationProxy)), // OpenApplicationProxy
+            // OpenApplicationProxy; 10 is the Switch 2 form (Lichii).
+            0 | 10 => ctx.push_object(obj(ApplicationProxy)),
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())

@@ -194,7 +194,9 @@ impl Horizon {
         if prio > 0x3F {
             return self.ret(INVALID_PRIORITY);
         }
-        if !(-2..=3).contains(&core) {
+        // Switch 2 programs use six cores (0-5); one host thread runs
+        // them all here, so any of them is accepted.
+        if !(-2..=5).contains(&core) {
             return self.ret(INVALID_CORE_ID);
         }
         if self

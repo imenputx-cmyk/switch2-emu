@@ -87,6 +87,7 @@ cargo run --release -p emu-run -- --keys=prod.keys game.nsp  # an application (N
 - [envytools](https://github.com/envytools/envytools) (MIT): the macro (MME) and Maxwell shader instruction encodings, from its disassembler tables (envydis) and macro simulator. The shader program header follows NVIDIA's [Shader Program Header specification](https://github.com/NVIDIA/open-gpu-doc/tree/master/Shader-Program-Header) (MIT).
 - Ryujinx (MIT) and yuzu: overall structure of a kernel HLE. Only used as background; no code is copied.
 - [oboromi](https://github.com/0xNikilite/oboromi) (GPL-3.0): an architectural reference for how a Switch 2 emulator can be organized (multi-core CPU manager, HIPC/service layer, SM86 GPU decoding).
+- [Lichii](https://github.com/zortos293/lichii) (GPL-3.0-or-later, an Eden-NX2 fork): its `NX2_NOTES.md` records, blocker by blocker, what Switch 2 titles need while booting (ARMv8.3-8.5 instructions, new `svcGetInfo` ids, six cores, Switch 2 service commands, the gsv/NvRm/NVN2 graphics stack); followed here in the same order.
 - [Eden](https://git.eden-emu.dev/eden-emu/eden) and its NX2 branch (GPL-3.0-or-later, derived from yuzu, GPL-2.0-or-later): Switch 2 specifics (NX2 services, GPU profile, video decoding) and the Switch HLE in general. Code taken from it keeps its copyright notice in the file it lands in.
 
 ## License

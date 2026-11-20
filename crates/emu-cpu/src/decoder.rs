@@ -847,7 +847,196 @@ pub fn decode(insn: u32) -> Instr {
         0b0111 | 0b1111 => decode_simd_fp(insn),
         _ => None,
     };
-    result.unwrap_or(Instr::Unknown(insn))
+    result
+        .or_else(|| decode_v8x(insn))
+        .unwrap_or(Instr::Unknown(insn))
+}
+
+/// ARMv8.3-8.5 instructions Switch 2 programs use, mapped onto simpler
+/// ones (approach from Lichii's NX2 notes, GPL-3.0-or-later: pointer
+/// authentication is the identity and memory tags are always 0, which
+/// is what the hardware does with those features disabled):
+///
+/// - RETAA/RETAB, BRAA/BRAB(Z), BLRAA/BLRAB(Z): plain RET/BR/BLR.
+/// - PAC*/AUT*/XPAC* (data processing, 1 source): no-ops.
+/// - PACGA: the code is 0.
+/// - LDRAA/LDRAB: a 64-bit load with a scaled 10-bit offset.
+/// - LDAPUR/STLUR (RCpc, unscaled): plain unscaled loads/stores.
+/// - MTE: IRG/ADDG/SUBG as additions, GMI as ORR, STG/ST2G as no-ops
+///   (their writeback as an addition), STZG as a zero store pair, STGP
+///   as a store pair, LDG clears the tag bits.
+fn decode_v8x(insn: u32) -> Option<Instr> {
+    let rn = reg(insn, 5);
+    let rd = reg(insn, 0);
+    // Pointer-authenticated branches.
+    match insn & 0xFEFF_F800 {
+        0xD61F_0800 => {
+            return Some(Instr::BranchReg {
+                op: BranchRegOp::Br,
+                rn,
+            })
+        }
+        0xD63F_0800 => {
+            return Some(Instr::BranchReg {
+                op: BranchRegOp::Blr,
+                rn,
+            })
+        }
+        _ => {}
+    }
+    if insn & 0xFFFF_FBFF == 0xD65F_0BFF {
+        return Some(Instr::BranchReg {
+            op: BranchRegOp::Ret,
+            rn: 30,
+        });
+    }
+    // PACIA..AUTDZB, XPACI, XPACD.
+    if insn & 0xFFFF_0000 == 0xDAC1_0000 && bits(insn, 15, 10) <= 17 {
+        return Some(Instr::Nop);
+    }
+    // PACGA Xd, Xn, Xm|SP.
+    if insn & 0xFFE0_FC00 == 0x9AC0_3000 {
+        return Some(Instr::MoveWide {
+            sf: true,
+            op: MoveWideOp::Movz,
+            shift: 0,
+            imm16: 0,
+            rd,
+        });
+    }
+    // LDRAA/LDRAB: 11111000 M S 1 imm9 W 1 Rn Rt.
+    if insn & 0xFF20_0400 == 0xF820_0400 {
+        let imm = sign_extend(bits(insn, 22, 22) << 9 | bits(insn, 20, 12), 10) << 3;
+        let mode = if bit(insn, 11) {
+            AddrMode::PreIndex { rn, imm }
+        } else {
+            AddrMode::Offset { rn, imm }
+        };
+        return Some(Instr::LoadStore {
+            simd: false,
+            size: 3,
+            kind: LoadKind::Load,
+            mode,
+            rt: rd,
+        });
+    }
+    // LDAPUR*/STLUR*: size 011001 opc 0 imm9 00 Rn Rt.
+    if insn & 0x3F20_0C00 == 0x1900_0000 {
+        let size = bits(insn, 31, 30) as u8;
+        let kind = match (bits(insn, 23, 22), size) {
+            (0, _) => LoadKind::Store,
+            (1, _) => LoadKind::Load,
+            (2, 0..=2) => LoadKind::LoadSigned64,
+            (3, 0..=1) => LoadKind::LoadSigned32,
+            _ => return None,
+        };
+        let imm = sign_extend(bits(insn, 20, 12), 9);
+        return Some(Instr::LoadStore {
+            simd: false,
+            size,
+            kind,
+            mode: AddrMode::Offset { rn, imm },
+            rt: rd,
+        });
+    }
+    // IRG (Xd|SP = Xn|SP with tag 0) and GMI (Xd = Xm | 1).
+    if insn & 0xFFE0_FC00 == 0x9AC0_1000 {
+        return Some(Instr::AddSubImm {
+            sf: true,
+            sub: false,
+            set_flags: false,
+            imm: 0,
+            rn,
+            rd,
+        });
+    }
+    if insn & 0xFFE0_FC00 == 0x9AC0_1400 {
+        return Some(Instr::LogicalImm {
+            sf: true,
+            op: LogicOp::Orr,
+            imm: 1,
+            rn: reg(insn, 16),
+            rd,
+        });
+    }
+    // ADDG/SUBG: Xd|SP = Xn|SP +/- uimm6 * 16 (the tag offset ignored).
+    if insn & 0xBFC0_C000 == 0x9180_0000 {
+        return Some(Instr::AddSubImm {
+            sf: true,
+            sub: bit(insn, 30),
+            set_flags: false,
+            imm: u64::from(bits(insn, 21, 16)) << 4,
+            rn,
+            rd,
+        });
+    }
+    // STG/STZG/ST2G/STZ2G/LDG: 11011001 opc 1 imm9 op2 Rn Rt.
+    if insn & 0xFF20_0000 == 0xD920_0000 {
+        let opc = bits(insn, 23, 22);
+        let op2 = bits(insn, 11, 10);
+        let imm = sign_extend(bits(insn, 20, 12), 9) << 4;
+        if op2 == 0 {
+            // LDG (opc 01): insert tag 0; the bulk forms (STZGM, STGM,
+            // LDGM) are EL1-only.
+            return (opc == 1).then_some(Instr::LogicalImm {
+                sf: true,
+                op: LogicOp::And,
+                imm: !(0xF << 56),
+                rn: rd,
+                rd,
+            });
+        }
+        let writeback = |imm: i64| Instr::AddSubImm {
+            sf: true,
+            sub: imm < 0,
+            set_flags: false,
+            imm: imm.unsigned_abs(),
+            rn,
+            rd: rn,
+        };
+        return match (opc, op2) {
+            // STG/ST2G: offset form does nothing; pre/post only update Xn.
+            (0 | 2, 0b10) => Some(Instr::Nop),
+            (0 | 2, _) => Some(writeback(imm)),
+            // STZG: zero one granule.
+            (1, _) => Some(Instr::LoadStorePair {
+                simd: false,
+                size: 3,
+                load: false,
+                signed: false,
+                mode: match op2 {
+                    0b01 => PairMode::PostIndex,
+                    0b11 => PairMode::PreIndex,
+                    _ => PairMode::Offset,
+                },
+                rn,
+                imm,
+                rt: 31,
+                rt2: 31,
+            }),
+            _ => None, // STZ2G: two granules
+        };
+    }
+    // STGP Xt, Xt2, [Xn|SP, #imm7 * 16] (post, offset, pre).
+    if insn & 0xFE40_0000 == 0x6800_0000 && bits(insn, 24, 23) != 0 {
+        let mode = match bits(insn, 24, 23) {
+            1 => PairMode::PostIndex,
+            2 => PairMode::Offset,
+            _ => PairMode::PreIndex,
+        };
+        return Some(Instr::LoadStorePair {
+            simd: false,
+            size: 3,
+            load: false,
+            signed: false,
+            mode,
+            rn,
+            imm: sign_extend(bits(insn, 21, 15), 7) << 4,
+            rt: rd,
+            rt2: reg(insn, 10),
+        });
+    }
+    None
 }
 
 fn decode_dp_imm(insn: u32) -> Option<Instr> {
@@ -2202,6 +2391,57 @@ mod tests {
         );
         // All-ones is not encodable as a logical immediate.
         assert_eq!(decode_bit_masks(true, 0b111111, 0, true, 64), None);
+    }
+
+    #[test]
+    fn armv8_3_to_8_5_forms() {
+        let ret = Instr::BranchReg {
+            op: BranchRegOp::Ret,
+            rn: 30,
+        };
+        assert_eq!(decode(0xD65F_0BFF), ret); // retaa
+        assert_eq!(decode(0xD65F_0FFF), ret); // retab
+        assert_eq!(
+            decode(0xD71F_0822),
+            Instr::BranchReg {
+                op: BranchRegOp::Br,
+                rn: 1
+            }
+        ); // braa x1, x2
+        assert_eq!(
+            decode(0xD73F_0C22),
+            Instr::BranchReg {
+                op: BranchRegOp::Blr,
+                rn: 1
+            }
+        ); // blrab x1, x2
+        assert_eq!(decode(0xDAC1_0020), Instr::Nop); // pacia x0, x1
+        assert_eq!(decode(0xDAC1_43E0), Instr::Nop); // xpaci x0
+        assert_eq!(
+            decode(0xF860_0C20), // ldraa x0, [x1, #-4096]!
+            Instr::LoadStore {
+                simd: false,
+                size: 3,
+                kind: LoadKind::Load,
+                mode: AddrMode::PreIndex { rn: 1, imm: -4096 },
+                rt: 0
+            }
+        );
+        assert_eq!(
+            decode(0xD960_1820), // stzg x0, [x1, #16]
+            Instr::LoadStorePair {
+                simd: false,
+                size: 3,
+                load: false,
+                signed: false,
+                mode: PairMode::Offset,
+                rn: 1,
+                imm: 16,
+                rt: 31,
+                rt2: 31
+            }
+        );
+        assert_eq!(decode(0xD920_0820), Instr::Nop); // stg x0, [x1]
     }
 
     #[test]

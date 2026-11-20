@@ -997,7 +997,7 @@ impl Horizon {
         let l = self.layout;
         let process_info = |v: u64| Some(v);
         let value = match kind {
-            0..=7 | 12..=18 | 21..=24 | 28 => {
+            0..=7 | 12..=18 | 21..=24 | 28..=33 => {
                 if !self.is_process(handle) {
                     return self.ret(INVALID_HANDLE);
                 }
@@ -1021,7 +1021,15 @@ impl Horizon {
                     18 => process_info(self.program_id), // ProgramId
                     23 => process_info(1),      // IsApplication
                     24 => process_info(64),     // FreeThreadCount
-                    _ => process_info(0),       // AliasRegionExtraSize
+                    // Switch 2 (values from Lichii's svc_info.cpp): the
+                    // region VAMM reserves address space in (the upper
+                    // half of the alias region), remote memory size and
+                    // use, and the VAMM granule.
+                    29 => process_info(l.alias.0 + l.alias.1 / 2),
+                    30 => process_info(l.alias.1 / 2),
+                    31 | 32 => process_info(0),
+                    33 => process_info(PAGE),
+                    _ => process_info(0), // AliasRegionExtraSize
                 }
             }
             8 => Some(0), // DebuggerAttached
