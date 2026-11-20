@@ -487,3 +487,36 @@ fn shaded_triangles() {
     );
     assert_eq!(px(f, 120, 450), bg);
 }
+
+#[test]
+fn homebrew_booted_as_an_application_nso() {
+    // libnx programs also run as NSOs (no loader config: X0 = 0, X1 =
+    // main thread handle). This test program's startup code returns to
+    // its caller (the loader stub) at the end in both modes; without a
+    // loader config there is no HOS version entry.
+    let nso = emu_loader::nso::from_nro(&program("hb_libnx.nro")).unwrap();
+    let module = emu_loader::nso::parse_nso(&nso).unwrap();
+    let sd = std::env::temp_dir().join(format!("switch2-emu-sd-nso-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sd);
+    std::fs::create_dir_all(&sd).unwrap();
+    std::fs::write(sd.join("hello.txt"), "hi\n").unwrap();
+    let config = emu_horizon::services::Config {
+        sdmc_root: Some(sd.clone()),
+        boot_time: Some(1_800_000_000),
+        ..Default::default()
+    };
+    let r = emu_run::run_program_presenting(
+        &emu_run::Program::Application(vec![module]),
+        10_000_000,
+        false,
+        config,
+        None,
+    )
+    .expect("boots");
+    std::fs::remove_dir_all(&sd).unwrap();
+    let out = String::from_utf8_lossy(&r.debug_output);
+    assert!(out.contains("smInitialize = 0x0"), "{out}");
+    assert!(out.contains("fsOpenSdCardFileSystem = 0x0"), "{out}");
+    assert!(out.starts_with("hosversion = 0x0\n"), "{out}");
+    assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0), "{out}");
+}

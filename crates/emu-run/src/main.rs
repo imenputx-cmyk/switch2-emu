@@ -7,20 +7,22 @@ fn main() -> ExitCode {
     let trace = args.iter().any(|a| a == "--trace-svc");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
         eprintln!(
-            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] <program.elf | homebrew.nro>\n\
+            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] <program.elf | homebrew.nro | game.nso | exefs-dir>\n\
              (built with --features window, frames are shown in a window unless --frames is given)"
         );
         return ExitCode::from(2);
     };
-    let elf = match std::fs::read(&path) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("cannot read {path}: {e}");
-            return ExitCode::from(2);
-        }
-    };
     let start = Instant::now();
-    if emu_loader::nro::is_nro(&elf) {
+    let p = std::path::Path::new(&path);
+    let is_elf = !p.is_dir() && std::fs::read(p).is_ok_and(|d| d.starts_with(b"\x7fELF"));
+    if !is_elf {
+        let program = match emu_run::Program::open(p) {
+            Ok(program) => program,
+            Err(e) => {
+                eprintln!("[emu-run] {e}");
+                return ExitCode::from(2);
+            }
+        };
         let config = emu_horizon::services::Config {
             sdmc_root: args
                 .iter()
@@ -50,7 +52,7 @@ fn main() -> ExitCode {
             } else {
                 10_000_000_000
             });
-        return match emu_run::run_nro_presenting(&elf, limit, trace, config, presenter) {
+        return match emu_run::run_program_presenting(&program, limit, trace, config, presenter) {
             Ok(r) => {
                 std::io::stdout().write_all(&r.debug_output).unwrap();
                 if let Some(dir) = args.iter().find_map(|a| a.strip_prefix("--frames=")) {
@@ -85,6 +87,7 @@ fn main() -> ExitCode {
             }
         };
     }
+    let elf = std::fs::read(p).expect("read above");
     match emu_run::run_elf(&elf, 1_000_000_000) {
         Ok(result) => {
             std::io::stdout().write_all(&result.stdout).unwrap();

@@ -252,29 +252,7 @@ impl Horizon {
             .write_privileged(base, &nro_file[..file_end])
             .expect("mapped above");
 
-        // Main thread: stack, TLS and handle.
-        let stack_top = l.stack.0 + l.main_stack_size;
-        self.map_block(
-            l.stack.0,
-            l.main_stack_size,
-            MemState::Stack,
-            PERM_R | PERM_W,
-        );
-        let tls = self.alloc_tls();
-        debug_assert_eq!(tls, l.tls_page);
-        let main = self.add_thread(Cpu::new(), 0x2C, tls, threads::ThreadState::Runnable);
-        self.current = main;
-        self.main_thread_handle = self
-            .handles
-            .insert(KObject::Thread { id: main })
-            .expect("empty table");
-
-        // Loader page: return stub (BRK, recognised by `run`) and config.
-        self.map_block(l.loader_page, PAGE, MemState::CodeStatic, PERM_R | PERM_X);
-        let brk_loader: u32 = 0xD420_0000 | (0x4C44 << 5); // brk #0x4c44 ("LD")
-        self.mem
-            .write_privileged(l.loader_page, &brk_loader.to_le_bytes())
-            .unwrap();
+        let stack_top = self.create_main_thread();
         let info_addr = l.loader_page + 0x40;
         self.mem
             .write_privileged(info_addr, LOADER_INFO.as_bytes())
@@ -320,6 +298,86 @@ impl Horizon {
         self.cpu.write_sp(31, stack_top);
         self.cpu.write_xzr(0, config_addr);
         self.cpu.write_xzr(1, u64::MAX);
+        self.cpu.write_xzr(30, l.loader_page);
+        self.cpu.tpidrro_el0 = l.tls_page;
+        Ok(())
+    }
+
+    /// Maps the main thread's stack and TLS, creates the thread and its
+    /// handle, and the loader page with the return stub (BRK, recognised
+    /// by `run`). Returns the stack top.
+    fn create_main_thread(&mut self) -> u64 {
+        let l = self.layout;
+        let stack_top = l.stack.0 + l.main_stack_size;
+        self.map_block(
+            l.stack.0,
+            l.main_stack_size,
+            MemState::Stack,
+            PERM_R | PERM_W,
+        );
+        let tls = self.alloc_tls();
+        debug_assert_eq!(tls, l.tls_page);
+        let main = self.add_thread(Cpu::new(), 0x2C, tls, threads::ThreadState::Runnable);
+        self.current = main;
+        self.main_thread_handle = self
+            .handles
+            .insert(KObject::Thread { id: main })
+            .expect("empty table");
+        self.map_block(l.loader_page, PAGE, MemState::CodeStatic, PERM_R | PERM_X);
+        let brk_loader: u32 = 0xD420_0000 | (0x4C44 << 5); // brk #0x4c44 ("LD")
+        self.mem
+            .write_privileged(l.loader_page, &brk_loader.to_le_bytes())
+            .unwrap();
+        stack_top
+    }
+
+    /// Loads an application's modules (NSO, in ExeFS order: rtld, main,
+    /// subsdk*, sdk) one after another and enters the first, the way the
+    /// kernel starts an application: X0 = 0 (no arguments), X1 = the
+    /// main thread's handle.
+    pub fn boot_application(
+        &mut self,
+        modules: &[emu_loader::nso::Module],
+    ) -> Result<(), LoadError> {
+        if modules.is_empty() {
+            return Err(LoadError::Unsupported("no modules"));
+        }
+        let l = self.layout;
+        let mut base = l.image_base;
+        for m in modules {
+            let [text, ro, data] = m.segments;
+            let size = m.image.len() as u64;
+            if base + size > l.aslr.1 {
+                return Err(LoadError::Unsupported(
+                    "modules do not fit the address space",
+                ));
+            }
+            let (ro_at, data_at) = (u64::from(ro.offset), u64::from(data.offset));
+            if text.size > 0 {
+                self.map_block(base, ro_at, MemState::CodeStatic, PERM_R | PERM_X);
+            }
+            if data_at > ro_at {
+                self.map_block(base + ro_at, data_at - ro_at, MemState::CodeStatic, PERM_R);
+            }
+            if size > data_at {
+                self.map_block(
+                    base + data_at,
+                    size - data_at,
+                    MemState::CodeMutable,
+                    PERM_R | PERM_W,
+                );
+            }
+            self.mem
+                .write_privileged(base, &m.image)
+                .map_err(|e| LoadError::Memory(format!("{e:?}")))?;
+            base += size.next_multiple_of(PAGE);
+        }
+        let stack_top = self.create_main_thread();
+        self.cpu = Cpu::new();
+        self.cpu.set_pc(l.image_base);
+        self.cpu.write_sp(31, stack_top);
+        self.cpu.write_xzr(0, 0);
+        self.cpu.write_xzr(1, u64::from(self.main_thread_handle));
         self.cpu.write_xzr(30, l.loader_page);
         self.cpu.tpidrro_el0 = l.tls_page;
         Ok(())

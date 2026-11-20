@@ -1,9 +1,11 @@
 //! Loads executable images into guest memory.
 //!
 //! - ELF (64-bit little-endian AArch64): test programs built with clang.
-//! - NRO ([`nro`]): Switch homebrew. NSO comes later.
+//! - NRO ([`nro`]): Switch homebrew.
+//! - NSO ([`nso`]): system modules and games (LZ4 or Switch 2 ZBIC).
 
 pub mod nro;
+pub mod nso;
 
 use emu_memory::{Memory, Perm, PAGE_SIZE};
 use std::collections::BTreeMap;

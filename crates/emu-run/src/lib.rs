@@ -155,10 +155,72 @@ pub fn run_nro_with(
     run_nro_presenting(nro, max_steps, trace_svcs, config, None)
 }
 
+/// What to boot on the Horizon HLE kernel.
+pub enum Program {
+    /// A homebrew NRO.
+    Homebrew(Vec<u8>),
+    /// An application's NSO modules, in ExeFS order.
+    Application(Vec<emu_loader::nso::Module>),
+}
+
+impl Program {
+    /// Reads an NRO or NSO file, or an ExeFS directory (rtld, main,
+    /// subsdk0-9, sdk).
+    pub fn open(path: &std::path::Path) -> Result<Program, String> {
+        let parse = |data: &[u8], name: &str| {
+            emu_loader::nso::parse_nso(data).map_err(|e| format!("{name}: {e}"))
+        };
+        if path.is_dir() {
+            let mut names = vec!["rtld".to_string(), "main".to_string()];
+            names.extend((0..10).map(|i| format!("subsdk{i}")));
+            names.push("sdk".into());
+            let mut modules = Vec::new();
+            for name in names {
+                let p = path.join(&name);
+                if let Ok(data) = std::fs::read(&p) {
+                    modules.push(parse(&data, &name)?);
+                }
+            }
+            if modules.is_empty() {
+                return Err(format!("{}: no NSO modules", path.display()));
+            }
+            return Ok(Program::Application(modules));
+        }
+        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if emu_loader::nro::is_nro(&data) {
+            Ok(Program::Homebrew(data))
+        } else if emu_loader::nso::is_nso(&data) {
+            Ok(Program::Application(vec![parse(&data, "NSO")?]))
+        } else {
+            Err(format!(
+                "{}: not an NRO, NSO or ExeFS directory",
+                path.display()
+            ))
+        }
+    }
+}
+
 /// Like [`run_nro_with`], handing each presented frame to `on_present`
 /// (e.g. a window) instead of collecting it.
 pub fn run_nro_presenting(
     nro: &[u8],
+    max_steps: u64,
+    trace_svcs: bool,
+    config: emu_horizon::services::Config,
+    on_present: Option<emu_horizon::services::Presenter>,
+) -> Result<HomebrewResult, RunError> {
+    run_program_presenting(
+        &Program::Homebrew(nro.to_vec()),
+        max_steps,
+        trace_svcs,
+        config,
+        on_present,
+    )
+}
+
+/// Boots a homebrew program or an application and runs it.
+pub fn run_program_presenting(
+    program: &Program,
     max_steps: u64,
     trace_svcs: bool,
     config: emu_horizon::services::Config,
@@ -172,7 +234,11 @@ pub fn run_nro_presenting(
     }
     hos.trace_svcs = trace_svcs;
     hos.config = config;
-    hos.boot_homebrew(nro).map_err(RunError::Load)?;
+    match program {
+        Program::Homebrew(nro) => hos.boot_homebrew(nro),
+        Program::Application(modules) => hos.boot_application(modules),
+    }
+    .map_err(RunError::Load)?;
     let stop = hos.run(max_steps);
     Ok(HomebrewResult {
         stop,

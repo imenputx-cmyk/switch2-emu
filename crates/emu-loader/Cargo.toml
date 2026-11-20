@@ -7,3 +7,8 @@ description = "Loads executable images into guest memory"
 
 [dependencies]
 emu-memory = { path = "../emu-memory" }
+lz4_flex = { version = "0.14.2", default-features = false, features = ["safe-decode"] }
+ruzstd = "0.9.1"
+
+[dev-dependencies]
+lz4_flex = { version = "0.14.2", features = ["safe-encode"] }
