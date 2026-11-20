@@ -179,6 +179,9 @@ pub struct Horizon {
     pub system: services::System,
     /// Log of SVC calls, for diagnostics.
     pub trace_svcs: bool,
+    /// The JIT, when guest code runs recompiled instead of interpreted.
+    #[cfg(feature = "jit")]
+    pub jit: Option<emu_jit::Jit>,
 }
 
 impl Default for Horizon {
@@ -218,6 +221,43 @@ impl Horizon {
             config: services::Config::default(),
             system: services::System::default(),
             trace_svcs: false,
+            #[cfg(feature = "jit")]
+            jit: None,
+        }
+    }
+
+    /// Whether this build includes the JIT.
+    pub const HAS_JIT: bool = cfg!(feature = "jit");
+
+    /// Switches between the JIT (when built in) and the interpreter.
+    /// Returns whether the JIT is now in use.
+    pub fn set_jit(&mut self, on: bool) -> bool {
+        #[cfg(feature = "jit")]
+        {
+            self.jit = on.then(emu_jit::Jit::new);
+            self.jit.is_some()
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            let _ = on;
+            false
+        }
+    }
+
+    /// Runs the current thread for at most `steps` instructions.
+    fn run_cpu(&mut self, steps: u64) -> Option<Exit> {
+        #[cfg(feature = "jit")]
+        if let Some(jit) = &mut self.jit {
+            return jit.run(&mut self.cpu, &mut self.mem, steps);
+        }
+        self.cpu.run(&mut self.mem, steps)
+    }
+
+    /// Drops recompiled code after the guest's memory layout changed.
+    fn invalidate_code(&mut self) {
+        #[cfg(feature = "jit")]
+        if let Some(jit) = &mut self.jit {
+            jit.clear_cache();
         }
     }
 
@@ -548,7 +588,7 @@ impl Horizon {
             if budget == 0 {
                 return Stop::StepLimit;
             }
-            match self.cpu.run(&mut self.mem, budget.min(threads::TIME_SLICE)) {
+            match self.run_cpu(budget.min(threads::TIME_SLICE)) {
                 None => {
                     let pc = self.cpu.pc();
                     if self.mem.read_uint(pc, 4) == Ok(0x1400_0000) && self.threads.len() == 1 {
@@ -562,6 +602,13 @@ impl Horizon {
                 Some(Exit::Svc(id)) => {
                     if let Err(stop) = self.svc(id) {
                         return stop;
+                    }
+                    // Memory mapping SVCs can change what code lives where.
+                    if matches!(
+                        id,
+                        0x02 | 0x04 | 0x05 | 0x13 | 0x14 | 0x2C | 0x2D | 0x73 | 0x74 | 0x77 | 0x78
+                    ) {
+                        self.invalidate_code();
                     }
                     if self.system.quit {
                         return Stop::HostQuit;

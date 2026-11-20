@@ -1,0 +1,15 @@
+[package]
+name = "emu-jit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "AArch64 JIT backend built on dynarmic (vendored in third_party/dynarmic)"
+links = "dynarmic"
+
+[dependencies]
+emu-cpu = { path = "../emu-cpu" }
+emu-memory = { path = "../emu-memory" }
+
+[build-dependencies]
+cmake = "0.1"
+cc = "1"

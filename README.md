@@ -90,6 +90,14 @@ cargo run --release -p emu-run -- --keys=prod.keys game.nsp  # an application (N
 - [Lichii](https://github.com/zortos293/lichii) (GPL-3.0-or-later, an Eden-NX2 fork): its `NX2_NOTES.md` records, blocker by blocker, what Switch 2 titles need while booting (ARMv8.3-8.5 instructions, new `svcGetInfo` ids, six cores, Switch 2 service commands, the gsv/NvRm/NVN2 graphics stack); followed here in the same order.
 - [Eden](https://git.eden-emu.dev/eden-emu/eden) and its NX2 branch (GPL-3.0-or-later, derived from yuzu, GPL-2.0-or-later): Switch 2 specifics (NX2 services, GPU profile, video decoding) and the Switch HLE in general. Code taken from it keeps its copyright notice in the file it lands in.
 
+## CPU: interpreter or JIT
+
+`emu-run` built with `--features jit` runs guest code through
+[dynarmic](https://github.com/azahar-emu/dynarmic) (the JIT yuzu, Eden and
+Lichii use), vendored in `third_party/` (see `third_party/README.md`). It
+needs CMake and a C++20 compiler. `--cpu=interp` switches back to the
+interpreter, which also handles anything dynarmic does not.
+
 ## License
 
 GPL-3.0-or-later (see `LICENSE`), so that code from GPL emulators (Eden, yuzu) can be used directly. Parts taken from permissively licensed projects (deko3d: zlib, envytools and open-gpu-doc: MIT, libnx: ISC) keep their original notices; those licenses are compatible with the GPL.

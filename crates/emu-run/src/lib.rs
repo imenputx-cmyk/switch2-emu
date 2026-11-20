@@ -156,6 +156,10 @@ pub fn run_nro_with(
 }
 
 /// Set by the host (Ctrl+C) to stop a running program.
+/// Run guest code with the JIT when this build has one (`--cpu=interp`
+/// turns it off).
+pub static USE_JIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub static INTERRUPT: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
 
@@ -336,6 +340,11 @@ pub fn run_program_presenting(
     result.map_err(RunError::Load)?;
     eprintln!("[emu-run] booted; running");
     hos.interrupt = INTERRUPT.get().cloned();
+    let jit = hos.set_jit(USE_JIT.load(std::sync::atomic::Ordering::Relaxed));
+    eprintln!(
+        "[emu-run] CPU: {}",
+        if jit { "dynarmic JIT" } else { "interpreter" }
+    );
     hos.heartbeat = matches!(program, Program::Application(..));
     let stop = hos.run(max_steps);
     if !matches!(

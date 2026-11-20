@@ -11,7 +11,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       # The toolchain version comes from rust-toolchain.toml.
@@ -28,12 +28,12 @@ jobs:
       - run: cargo test --release
       - name: Build with the window front end
         if: runner.os == 'Windows'
-        run: cargo clippy --release -p emu-run --features window -- -D warnings
+        run: cargo clippy --release -p emu-run --features window,jit -- -D warnings
 
   difftest:
     # Cross-checks the interpreter against Unicorn on random instructions.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup show active-toolchain

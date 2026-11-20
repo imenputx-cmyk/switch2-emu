@@ -19,3 +19,5 @@ ctrlc = "3"
 # Show presented frames in a window (minifb). Off by default so headless
 # builds (CI, servers) need no windowing libraries.
 window = ["dep:minifb"]
+# Use the dynarmic JIT by default (see emu-jit).
+jit = ["emu-horizon/jit"]

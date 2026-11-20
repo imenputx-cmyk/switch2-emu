@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup show active-toolchain
-      - run: cargo build --release -p emu-run --features window
+      - run: cargo build --release -p emu-run --features window,jit
       - name: Package
         shell: pwsh
         run: |
