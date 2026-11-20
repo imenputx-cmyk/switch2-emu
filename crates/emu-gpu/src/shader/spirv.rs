@@ -17,7 +17,8 @@
 //! can fall back to the software renderer.
 
 use super::decode::{
-    Bop, FCmp, ICmp, Inst, IpaMode, LopOp, Mods, MufuOp, Op, Operand, Pred, Round, XmadMode, PT, RZ,
+    Bop, FCmp, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand, Pred, Round,
+    XmadMode, PT, RZ,
 };
 use super::interp::{SSY_DEPTH, STEP_LIMIT};
 use super::{attr, Header, Stage};
@@ -103,6 +104,14 @@ mod op {
     pub const BITWISE_XOR: u16 = 198;
     pub const BITWISE_AND: u16 = 199;
     pub const NOT: u16 = 200;
+    pub const BIT_REVERSE: u16 = 204;
+    pub const BIT_COUNT: u16 = 205;
+    pub const I_ADD_CARRY: u16 = 149;
+    pub const U_MUL_EXTENDED: u16 = 151;
+    pub const S_MUL_EXTENDED: u16 = 152;
+    pub const IMAGE_GATHER: u16 = 96;
+    pub const IMAGE_QUERY_SIZE_LOD: u16 = 103;
+    pub const IMAGE_QUERY_LEVELS: u16 = 106;
     pub const BIT_FIELD_S_EXTRACT: u16 = 202;
     pub const BIT_FIELD_U_EXTRACT: u16 = 203;
     pub const LOOP_MERGE: u16 = 246;
@@ -155,6 +164,8 @@ const GLSL_UMAX: u32 = 41;
 const GLSL_SMAX: u32 = 42;
 const GLSL_NMIN: u32 = 79;
 const GLSL_NMAX: u32 = 80;
+const GLSL_FIND_S_MSB: u32 = 74;
+const GLSL_FIND_U_MSB: u32 = 75;
 
 #[derive(Default)]
 struct Module {
@@ -217,6 +228,8 @@ struct Common {
     image_t: u32,
     sampled_image: u32,
     p_sampled_image: u32,
+    /// struct { uint, uint } (extended multiply and carry results).
+    uint_pair: u32,
 }
 
 /// Descriptor binding of constant buffer `index` for a stage.
@@ -783,6 +796,44 @@ impl Translator {
             );
             id
         }))
+    }
+
+    fn extract(&mut self, ty: u32, v: u32, k: u32) -> u32 {
+        let id = self.m.id();
+        inst(&mut self.m.body, op::COMPOSITE_EXTRACT, &[ty, id, v, k]);
+        id
+    }
+
+    /// The image of a texture's sampled image.
+    fn texture_image(&mut self, handle: u32) -> Result<(u32, u32), String> {
+        let var = self.texture_var(handle)?;
+        let sampled = self.load(self.c.sampled_image, var);
+        let img = self.m.id();
+        inst(&mut self.m.body, op::IMAGE, &[self.c.image_t, img, sampled]);
+        Ok((sampled, img))
+    }
+
+    /// Truth table of three booleans (bit i for (a, b, c) = (i >> 2, i >> 1, i) & 1).
+    fn bool_lut(&mut self, lut: u8, a: u32, b: u32, c: u32) -> u32 {
+        let bool_t = self.c.bool_t;
+        let inv = [
+            self.op1(op::LOGICAL_NOT, bool_t, a),
+            self.op1(op::LOGICAL_NOT, bool_t, b),
+            self.op1(op::LOGICAL_NOT, bool_t, c),
+        ];
+        let mut r = self.c.false_c;
+        for i in 0..8u32 {
+            if lut >> i & 1 == 0 {
+                continue;
+            }
+            let pa = if i & 4 != 0 { a } else { inv[0] };
+            let pb = if i & 2 != 0 { b } else { inv[1] };
+            let pc = if i & 1 != 0 { c } else { inv[2] };
+            let t = self.op2(op::LOGICAL_AND, bool_t, pa, pb);
+            let t = self.op2(op::LOGICAL_AND, bool_t, t, pc);
+            r = self.op2(op::LOGICAL_OR, bool_t, r, t);
+        }
+        r
     }
 
     /// Translates a non-control-flow instruction.
@@ -1399,6 +1450,240 @@ impl Translator {
                     }
                 }
             }
+            Op::S2r { dst, sr } => {
+                // One invocation of a graphics stage: ids are zero.
+                let v = super::decode::sr::constant(sr).unwrap_or(0);
+                let v = self.constant_u(v);
+                self.store_reg(dst, v);
+            }
+            Op::Ldc {
+                dst,
+                index,
+                base,
+                offset,
+                wide,
+            } => {
+                let var = self.cbuf_var(index);
+                let b = self.load_reg(base);
+                let off = self.constant_u(offset);
+                let at = self.op2(op::I_ADD, uint, b, off);
+                for k in 0..if wide { 2 } else { 1 } {
+                    let target = if dst == RZ { RZ } else { dst + k };
+                    let four = self.constant_u(4 * u32::from(k));
+                    let at = self.op2(op::I_ADD, uint, at, four);
+                    let (s4, s2, m3, last) = (
+                        self.constant_u(4),
+                        self.constant_u(2),
+                        self.constant_u(3),
+                        self.constant_u(4095),
+                    );
+                    let vec = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, at, s4);
+                    let vec = self.glsl(uint, GLSL_UMIN, &[vec, last]);
+                    let word = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, at, s2);
+                    let comp = self.op2(op::BITWISE_AND, uint, word, m3);
+                    let p = self.m.id();
+                    inst(
+                        &mut self.m.body,
+                        op::ACCESS_CHAIN,
+                        &[self.c.p_uniform_uint, p, var, self.c.zero_u, vec, comp],
+                    );
+                    let v = self.load(uint, p);
+                    self.store_reg(target, v);
+                }
+            }
+            Op::Ldg { .. } | Op::Stg { .. } => {
+                return Err("global memory access is not translated yet".into());
+            }
+            Op::Plop3 {
+                dst,
+                dst2,
+                a,
+                b,
+                c,
+                lut,
+                lut2,
+            } => {
+                let (x, y, z) = (self.load_pred(a), self.load_pred(b), self.load_pred(c));
+                let r = self.bool_lut(lut, x, y, z);
+                let r2 = self.bool_lut(lut2, x, y, z);
+                self.store_pred(dst, r);
+                self.store_pred(dst2, r2);
+            }
+            Op::IntUnary { dst, func, src } => {
+                let x = self.operand_uint(src)?;
+                let r = match func {
+                    IntFunc::Popc => self.op1(op::BIT_COUNT, uint, x),
+                    IntFunc::Brev => self.op1(op::BIT_REVERSE, uint, x),
+                    IntFunc::Iabs => self.glsl(uint, GLSL_SABS, &[x]),
+                    IntFunc::Flo { signed, shift } => {
+                        let f = if signed {
+                            GLSL_FIND_S_MSB
+                        } else {
+                            GLSL_FIND_U_MSB
+                        };
+                        let r = self.glsl(uint, f, &[x]);
+                        if shift {
+                            let none = self.constant_u(u32::MAX);
+                            let is_none = self.op2(op::I_EQUAL, self.c.bool_t, r, none);
+                            let k = self.constant_u(31);
+                            let s = self.op2(op::I_SUB, uint, k, r);
+                            self.select(uint, is_none, none, s)
+                        } else {
+                            r
+                        }
+                    }
+                };
+                self.store_reg(dst, r);
+            }
+            Op::Prmt { dst, a, sel, c } => {
+                let x = self.load_reg(a);
+                let s = self.operand_uint(sel)?;
+                let z = self.operand_uint(c)?;
+                let bool_t = self.c.bool_t;
+                let mut r = self.c.zero_u;
+                for i in 0..4u32 {
+                    let (sh, m15, m3, m4, m8, ff, eight, seven) = (
+                        self.constant_u(4 * i),
+                        self.constant_u(15),
+                        self.constant_u(3),
+                        self.constant_u(4),
+                        self.constant_u(8),
+                        self.constant_u(0xFF),
+                        self.constant_u(8),
+                        self.constant_u(7),
+                    );
+                    let n = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, s, sh);
+                    let n = self.op2(op::BITWISE_AND, uint, n, m15);
+                    let which = self.op2(op::BITWISE_AND, uint, n, m4);
+                    let hi = self.op2(op::I_NOT_EQUAL, bool_t, which, self.c.zero_u);
+                    let src = self.select(uint, hi, z, x);
+                    let byte = self.op2(op::BITWISE_AND, uint, n, m3);
+                    let bits = self.op2(op::I_MUL, uint, byte, eight);
+                    let b = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, src, bits);
+                    let b = self.op2(op::BITWISE_AND, uint, b, ff);
+                    let sign_bit = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, b, seven);
+                    let rep = self.op2(op::I_MUL, uint, sign_bit, ff);
+                    let sign = self.op2(op::BITWISE_AND, uint, n, m8);
+                    let signed = self.op2(op::I_NOT_EQUAL, bool_t, sign, self.c.zero_u);
+                    let b = self.select(uint, signed, rep, b);
+                    let at = self.constant_u(8 * i);
+                    let b = self.op2(op::SHIFT_LEFT_LOGICAL, uint, b, at);
+                    r = self.op2(op::BITWISE_OR, uint, r, b);
+                }
+                self.store_reg(dst, r);
+            }
+            Op::ImadWide {
+                dst,
+                a,
+                b,
+                c,
+                signed,
+            } => {
+                let x = self.load_reg(a);
+                let y = self.operand_uint(b)?;
+                let pair = self.c.uint_pair;
+                let mul = if signed {
+                    op::S_MUL_EXTENDED
+                } else {
+                    op::U_MUL_EXTENDED
+                };
+                let p = self.op2(mul, pair, x, y);
+                let (lo, hi) = (self.extract(uint, p, 0), self.extract(uint, p, 1));
+                let (clo, chi) = if c == RZ {
+                    (self.c.zero_u, self.c.zero_u)
+                } else {
+                    (self.load_reg(c), self.load_reg(c + 1))
+                };
+                let sum = self.op2(op::I_ADD_CARRY, pair, lo, clo);
+                let (rlo, carry) = (self.extract(uint, sum, 0), self.extract(uint, sum, 1));
+                let rhi = self.op2(op::I_ADD, uint, hi, chi);
+                let rhi = self.op2(op::I_ADD, uint, rhi, carry);
+                self.store_reg(dst, rlo);
+                if dst != RZ {
+                    self.store_reg(dst + 1, rhi);
+                }
+            }
+            Op::ImadHi {
+                dst,
+                a,
+                b,
+                c,
+                signed,
+            } => {
+                let x = self.load_reg(a);
+                let y = self.operand_uint(b)?;
+                let z = self.operand_uint(c)?;
+                let mul = if signed {
+                    op::S_MUL_EXTENDED
+                } else {
+                    op::U_MUL_EXTENDED
+                };
+                let p = self.op2(mul, self.c.uint_pair, x, y);
+                let hi = self.extract(uint, p, 1);
+                let r = self.op2(op::I_ADD, uint, hi, z);
+                self.store_reg(dst, r);
+            }
+            Op::Vote { dst, pdst, src, eq } => {
+                let p = self.load_pred(src);
+                let one = self.constant_u(1);
+                let v = self.select(uint, p, one, self.c.zero_u);
+                self.store_reg(dst, v);
+                let out = if eq { self.c.true_c } else { p };
+                self.store_pred(pdst, out);
+            }
+            Op::Txq {
+                dst,
+                dst1,
+                lod,
+                handle,
+                comps,
+            } => {
+                let (_, img) = self.texture_image(handle)?;
+                let l = self.load_reg(lod);
+                let size = self.op2(op::IMAGE_QUERY_SIZE_LOD, self.c.uvec2, img, l);
+                let levels = self.op1(op::IMAGE_QUERY_LEVELS, uint, img);
+                let one = self.constant_u(1);
+                let vals = [
+                    self.extract(uint, size, 0),
+                    self.extract(uint, size, 1),
+                    one,
+                    levels,
+                ];
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    self.store_reg(super::interp::texs_dst(dst, dst1, k), vals[c]);
+                }
+            }
+            Op::Tld4 {
+                dst0,
+                dst1,
+                a,
+                b,
+                handle,
+                comp,
+                comps,
+            } => {
+                let u = self.reg_float(a, no);
+                let v = self.reg_float(b, no);
+                let var = self.texture_var(handle)?;
+                let img = self.load(self.c.sampled_image, var);
+                let coord = self.m.id();
+                inst(
+                    &mut self.m.body,
+                    op::COMPOSITE_CONSTRUCT,
+                    &[self.c.vec2, coord, u, v],
+                );
+                let which = self.constant_u(u32::from(comp));
+                let texel = self.m.id();
+                inst(
+                    &mut self.m.body,
+                    op::IMAGE_GATHER,
+                    &[self.c.vec4, texel, img, coord, which],
+                );
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    let f = self.extract(float, texel, c as u32);
+                    self.store_float(super::interp::texs_dst(dst0, dst1, k), f, false);
+                }
+            }
             Op::Nop => {}
             Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {
                 unreachable!("control flow is translated by the caller")
@@ -1639,7 +1924,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     let (bool_t, true_c, false_c, p_private_bool) = (m.id(), m.id(), m.id(), m.id());
     let (len_ssy, stack_t, p_private_stack, null_stack) = (m.id(), m.id(), m.id(), m.id());
     let (vec2, image_t, sampled_image, p_sampled_image) = (m.id(), m.id(), m.id(), m.id());
-    let uvec2 = m.id();
+    let (uvec2, uint_pair) = (m.id(), m.id());
     let g = &mut m.globals;
     inst(g, op::TYPE_BOOL, &[bool_t]);
     inst(g, op::CONSTANT_TRUE, &[bool_t, true_c]);
@@ -1651,6 +1936,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     inst(g, op::CONSTANT_NULL, &[stack_t, null_stack]);
     inst(g, op::TYPE_VECTOR, &[vec2, float, 2]);
     inst(g, op::TYPE_VECTOR, &[uvec2, uint, 2]);
+    inst(g, op::TYPE_STRUCT, &[uint_pair, uint, uint]);
     // 2D, not depth, not arrayed, single-sampled, sampled, format unknown.
     inst(g, op::TYPE_IMAGE, &[image_t, float, 1, 0, 0, 0, 1, 0]);
     inst(g, op::TYPE_SAMPLED_IMAGE, &[sampled_image, image_t]);
@@ -1690,6 +1976,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         image_t,
         sampled_image,
         p_sampled_image,
+        uint_pair,
     };
     let mut t = Translator {
         m,
@@ -1748,6 +2035,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     let bound = t.m.next_id + 1;
     words.extend([0x0723_0203, 0x0001_0300, 0, bound, 0]);
     inst(&mut words, op::CAPABILITY, &[1]); // Shader
+    inst(&mut words, op::CAPABILITY, &[50]); // ImageQuery
     let mut ext = vec![glsl];
     ext.extend(string("GLSL.std.450"));
     inst(&mut words, op::EXT_INST_IMPORT, &ext);
@@ -1896,6 +2184,74 @@ mod tests {
             ),
             inst(0x223, 0, &[(24, 8, 0), (32, 8, 1), (64, 8, 2)]),
             inst(0x308, 1, &[(32, 8, 1), (74, 6, 1)]),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 0),
+                    (40, 10, 0x70),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            exit(),
+        ];
+        let mut code = crate::shader::sm86::asm::program(&insts);
+        code[..0x50].copy_from_slice(&vertex_header());
+        let h = super::super::Header::parse(&code);
+        let p =
+            crate::shader::sm86::decode_program(&code[crate::shader::sm86::HEADER_SIZE..]).unwrap();
+        let t = translate(&p, &h).unwrap();
+        validate(&t.words);
+    }
+
+    #[test]
+    fn switch2_integer_and_uniform_ops_validate() {
+        use crate::shader::sm86::asm::{exit, inst};
+        let insts = [
+            inst(0x309, 2, &[(32, 8, 0)]),
+            inst(0x300, 4, &[(32, 8, 0), (74, 1, 1), (81, 3, 7)]),
+            inst(0x816, 5, &[(24, 8, 0), (32, 32, 0x7610), (64, 8, 1)]),
+            inst(0x225, 6, &[(24, 8, 0), (32, 8, 1), (64, 8, 8), (81, 3, 7)]),
+            inst(
+                0x227,
+                9,
+                &[(24, 8, 0), (32, 8, 1), (64, 8, 255), (73, 1, 1), (81, 3, 7)],
+            ),
+            inst(
+                0x88C,
+                0,
+                &[
+                    (24, 8, 4),
+                    (32, 32, 7),
+                    (76, 3, 6),
+                    (81, 3, 1),
+                    (84, 3, 7),
+                    (87, 4, 7),
+                ],
+            ),
+            inst(0x887, 5, &[(24, 8, 4), (32, 32, 99), (87, 4, 1)]),
+            inst(
+                0xB82,
+                2,
+                &[(24, 8, 0), (38, 16, 0x10), (54, 5, 3), (73, 3, 5)],
+            ),
+            inst(0x919, 4, &[(72, 8, 56)]),
+            inst(0x806, 10, &[(81, 3, 1), (87, 4, 7)]),
+            inst(
+                0x81C,
+                0,
+                &[
+                    (87, 4, 1),
+                    (77, 4, 7),
+                    (68, 4, 7),
+                    (64, 3, 7),
+                    (72, 5, 1),
+                    (81, 3, 2),
+                    (84, 3, 7),
+                ],
+            ),
             inst(
                 0x322,
                 0,

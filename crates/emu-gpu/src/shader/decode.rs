@@ -424,6 +424,110 @@ pub enum Op {
         wide: bool,
         signed: bool,
     },
+    /// Special register (S2R): see [`sr`].
+    S2r {
+        dst: u8,
+        sr: u8,
+    },
+    /// Constant load at register `base` + `offset` (LDC); `wide` loads
+    /// a register pair.
+    Ldc {
+        dst: u8,
+        index: u8,
+        base: u8,
+        offset: u32,
+        wide: bool,
+    },
+    /// Global memory load (LDG): `size` as Maxwell's (0 U8, 1 S8, 2 U16,
+    /// 3 S16, 4 32, 5 64, 6 128 bits) at the address `addr` (a register
+    /// pair if `wide`, else zero-extended) + `uaddr` (a pair, RZ for
+    /// none) + `offset`.
+    Ldg {
+        dst: u8,
+        addr: u8,
+        wide: bool,
+        uaddr: u8,
+        offset: i32,
+        size: u8,
+    },
+    /// Global memory store (STG), addressed like LDG.
+    Stg {
+        src: u8,
+        addr: u8,
+        wide: bool,
+        uaddr: u8,
+        offset: i32,
+        size: u8,
+    },
+    /// Predicate truth tables (PLOP3.LUT): dst = lut(a, b, c),
+    /// dst2 = lut2(a, b, c), bits as for LOP3.
+    Plop3 {
+        dst: u8,
+        dst2: u8,
+        a: Pred,
+        b: Pred,
+        c: Pred,
+        lut: u8,
+        lut2: u8,
+    },
+    /// One-source integer functions.
+    IntUnary {
+        dst: u8,
+        func: IntFunc,
+        src: Operand,
+    },
+    /// Byte permute (PRMT, default mode): byte i of the result is byte
+    /// (selector nibble i & 7) of c:a, sign-replicated if nibble bit 3.
+    Prmt {
+        dst: u8,
+        a: u8,
+        sel: Operand,
+        c: Operand,
+    },
+    /// 32x32 to 64-bit multiply-add (IMAD.WIDE): dst:dst+1 = a * b + c:c+1.
+    ImadWide {
+        dst: u8,
+        a: u8,
+        b: Operand,
+        c: u8,
+        signed: bool,
+    },
+    /// High 32 bits of a 32x32 multiply plus c (IMAD.HI).
+    ImadHi {
+        dst: u8,
+        a: u8,
+        b: Operand,
+        c: Operand,
+        signed: bool,
+    },
+    /// Warp vote, one invocation at a time: `pdst` = src (ALL/ANY) or
+    /// true (EQ); `dst` = the ballot (1 if src).
+    Vote {
+        dst: u8,
+        pdst: u8,
+        src: Pred,
+        eq: bool,
+    },
+    /// Texture query (TXQ, dimensions): width, height, depth, levels of
+    /// level `lod` (a register), the enabled ones to dst on.
+    Txq {
+        dst: u8,
+        dst1: u8,
+        lod: u8,
+        handle: u32,
+        comps: u8,
+    },
+    /// Gather (TLD4) of component `comp` at (a, b) of a 2D texture;
+    /// outputs like TEXS.
+    Tld4 {
+        dst0: u8,
+        dst1: u8,
+        a: u8,
+        b: u8,
+        handle: u32,
+        comp: u8,
+        comps: u8,
+    },
     Bra {
         target: usize,
     },
@@ -437,6 +541,51 @@ pub enum Op {
     Kil,
     Exit,
     Nop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntFunc {
+    /// Population count.
+    Popc,
+    /// Index of the most significant set bit (of the magnitude for
+    /// signed), 0xFFFFFFFF if none; `shift` gives 31 minus it.
+    Flo { signed: bool, shift: bool },
+    /// Bit reverse.
+    Brev,
+    /// Absolute value.
+    Iabs,
+}
+
+/// Special registers (S2R), numbered as on Maxwell.
+pub mod sr {
+    pub const LANE_ID: u8 = 0;
+    pub const Y_DIRECTION: u8 = 18;
+    pub const TID_X: u8 = 33;
+    pub const TID_Y: u8 = 34;
+    pub const TID_Z: u8 = 35;
+    pub const CTAID_X: u8 = 37;
+    pub const CTAID_Y: u8 = 38;
+    pub const CTAID_Z: u8 = 39;
+    pub const EQ_MASK: u8 = 56;
+    pub const LT_MASK: u8 = 57;
+    pub const LE_MASK: u8 = 58;
+    pub const GT_MASK: u8 = 59;
+    pub const GE_MASK: u8 = 60;
+    pub const CLOCK_LO: u8 = 80;
+    pub const CLOCK_HI: u8 = 81;
+
+    /// The value of a special register that does not depend on the
+    /// invocation (one lane of one warp), if it is one.
+    pub fn constant(sr: u8) -> Option<u32> {
+        Some(match sr {
+            LANE_ID | LT_MASK | CLOCK_LO | CLOCK_HI => 0,
+            EQ_MASK | LE_MASK => 1,
+            GT_MASK => 0xFFFF_FFFE,
+            GE_MASK => 0xFFFF_FFFF,
+            Y_DIRECTION => 1.0f32.to_bits(),
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -127,7 +127,12 @@ pub fn cbuf_bytes(
 pub fn texture_handles(program: &[Inst]) -> Vec<u32> {
     let mut out = Vec::new();
     for i in program {
-        if let Op::Texs { handle, .. } | Op::Tex { handle, .. } | Op::Tld { handle, .. } = i.op {
+        if let Op::Texs { handle, .. }
+        | Op::Tex { handle, .. }
+        | Op::Tld { handle, .. }
+        | Op::Txq { handle, .. }
+        | Op::Tld4 { handle, .. } = i.op
+        {
             if !out.contains(&handle) {
                 out.push(handle);
             }
@@ -307,14 +312,29 @@ impl Cbufs {
     }
 }
 
-struct VertexIo<'a> {
+struct VertexIo<'a, 'g> {
+    mem: &'a mut GuestMemory<'g>,
     inputs: &'a [[u32; 4]],
     out: Varyings,
     cbufs: &'a Cbufs,
     tex: &'a texture::Bound,
 }
 
-impl ShaderIo for VertexIo<'_> {
+impl ShaderIo for VertexIo<'_, '_> {
+    fn gather(&self, handle: u32, u: f32, v: f32, comp: u8) -> [f32; 4] {
+        self.tex.gather(handle, u, v, comp)
+    }
+    fn texture_size(&self, handle: u32, lod: u32) -> [u32; 4] {
+        self.tex.size(handle, lod)
+    }
+    fn load_global(&mut self, va: u64, buf: &mut [u8]) {
+        if self.mem.read(va, buf).is_err() {
+            buf.fill(0);
+        }
+    }
+    fn store_global(&mut self, va: u64, data: &[u8]) {
+        let _ = self.mem.write(va, data);
+    }
     fn load_attr(&self, addr: u32) -> u32 {
         if addr >= attr::generic(0) {
             let i = ((addr - attr::generic(0)) / 16) as usize;
@@ -345,7 +365,8 @@ impl ShaderIo for VertexIo<'_> {
     }
 }
 
-struct PixelIo<'a> {
+struct PixelIo<'a, 'g> {
+    mem: &'a mut GuestMemory<'g>,
     v: [&'a Varyings; 3],
     cbufs: &'a Cbufs,
     tex: &'a texture::Bound,
@@ -354,7 +375,21 @@ struct PixelIo<'a> {
     frag: [f32; 4],
 }
 
-impl ShaderIo for PixelIo<'_> {
+impl ShaderIo for PixelIo<'_, '_> {
+    fn gather(&self, handle: u32, u: f32, v: f32, comp: u8) -> [f32; 4] {
+        self.tex.gather(handle, u, v, comp)
+    }
+    fn texture_size(&self, handle: u32, lod: u32) -> [u32; 4] {
+        self.tex.size(handle, lod)
+    }
+    fn load_global(&mut self, va: u64, buf: &mut [u8]) {
+        if self.mem.read(va, buf).is_err() {
+            buf.fill(0);
+        }
+    }
+    fn store_global(&mut self, va: u64, data: &[u8]) {
+        let _ = self.mem.write(va, data);
+    }
     fn load_attr(&self, addr: u32) -> u32 {
         self.interpolate(addr, IpaMode::Pass).to_bits()
     }
@@ -459,6 +494,7 @@ pub fn draw_software(g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut io = VertexIo {
+                mem: g,
                 inputs: &inputs,
                 out: Varyings { words: [0; 128] },
                 cbufs: &vs_cbufs,
@@ -556,6 +592,7 @@ fn rasterize(
             let z: f32 = (0..3).map(|i| b[i] * win[i][2]).sum();
             let z = z.clamp(z_lo, z_hi);
             let mut io = PixelIo {
+                mem: g,
                 v,
                 cbufs,
                 tex,

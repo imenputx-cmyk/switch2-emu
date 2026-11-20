@@ -26,8 +26,16 @@
 //! instructions to Maxwell ones.
 
 use super::decode::{
-    Bop, DecodeError, Inst, IpaMode, Mods, MufuOp, Op, Operand, Pred, Round, PT, RZ,
+    Bop, DecodeError, Inst, IntFunc, IpaMode, Mods, MufuOp, Op, Operand, Pred, Round, PT, RZ,
 };
+
+/// Uniform predicates UP0-UP6 are IR predicates 8-14 (UPT is PT).
+pub fn upred(n: u32) -> u8 {
+    match n & 7 {
+        7 => 7,
+        n => 8 + n as u8,
+    }
+}
 
 /// Bytes of a graphics program header before the first instruction.
 pub const HEADER_SIZE: usize = 0x80;
@@ -67,12 +75,19 @@ fn is_uniform_op(op: u32) -> bool {
             | 0x899
             | 0xAB9
             | 0xABB
+            | 0x28C
+            | 0x88C
+            | 0x287
+            | 0x887
+            | 0x89C
     )
 }
 
 /// Whether an instruction reads or writes uniform registers.
 fn uses_uniforms(op: u32) -> bool {
-    is_uniform_op(op) || matches!(op >> 9, 6 | 7) || op == 0x3C2 || op == 0xC02
+    is_uniform_op(op)
+        || matches!(op >> 9, 6 | 7)
+        || matches!(op, 0x3C2 | 0xC02 | 0x9C3 | 0x981 | 0x986)
 }
 
 /// The highest ordinary register a program names (fields 16, 24, 64, and
@@ -129,6 +144,19 @@ impl Instruction {
             index: self.bits(offset, 3) as u8,
             neg: self.on(offset + 3),
         }
+    }
+
+    /// A uniform predicate operand (UPn, negated by the fourth bit).
+    fn upred_at(&self, offset: u32) -> Pred {
+        Pred {
+            index: upred(self.bits(offset, 3)),
+            neg: self.on(offset + 3),
+        }
+    }
+
+    /// The truth table of PLOP3/UPLOP3: bits 64..67 and 72..77.
+    fn plop3_lut(&self) -> u8 {
+        (self.bits(64, 3) | self.bits(72, 5) << 3) as u8
     }
 
     /// A branch-style target: instruction index (byte offset relative to
@@ -572,6 +600,112 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 }
             })
         }
+        // POPC, FLO, BREV, IABS on source B.
+        0x109 | 0x100 | 0x101 | 0x013 => {
+            let func = match op & 0x1FF {
+                0x109 => IntFunc::Popc,
+                0x100 => IntFunc::Flo {
+                    signed: i.on(73),
+                    shift: i.on(74),
+                },
+                0x101 => IntFunc::Brev,
+                _ => IntFunc::Iabs,
+            };
+            if op & 0x1FF == 0x100 && i.bits(81, 3) != 7 {
+                return err("FLO predicate output");
+            }
+            one(Op::IntUnary {
+                dst,
+                func,
+                src: src_b()?.0,
+            })
+        }
+        // IMNMX: min when the predicate at 87 holds; bit 73 signed.
+        0x017 => one(Op::Imnmx {
+            dst,
+            a,
+            b: src_b()?.0,
+            signed: i.on(73),
+            min: i.pred_at(87),
+        }),
+        // PRMT (default mode only).
+        0x016 => {
+            if i.bits(72, 3) != 0 {
+                return err("PRMT mode");
+            }
+            one(Op::Prmt {
+                dst,
+                a,
+                sel: src_b()?.0,
+                c: src_c()?.0,
+            })
+        }
+        // LEA: (a << shift) + b, low word only.
+        0x011 => {
+            if i.on(80) || i.on(74) || i.bits(81, 3) != 7 {
+                return err("LEA.HI, .X or carry");
+            }
+            let (b, b_mods) = src_b()?;
+            one(Op::Iscadd {
+                dst,
+                a,
+                neg_a: i.on(72),
+                b,
+                neg_b: b_mods.neg,
+                shift: i.bits(75, 5),
+            })
+        }
+        // FRND.F32: rounding mode at 78..80.
+        0x107 => {
+            if i.bits(75, 2) != 2 || i.bits(84, 2) != 2 {
+                return err("FRND types");
+            }
+            let (src, mods) = src_b()?;
+            let round = match i.bits(78, 2) {
+                0 => Round::Nearest,
+                1 => Round::Floor,
+                2 => Round::Ceil,
+                _ => Round::Trunc,
+            };
+            one(Op::F2f {
+                dst,
+                src,
+                mods,
+                round,
+                sat: false,
+            })
+        }
+        // IMAD.WIDE (c and the result are register pairs) and IMAD.HI.
+        0x025 | 0x027 => {
+            if i.on(74) || i.bits(81, 3) != 7 {
+                return err("IMAD.WIDE/HI carry");
+            }
+            let b = src_b()?.0;
+            let (c, c_mods) = src_c()?;
+            if c_mods.neg {
+                return err("IMAD.WIDE/HI negated addend");
+            }
+            if op & 0x1FF == 0x025 {
+                let Operand::Reg(c) = c else {
+                    return err("IMAD.WIDE addend");
+                };
+                one(Op::ImadWide {
+                    dst,
+                    a,
+                    b,
+                    c,
+                    signed: i.on(73),
+                })
+            } else {
+                one(Op::ImadHi {
+                    dst,
+                    a,
+                    b,
+                    c,
+                    signed: i.on(73),
+                })
+            }
+        }
         _ => match op {
             // TEX / TLD on a 2D texture whose handle is word 40..54 of
             // constant bank 54..59: x in Ra, y in Rb; components (mask
@@ -621,6 +755,210 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                         comps: mask,
                         lz: lod == 1,
                     }
+                })
+            }
+            // S2R / S2UR: the special register at 72..80.
+            0x919 | 0x9C3 => {
+                let target = if op == 0x9C3 {
+                    ureg(u32::from(dst))
+                } else {
+                    dst
+                };
+                one(Op::S2r {
+                    dst: target,
+                    sr: i.bits(72, 8) as u8,
+                })
+            }
+            // CS2R: SRZ (zero) or the clock, 32 or 64 bits (bit 80).
+            0x805 => {
+                let sr = i.bits(72, 8) as u8;
+                let mut out = vec![Inst {
+                    pred,
+                    op: Op::S2r {
+                        dst,
+                        sr: if sr == 255 {
+                            super::decode::sr::LANE_ID
+                        } else {
+                            sr
+                        },
+                    },
+                }];
+                if i.on(80) && dst != RZ {
+                    out.push(Inst {
+                        pred,
+                        op: Op::S2r {
+                            dst: dst + 1,
+                            sr: if sr == 255 { 0 } else { sr.wrapping_add(1) },
+                        },
+                    });
+                }
+                Ok(out)
+            }
+            // LDC: bank 54..59, offset 38..54 from Ra; 32 or 64 bits.
+            0xB82 => {
+                let width = i.bits(73, 3);
+                if i.bits(78, 2) != 0 || !matches!(width, 4 | 5) {
+                    return err("LDC mode or width");
+                }
+                let bank = i.bits(54, 5);
+                if bank >= 18 {
+                    return err("LDC bank");
+                }
+                one(Op::Ldc {
+                    dst,
+                    index: bank as u8,
+                    base: a,
+                    offset: i.bits(38, 16) as i16 as i32 as u32,
+                    wide: width == 5,
+                })
+            }
+            // LDG / STG: 24-bit signed offset at 40, size at 73.
+            0x381 | 0x981 | 0x386 | 0x986 => {
+                let size = i.bits(73, 3) as u8;
+                if size > 6 {
+                    return err("global access size");
+                }
+                let offset = ((i.bits(40, 24) << 8) as i32) >> 8;
+                let load = op & 0xFF == 0x81;
+                let uaddr = match op {
+                    0x981 => {
+                        if i.bits(38, 2) != 0 {
+                            return err("LDG uniform address");
+                        }
+                        ureg(i.bits(32, 6))
+                    }
+                    0x986 => ureg(i.bits(64, 6)),
+                    _ => RZ,
+                };
+                if load && op == 0x381 && i.bits(64, 4) != 0 {
+                    return err("LDG load predicate");
+                }
+                let wide = if load { i.on(90) } else { i.on(72) };
+                one(if load {
+                    Op::Ldg {
+                        dst,
+                        addr: a,
+                        wide,
+                        uaddr,
+                        offset,
+                        size,
+                    }
+                } else {
+                    Op::Stg {
+                        src: i.reg(32),
+                        addr: a,
+                        wide,
+                        uaddr,
+                        offset,
+                        size,
+                    }
+                })
+            }
+            // PLOP3.LUT: a at 87, b at 77, c at 68 (a uniform predicate if
+            // bit 67); dst at 81 by the table, dst2 at 84 by bits 16..24.
+            0x81C => {
+                let c = if i.on(67) {
+                    i.upred_at(68)
+                } else {
+                    i.pred_at(68)
+                };
+                one(Op::Plop3 {
+                    dst: i.bits(81, 3) as u8,
+                    dst2: i.bits(84, 3) as u8,
+                    a: i.pred_at(87),
+                    b: i.pred_at(77),
+                    c,
+                    lut: i.plop3_lut(),
+                    lut2: i.bits(16, 8) as u8,
+                })
+            }
+            // VOTE.{ALL,ANY,EQ}, one invocation at a time.
+            0x806 => {
+                let mode = i.bits(72, 2);
+                if mode > 2 {
+                    return err("VOTE mode");
+                }
+                one(Op::Vote {
+                    dst,
+                    pdst: i.bits(81, 3) as u8,
+                    src: i.pred_at(87),
+                    eq: mode == 2,
+                })
+            }
+            // SHFL: one invocation reads its own value; in range.
+            0xF89 | 0x989 | 0x589 | 0x389 => Ok(vec![
+                Inst {
+                    pred,
+                    op: Op::Mov {
+                        dst,
+                        src: Operand::Reg(a),
+                    },
+                },
+                Inst {
+                    pred,
+                    op: Op::Plop3 {
+                        dst: i.bits(81, 3) as u8,
+                        dst2: 7,
+                        a: PT,
+                        b: PT,
+                        c: PT,
+                        lut: 0xFF,
+                        lut2: 0,
+                    },
+                },
+            ]),
+            // TXQ: dimensions (query 0 in bits 59..64) of a bound texture.
+            0xB6F => {
+                let mask = i.bits(72, 4) as u8;
+                if i.bits(59, 5) != 0 || mask == 0 || i.bits(76, 14) != 0 {
+                    return err("TXQ query");
+                }
+                let bank = i.bits(54, 5);
+                if bank >= 18 {
+                    return err("texture handle bank");
+                }
+                let second = i.reg(64);
+                one(Op::Txq {
+                    dst,
+                    dst1: match (second, dst) {
+                        (RZ, RZ) => RZ,
+                        (RZ, d) => d.wrapping_add(2),
+                        (s, _) => s,
+                    },
+                    lod: a,
+                    handle: super::decode::bank_handle(bank, i.bits(40, 14)),
+                    comps: mask,
+                })
+            }
+            // TLD4 on a 2D texture: component at 87..89.
+            0xB63 => {
+                let mask = i.bits(72, 4) as u8;
+                if i.bits(61, 3) != 1
+                    || i.bits(76, 4) != 0
+                    || i.bits(81, 3) != 7
+                    || i.on(59)
+                    || i.on(89)
+                    || mask == 0
+                {
+                    return err("TLD4 mode");
+                }
+                let bank = i.bits(54, 5);
+                if bank >= 18 {
+                    return err("texture handle bank");
+                }
+                let second = i.reg(64);
+                one(Op::Tld4 {
+                    dst0: dst,
+                    dst1: match (second, dst) {
+                        (RZ, RZ) => RZ,
+                        (RZ, d) => d.wrapping_add(2),
+                        (s, _) => s,
+                    },
+                    a: i.reg(24),
+                    b: i.reg(32),
+                    handle: super::decode::bank_handle(bank, i.bits(40, 14)),
+                    comp: i.bits(87, 2) as u8,
+                    comps: mask,
                 })
             }
             // MOV R, UR (the source in bits 32..38).
@@ -681,13 +1019,70 @@ fn cbuf_operand(i: &Instruction, index: usize) -> Result<Operand, DecodeError> {
 /// are the ordinary instruction with uniform registers (Lichii rewrites
 /// them the same way); the guard must be UPT.
 fn decode_uniform(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
+    let guard = i.upred_at(12);
+    let insts = decode_uniform_op(i, index)?;
+    Ok(insts
+        .into_iter()
+        .map(|mut inst| {
+            if inst.pred == PT {
+                inst.pred = guard;
+            }
+            inst
+        })
+        .collect())
+}
+
+fn decode_uniform_op(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
     let op = i.opcode();
-    if i.bits(12, 4) != 7 {
-        return Err(native(index, &i, "uniform predicate guard"));
-    }
     let dst = ureg(i.bits(16, 8));
     let one = |op: Op| Ok(vec![Inst::always(op)]);
+    let ub = |i: &Instruction| {
+        if op & 0x800 != 0 {
+            Operand::Imm(i.0[1])
+        } else {
+            Operand::Reg(ureg(i.bits(32, 8)))
+        }
+    };
     match op {
+        // UISETP: UP outputs at 81 and 84, combined with the UP at 87.
+        0x28C | 0x88C => {
+            if i.on(72) {
+                return Err(native(index, &i, "UISETP.EX"));
+            }
+            let bop = match i.bits(74, 2) {
+                0 => Bop::And,
+                1 => Bop::Or,
+                2 => Bop::Xor,
+                _ => return Err(native(index, &i, "predicate combination")),
+            };
+            one(Op::Isetp {
+                dst: upred(i.bits(81, 3)),
+                dst2: upred(i.bits(84, 3)),
+                cmp: i.bits(76, 3) as u8,
+                signed: i.on(73),
+                a: ureg(i.bits(24, 8)),
+                b: ub(&i),
+                bop,
+                c: i.upred_at(87),
+            })
+        }
+        // USEL: A when the UP at 87 holds.
+        0x287 | 0x887 => one(Op::Sel {
+            dst,
+            a: ureg(i.bits(24, 8)),
+            b: ub(&i),
+            cond: i.upred_at(87),
+        }),
+        // UPLOP3.LUT on uniform predicates.
+        0x89C => one(Op::Plop3 {
+            dst: upred(i.bits(81, 3)),
+            dst2: upred(i.bits(84, 3)),
+            a: i.upred_at(87),
+            b: i.upred_at(77),
+            c: i.upred_at(68),
+            lut: i.plop3_lut(),
+            lut2: i.bits(16, 8) as u8,
+        }),
         0x882 => one(Op::Mov {
             dst,
             src: Operand::Imm(i.0[1]),
@@ -724,7 +1119,21 @@ fn decode_uniform(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError
                 _ => Err(native(index, &i, "ULDC width")),
             }
         }
-        0xABB => Err(native(index, &i, "indexed ULDC")),
+        // ULDC with a uniform index register (24..32).
+        0xABB => {
+            let width = i.bits(73, 3);
+            let bank = i.bits(54, 5);
+            if !matches!(width, 4 | 5) || bank >= 18 {
+                return Err(native(index, &i, "indexed ULDC width or bank"));
+            }
+            one(Op::Ldc {
+                dst,
+                index: bank as u8,
+                base: ureg(i.bits(24, 8)),
+                offset: i.bits(38, 16) as i16 as i32 as u32,
+                wide: width == 5,
+            })
+        }
         // UIADD3, ULOP3, UIMAD, USHF: the ordinary opcode with the
         // registers rewritten to their IR homes.
         _ => {
@@ -741,15 +1150,22 @@ fn decode_uniform(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError
                 set(&mut r, 32, ureg(i.bits(32, 8)));
             }
             // ULOP3's predicate output is a uniform predicate.
-            if op & 0x1FF == 0x092 {
-                if i.bits(81, 3) != 7 {
-                    return Err(native(index, &i, "ULOP3 predicate output"));
-                }
+            let lop3_pred = (op & 0x1FF == 0x092).then(|| upred(i.bits(81, 3)));
+            if lop3_pred.is_some() {
                 r.0[2] |= 0xF << 23; // input PT (bits 87..91)
             }
             r.0[0] &= !0x80; // the ordinary opcode
+            r.0[0] = (r.0[0] & !(0xF << 12)) | (7 << 12); // guard: applied by the caller
             r.0[2] &= !(1 << 27); // bit 91
-            decode(r, index)
+            let mut out = decode(r, index)?;
+            if let Some(up) = lop3_pred {
+                for inst in &mut out {
+                    if let Op::Lop3 { pred, .. } = &mut inst.op {
+                        *pred = up;
+                    }
+                }
+            }
+            Ok(out)
         }
     }
 }
@@ -1143,5 +1559,180 @@ mod tests {
                 }
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::asm::*;
+    use super::*;
+    use crate::shader::interp::{run, ShaderIo};
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Io {
+        global: HashMap<u64, u8>,
+    }
+    impl ShaderIo for Io {
+        fn load_attr(&self, _: u32) -> u32 {
+            0
+        }
+        fn store_attr(&mut self, _: u32, _: u32) {}
+        fn interpolate(&self, _: u32, _: IpaMode) -> f32 {
+            0.0
+        }
+        /// Word at `offset` of bank `index` holds index * 0x1000 + offset.
+        fn cbuf(&self, index: u8, offset: u32) -> u32 {
+            u32::from(index) * 0x1000 + offset
+        }
+        fn load_global(&mut self, va: u64, buf: &mut [u8]) {
+            for (k, b) in buf.iter_mut().enumerate() {
+                *b = self.global.get(&(va + k as u64)).copied().unwrap_or(0);
+            }
+        }
+        fn store_global(&mut self, va: u64, data: &[u8]) {
+            for (k, &b) in data.iter().enumerate() {
+                self.global.insert(va + k as u64, b);
+            }
+        }
+    }
+
+    fn exec(insts: &[Instruction], init: &[(u8, u32)], io: &mut Io) -> [u32; 256] {
+        let code = program(insts);
+        let decoded = decode_program(&code[HEADER_SIZE..]).expect("decodes");
+        let mut program: Vec<Inst> = init
+            .iter()
+            .map(|&(dst, v)| {
+                Inst::always(Op::Mov {
+                    dst,
+                    src: Operand::Imm(v),
+                })
+            })
+            .collect();
+        program.extend(decoded);
+        run(&program, io).expect("runs").0
+    }
+
+    #[test]
+    fn bit_ops_and_wide_multiply() {
+        let r = exec(
+            &[
+                // POPC R2 = popc(R0)
+                inst(0x309, 2, &[(32, 8, 0)]),
+                // BREV R3 = brev(R0)
+                inst(0x301, 3, &[(32, 8, 0)]),
+                // FLO.U32 R4 = msb(R0)
+                inst(0x300, 4, &[(32, 8, 0), (81, 3, 7)]),
+                // PRMT R5 = R0, 0x7610 (imm), R1
+                inst(0x816, 5, &[(24, 8, 0), (32, 32, 0x7610), (64, 8, 1)]),
+                // IMAD.WIDE.U32 R6:R7 = R0 * R1 + R8:R9
+                inst(0x225, 6, &[(24, 8, 0), (32, 8, 1), (64, 8, 8), (81, 3, 7)]),
+                // IABS R10 = |R11|
+                inst(0x213, 10, &[(32, 8, 11)]),
+                // LEA R12 = (R0 << 4) + R1
+                inst(0x211, 12, &[(24, 8, 0), (32, 8, 1), (75, 5, 4), (81, 3, 7)]),
+                exit(),
+            ],
+            &[
+                (0, 0x0000_F00F),
+                (1, 0x1234_5678),
+                (8, 0xFFFF_FFFF),
+                (9, 1),
+                (11, (-5i32) as u32),
+            ],
+            &mut Io::default(),
+        );
+        assert_eq!(r[2], 8);
+        assert_eq!(r[3], 0xF00F_0000);
+        assert_eq!(r[4], 15);
+        assert_eq!(r[5], 0x1234_F00F);
+        let wide = 0xF00Fu64 * 0x1234_5678 + 0x1_FFFF_FFFF;
+        assert_eq!((r[6], r[7]), (wide as u32, (wide >> 32) as u32));
+        assert_eq!(r[10], 5);
+        assert_eq!(r[12], (0xF00F << 4) + 0x1234_5678);
+    }
+
+    #[test]
+    fn uniform_predicates_and_indexed_constants() {
+        let r = exec(
+            &[
+                // UISETP.GE.U32 UP1 = UR4 >= 7 (combined with UPT)
+                inst(
+                    0x88C,
+                    0,
+                    &[
+                        (24, 8, 4),
+                        (32, 32, 7),
+                        (76, 3, 6),
+                        (81, 3, 1),
+                        (84, 3, 7),
+                        (87, 4, 7),
+                    ],
+                ),
+                // USEL UR5 = UP1 ? UR4 : 99
+                inst(0x887, 5, &[(24, 8, 4), (32, 32, 99), (87, 4, 1)]),
+                // UPLOP3 UP2 = !UP1 (lut of a only: 0x0F)
+                inst(
+                    0x89C,
+                    0,
+                    &[
+                        (87, 4, 1),
+                        (77, 4, 7),
+                        (68, 4, 7),
+                        (64, 3, 7),
+                        (72, 5, 1),
+                        (81, 3, 2),
+                        (84, 3, 7),
+                    ],
+                ),
+                // @UP2 UMOV UR6, 1 / @!UP2 UMOV UR6, 2
+                inst(0x882, 6, &[(12, 4, 2), (32, 32, 1)]),
+                inst(0x882, 6, &[(12, 4, 0b1010), (32, 32, 2)]),
+                // LDC.64 R2:R3 = c[3][R0 + 0x10]
+                inst(
+                    0xB82,
+                    2,
+                    &[(24, 8, 0), (38, 16, 0x10), (54, 5, 3), (73, 3, 5)],
+                ),
+                // S2R R4 = SR_EQMASK
+                inst(0x919, 4, &[(72, 8, 56)]),
+                exit(),
+            ],
+            &[(ureg(4), 9), (0, 0x20)],
+            &mut Io::default(),
+        );
+        assert_eq!(r[ureg(5) as usize], 9);
+        assert_eq!(r[ureg(6) as usize], 2);
+        assert_eq!((r[2], r[3]), (0x3030, 0x3034));
+        assert_eq!(r[4], 1);
+    }
+
+    #[test]
+    fn global_memory() {
+        let mut io = Io::default();
+        let r = exec(
+            &[
+                // STG.E.64 [R0.64 + 8], R2:R3
+                inst(
+                    0x386,
+                    0,
+                    &[(24, 8, 0), (32, 8, 2), (40, 24, 8), (72, 1, 1), (73, 3, 5)],
+                ),
+                // LDG.E R4 = [R0.64 + 12]
+                inst(
+                    0x381,
+                    4,
+                    &[(24, 8, 0), (40, 24, 12), (73, 3, 4), (90, 1, 1)],
+                ),
+                // LDG.E.U8 R5 = [R0.64 + 8]
+                inst(0x381, 5, &[(24, 8, 0), (40, 24, 8), (73, 3, 0), (90, 1, 1)]),
+                exit(),
+            ],
+            &[(0, 0x1000), (1, 0x1), (2, 0xAABB_CCDD), (3, 0x1122_3344)],
+            &mut io,
+        );
+        assert_eq!(r[4], 0x1122_3344);
+        assert_eq!(r[5], 0xDD);
+        assert_eq!(io.global.get(&0x1_0000_1008), Some(&0xDD));
     }
 }

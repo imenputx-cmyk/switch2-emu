@@ -395,6 +395,19 @@ impl Texture {
         self.texels[(y as u32 * self.width + x as u32) as usize]
     }
 
+    /// Gathers component `comp` of the four texels a bilinear sample at
+    /// (u, v) reads, in gather order: (x0, y1), (x1, y1), (x1, y0), (x0, y0).
+    pub fn gather(&self, s: &Tsc, u: f32, v: f32, comp: u8) -> [f32; 4] {
+        let (x, y) = (u * self.width as f32 - 0.5, v * self.height as f32 - 0.5);
+        if !x.is_finite() || !y.is_finite() {
+            return [0.0; 4];
+        }
+        let (x0, y0) = (x.floor() as i64, y.floor() as i64);
+        let c = usize::from(comp & 3);
+        [(x0, y0 + 1), (x0 + 1, y0 + 1), (x0 + 1, y0), (x0, y0)]
+            .map(|(x, y)| self.texel(x, y, s)[c])
+    }
+
     /// Samples level 0 at normalized coordinates.
     pub fn sample(&self, s: &Tsc, u: f32, v: f32) -> [f32; 4] {
         let (x, y) = (u * self.width as f32, v * self.height as f32);
@@ -451,6 +464,21 @@ impl Bound {
 
     pub fn fetch(&self, handle: u32, x: i32, y: i32) -> [f32; 4] {
         self.0.get(&handle).map_or([0.0; 4], |(t, _)| t.fetch(x, y))
+    }
+
+    pub fn gather(&self, handle: u32, u: f32, v: f32, comp: u8) -> [f32; 4] {
+        self.0
+            .get(&handle)
+            .map_or([0.0; 4], |(t, s)| t.gather(s, u, v, comp))
+    }
+
+    /// Width, height, depth and levels (only level 0 is kept).
+    pub fn size(&self, handle: u32, lod: u32) -> [u32; 4] {
+        match self.0.get(&handle) {
+            Some((t, _)) if lod == 0 => [t.width, t.height, 1, 1],
+            Some(_) => [0, 0, 0, 1],
+            None => [0; 4],
+        }
     }
 }
 
