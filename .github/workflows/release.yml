@@ -1,0 +1,39 @@
+name: Release
+
+# Pushing a tag v* builds the Windows emulator (with the window front
+# end) and publishes it, with the test programs, as a GitHub release.
+# GitHub adds the source code zip to every release by itself.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup show active-toolchain
+      - run: cargo build --release -p emu-run --features window
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "switch2-emu-windows"
+          New-Item -ItemType Directory -Path "$dir/tests/programs" | Out-Null
+          Copy-Item target/release/emu-run.exe $dir/
+          Copy-Item README.md, LICENSE $dir/
+          Copy-Item tests/programs/*.nro "$dir/tests/programs/"
+          Copy-Item tests/programs/LICENSE-libnx.md "$dir/tests/programs/"
+          Compress-Archive -Path $dir -DestinationPath switch2-emu-windows.zip
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "nightly" }
+          if ($tag -eq "nightly") { gh release delete $tag --yes --cleanup-tag 2>$null; $global:LASTEXITCODE = 0 }
+          gh release create $tag switch2-emu-windows.zip --target ${{ github.sha }} --title "switch2-emu $tag" --notes "Windows build (emu-run.exe with the window front end) and test programs. Run from a terminal, e.g.: ``emu-run.exe --gpu=vulkan tests/programs/hb_triangle.nro``. Games need your own console's keys in %USERPROFILE%\.switch\prod.keys."
