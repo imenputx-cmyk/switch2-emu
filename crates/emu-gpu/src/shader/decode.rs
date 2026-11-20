@@ -11,6 +11,15 @@
 
 pub const RZ: u8 = 255;
 
+/// A texture handle naming its own constant bank (SM86): set in bit 31,
+/// the bank in bits 16..21 and the word offset below. Other handles are
+/// word offsets in the bindless constant buffer (register 0x2608).
+pub const HANDLE_IN_BANK: u32 = 1 << 31;
+
+pub const fn bank_handle(bank: u32, word: u32) -> u32 {
+    HANDLE_IN_BANK | (bank & 0x1F) << 16 | (word & 0xFFFF)
+}
+
 /// A predicate operand: P0-P6, or PT (7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pred {
@@ -337,6 +346,16 @@ pub enum Op {
         addr: u32,
         mode: IpaMode,
         sat: bool,
+    },
+    /// Fetches the texel at integer (a, b) of level 0 of a 2D texture
+    /// (TLD.LZ); components go out as for TEXS.
+    Tld {
+        dst0: u8,
+        dst1: u8,
+        a: u8,
+        b: u8,
+        handle: u32,
+        comps: u8,
     },
     /// Samples a 2D texture at (a, b); the enabled components (`comps`,
     /// RGBA bits) go to dst0, dst0 + 1, dst1, dst1 + 1 in order.

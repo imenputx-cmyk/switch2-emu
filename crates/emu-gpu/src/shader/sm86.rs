@@ -573,6 +573,56 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
             })
         }
         _ => match op {
+            // TEX / TLD on a 2D texture whose handle is word 40..54 of
+            // constant bank 54..59: x in Ra, y in Rb; components (mask
+            // 72..76) to Rd, Rd + 1, then the second destination (64..72)
+            // or Rd + 2.
+            0xB60 | 0xB66 => {
+                let mask = i.bits(72, 4) as u8;
+                let lod = i.bits(87, 3);
+                let fetch = op == 0xB66;
+                if i.bits(61, 3) != 1 {
+                    return err("texture dimension other than 2D");
+                }
+                if i.bits(76, 4) != 0 || i.bits(81, 3) != 7 || i.on(59) || mask == 0 {
+                    return err("texture offsets, depth compare, FP16 or predicate");
+                }
+                if (fetch && lod != 1) || (!fetch && lod > 1) {
+                    return err("texture level mode");
+                }
+                let bank = i.bits(54, 5);
+                if bank >= 18 {
+                    return err("texture handle bank");
+                }
+                let handle = super::decode::bank_handle(bank, i.bits(40, 14));
+                let second = i.reg(64);
+                let dst1 = match (second, dst) {
+                    (RZ, RZ) => RZ,
+                    (RZ, d) => d.wrapping_add(2),
+                    (s, _) => s,
+                };
+                let (a, b) = (i.reg(24), i.reg(32));
+                one(if fetch {
+                    Op::Tld {
+                        dst0: dst,
+                        dst1,
+                        a,
+                        b,
+                        handle,
+                        comps: mask,
+                    }
+                } else {
+                    Op::Texs {
+                        dst0: dst,
+                        dst1,
+                        a,
+                        b,
+                        handle,
+                        comps: mask,
+                        lz: lod == 1,
+                    }
+                })
+            }
             // MOV R, UR (the source in bits 32..38).
             0xC02 => one(Op::Mov {
                 dst,
@@ -954,6 +1004,66 @@ mod tests {
             }) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn textures() {
+        // TEX R4 (RGBA, contiguous), handle c[2][0x30 words]; TLD.LZ R8 (RG).
+        let code = program(&[
+            inst(
+                0xB60,
+                4,
+                &[
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (40, 14, 0x30),
+                    (54, 5, 2),
+                    (61, 3, 1),
+                    (64, 8, 255),
+                    (72, 4, 15),
+                    (81, 3, 7),
+                ],
+            ),
+            inst(
+                0xB66,
+                8,
+                &[
+                    (24, 8, 2),
+                    (32, 8, 3),
+                    (40, 14, 0x31),
+                    (54, 5, 2),
+                    (61, 3, 1),
+                    (64, 8, 255),
+                    (72, 4, 3),
+                    (81, 3, 7),
+                    (87, 3, 1),
+                ],
+            ),
+            exit(),
+        ]);
+        let p = decode_program(&code[HEADER_SIZE..]).unwrap();
+        assert_eq!(
+            p[0].op,
+            Op::Texs {
+                dst0: 4,
+                dst1: 6,
+                a: 0,
+                b: 1,
+                handle: super::super::decode::bank_handle(2, 0x30),
+                comps: 15,
+                lz: false
+            }
+        );
+        assert!(matches!(
+            p[1].op,
+            Op::Tld {
+                dst0: 8,
+                a: 2,
+                b: 3,
+                comps: 3,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub trait ShaderIo {
     fn texture(&self, _handle: u32, _u: f32, _v: f32) -> [f32; 4] {
         [0.0; 4]
     }
+    /// Fetches texel (x, y) of level 0; zero outside the texture.
+    fn fetch(&self, _handle: u32, _x: i32, _y: i32) -> [f32; 4] {
+        [0.0; 4]
+    }
 }
 
 pub struct Regs(pub [u32; 256]);
@@ -618,6 +622,21 @@ impl Machine<'_> {
                 ..
             } => {
                 let t = self.io.texture(handle, self.regs.f(a), self.regs.f(b));
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    self.regs.set(texs_dst(dst0, dst1, k), t[c].to_bits());
+                }
+            }
+            Op::Tld {
+                dst0,
+                dst1,
+                a,
+                b,
+                handle,
+                comps,
+            } => {
+                let t = self
+                    .io
+                    .fetch(handle, self.regs.get(a) as i32, self.regs.get(b) as i32);
                 for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
                     self.regs.set(texs_dst(dst0, dst1, k), t[c].to_bits());
                 }

@@ -826,3 +826,111 @@ fn switch2_uniforms_and_root_tables() {
         .count();
     assert!(blue > 500, "{blue} pixels took blue from the root table");
 }
+
+#[test]
+fn switch2_textures() {
+    use emu_gpu::shader::asm::{pixel_header, vertex_header};
+    use emu_gpu::shader::sm86::asm::{exit, inst, program};
+    let with_header = |header: &[u8], insts: &[emu_gpu::shader::sm86::Instruction]| {
+        let mut p = program(insts);
+        p[..header.len()].copy_from_slice(header);
+        p
+    };
+    let vs = with_header(
+        &vertex_header(),
+        &[
+            inst(
+                0x321,
+                0,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x80), (74, 2, 3)],
+            ),
+            inst(
+                0x321,
+                4,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x90), (74, 2, 3)],
+            ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 0),
+                    (40, 10, 0x70),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 4),
+                    (40, 10, 0x80),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            exit(),
+        ],
+    );
+    let fmul_imm =
+        |d: u8, a: u32, k: f32| inst(0x820, d, &[(24, 8, a), (32, 32, k.to_bits()), (84, 3, 4)]);
+    let fadd = |d: u8, a: u32, b: u32| inst(0x221, d, &[(24, 8, a), (32, 8, b)]);
+    // F2I.U32.TRUNC from F32.
+    let f2i = |d: u8, a: u32| inst(0x305, d, &[(32, 8, a), (64, 32, 0x0020_F000)]);
+    // PS: the checkerboard sampled (TEX, handle word 0 of bank 0) at
+    // 2.5 x (u, v), averaged with the gradient texel fetched (TLD.LZ,
+    // word 1) at (u, v) x 3.99.
+    let ps = with_header(
+        &pixel_header(),
+        &[
+            inst(0x326, 0, &[(32, 8, 255), (64, 8, 0x20), (81, 3, 7)]),
+            inst(0x326, 1, &[(32, 8, 255), (64, 8, 0x21), (81, 3, 7)]),
+            fmul_imm(4, 0, 2.5),
+            fmul_imm(5, 1, 2.5),
+            fmul_imm(6, 0, 3.99),
+            fmul_imm(7, 1, 3.99),
+            f2i(6, 6),
+            f2i(7, 7),
+            inst(
+                0xB60,
+                0,
+                &[
+                    (24, 8, 4),
+                    (32, 8, 5),
+                    (40, 14, 0),
+                    (54, 5, 0),
+                    (61, 3, 1),
+                    (64, 8, 255),
+                    (72, 4, 7),
+                    (81, 3, 7),
+                ],
+            ),
+            inst(
+                0xB66,
+                8,
+                &[
+                    (24, 8, 6),
+                    (32, 8, 7),
+                    (40, 14, 1),
+                    (54, 5, 0),
+                    (61, 3, 1),
+                    (64, 8, 255),
+                    (72, 4, 7),
+                    (81, 3, 7),
+                    (87, 3, 1),
+                ],
+            ),
+            fadd(0, 0, 8),
+            fmul_imm(0, 0, 0.5),
+            fadd(1, 1, 9),
+            fmul_imm(1, 1, 0.5),
+            fadd(2, 2, 10),
+            fmul_imm(2, 2, 0.5),
+            inst(0x802, 3, &[(32, 32, 1.0f32.to_bits()), (72, 4, 15)]),
+            exit(),
+        ],
+    );
+    shaded_draw_on(vs, ps, 64, &[], true);
+}

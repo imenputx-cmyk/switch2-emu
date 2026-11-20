@@ -115,6 +115,8 @@ mod op {
     pub const TYPE_SAMPLED_IMAGE: u16 = 27;
     pub const COMPOSITE_EXTRACT: u16 = 81;
     pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
+    pub const IMAGE_FETCH: u16 = 95;
+    pub const IMAGE: u16 = 100;
 }
 
 // Storage classes, decorations, built-ins, GLSL.std.450 instructions.
@@ -211,6 +213,8 @@ struct Common {
     p_private_stack: u32,
     null_stack: u32,
     vec2: u32,
+    uvec2: u32,
+    image_t: u32,
     sampled_image: u32,
     p_sampled_image: u32,
 }
@@ -738,6 +742,37 @@ impl Translator {
             &mut self.m.body,
             op::IMAGE_SAMPLE_EXPLICIT_LOD,
             &[self.c.vec4, texel, img, coord, 0x2, self.c.zero_f],
+        );
+        Ok([0, 1, 2, 3].map(|k| {
+            let id = self.m.id();
+            inst(
+                &mut self.m.body,
+                op::COMPOSITE_EXTRACT,
+                &[self.c.float, id, texel, k],
+            );
+            id
+        }))
+    }
+
+    /// Fetches texel (x, y) of level 0 (OpImageFetch on the sampled
+    /// image's image).
+    fn fetch(&mut self, handle: u32, x: u32, y: u32) -> Result<[u32; 4], String> {
+        let var = self.texture_var(handle)?;
+        let sampled = self.load(self.c.sampled_image, var);
+        let img = self.m.id();
+        inst(&mut self.m.body, op::IMAGE, &[self.c.image_t, img, sampled]);
+        let coord = self.m.id();
+        inst(
+            &mut self.m.body,
+            op::COMPOSITE_CONSTRUCT,
+            &[self.c.uvec2, coord, x, y],
+        );
+        let texel = self.m.id();
+        // Image operand Lod (0x2) = 0.
+        inst(
+            &mut self.m.body,
+            op::IMAGE_FETCH,
+            &[self.c.vec4, texel, img, coord, 0x2, self.c.zero_u],
         );
         Ok([0, 1, 2, 3].map(|k| {
             let id = self.m.id();
@@ -1333,6 +1368,21 @@ impl Translator {
                     self.store_float(super::interp::texs_dst(dst0, dst1, k), t[c], false);
                 }
             }
+            Op::Tld {
+                dst0,
+                dst1,
+                a,
+                b,
+                handle,
+                comps,
+            } => {
+                let x = self.load_reg(a);
+                let y = self.load_reg(b);
+                let t = self.fetch(handle, x, y)?;
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    self.store_float(super::interp::texs_dst(dst0, dst1, k), t[c], false);
+                }
+            }
             Op::Tex {
                 dst,
                 a,
@@ -1589,6 +1639,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     let (bool_t, true_c, false_c, p_private_bool) = (m.id(), m.id(), m.id(), m.id());
     let (len_ssy, stack_t, p_private_stack, null_stack) = (m.id(), m.id(), m.id(), m.id());
     let (vec2, image_t, sampled_image, p_sampled_image) = (m.id(), m.id(), m.id(), m.id());
+    let uvec2 = m.id();
     let g = &mut m.globals;
     inst(g, op::TYPE_BOOL, &[bool_t]);
     inst(g, op::CONSTANT_TRUE, &[bool_t, true_c]);
@@ -1599,6 +1650,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     inst(g, op::TYPE_POINTER, &[p_private_stack, PRIVATE, stack_t]);
     inst(g, op::CONSTANT_NULL, &[stack_t, null_stack]);
     inst(g, op::TYPE_VECTOR, &[vec2, float, 2]);
+    inst(g, op::TYPE_VECTOR, &[uvec2, uint, 2]);
     // 2D, not depth, not arrayed, single-sampled, sampled, format unknown.
     inst(g, op::TYPE_IMAGE, &[image_t, float, 1, 0, 0, 0, 1, 0]);
     inst(g, op::TYPE_SAMPLED_IMAGE, &[sampled_image, image_t]);
@@ -1634,6 +1686,8 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         p_private_stack,
         null_stack,
         vec2,
+        uvec2,
+        image_t,
         sampled_image,
         p_sampled_image,
     };

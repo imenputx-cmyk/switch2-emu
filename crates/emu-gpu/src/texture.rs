@@ -387,6 +387,14 @@ impl Texture {
         }
     }
 
+    /// Texel (x, y) of level 0, zero outside the texture.
+    pub fn fetch(&self, x: i32, y: i32) -> [f32; 4] {
+        if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
+            return [0.0; 4];
+        }
+        self.texels[(y as u32 * self.width + x as u32) as usize]
+    }
+
     /// Samples level 0 at normalized coordinates.
     pub fn sample(&self, s: &Tsc, u: f32, v: f32) -> [f32; 4] {
         let (x, y) = (u * self.width as f32, v * self.height as f32);
@@ -439,6 +447,10 @@ impl Bound {
         self.0
             .get(&handle)
             .map_or([0.0; 4], |(t, s)| t.sample(s, u, v))
+    }
+
+    pub fn fetch(&self, handle: u32, x: i32, y: i32) -> [f32; 4] {
+        self.0.get(&handle).map_or([0.0; 4], |(t, _)| t.fetch(x, y))
     }
 }
 

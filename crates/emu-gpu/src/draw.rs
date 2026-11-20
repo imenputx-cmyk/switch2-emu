@@ -127,7 +127,7 @@ pub fn cbuf_bytes(
 pub fn texture_handles(program: &[Inst]) -> Vec<u32> {
     let mut out = Vec::new();
     for i in program {
-        if let Op::Texs { handle, .. } | Op::Tex { handle, .. } = i.op {
+        if let Op::Texs { handle, .. } | Op::Tex { handle, .. } | Op::Tld { handle, .. } = i.op {
             if !out.contains(&handle) {
                 out.push(handle);
             }
@@ -143,8 +143,14 @@ pub fn texture_handle_word(
     cbufs: &[Option<ConstBuffer>; CBUF_SLOTS],
     handle: u32,
 ) -> Result<u32, String> {
+    // SM86 handles name their bank.
+    let (slot, handle) = if handle & crate::shader::decode::HANDLE_IN_BANK != 0 {
+        ((handle >> 16) & 0x1F, handle & 0xFFFF)
+    } else {
+        (pools.cbuf_slot, handle)
+    };
     let cb = cbufs
-        .get(pools.cbuf_slot as usize)
+        .get(slot as usize)
         .copied()
         .flatten()
         .ok_or("texture handle constant buffer not bound")?;
@@ -333,6 +339,10 @@ impl ShaderIo for VertexIo<'_> {
     fn texture(&self, handle: u32, u: f32, v: f32) -> [f32; 4] {
         self.tex.sample(handle, u, v)
     }
+
+    fn fetch(&self, handle: u32, x: i32, y: i32) -> [f32; 4] {
+        self.tex.fetch(handle, x, y)
+    }
 }
 
 struct PixelIo<'a> {
@@ -363,6 +373,10 @@ impl ShaderIo for PixelIo<'_> {
     }
     fn texture(&self, handle: u32, u: f32, v: f32) -> [f32; 4] {
         self.tex.sample(handle, u, v)
+    }
+
+    fn fetch(&self, handle: u32, x: i32, y: i32) -> [f32; 4] {
+        self.tex.fetch(handle, x, y)
     }
 }
 
