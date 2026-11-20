@@ -246,7 +246,8 @@ impl Horizon {
     pub fn set_jit(&mut self, on: bool) -> bool {
         #[cfg(feature = "jit")]
         {
-            self.jit = on.then(emu_jit::Jit::new);
+            // Fast memory: the JIT reaches read-write pages directly.
+            self.jit = on.then(|| emu_jit::Jit::with_page_table(&mut self.mem));
             self.jit.is_some()
         }
         #[cfg(not(feature = "jit"))]

@@ -48,7 +48,11 @@ mod ffi {
     }
 
     extern "C" {
-        pub fn emu_jit_new(cb: *const Callbacks) -> *mut EmuJit;
+        pub fn emu_jit_new(
+            cb: *const Callbacks,
+            page_table: *mut *mut u8,
+            page_table_bits: u32,
+        ) -> *mut EmuJit;
         pub fn emu_jit_free(jit: *mut EmuJit);
         pub fn emu_jit_run(jit: *mut EmuJit, state: *mut State) -> u32;
         pub fn emu_jit_invalidate(jit: *mut EmuJit, addr: u64, size: u64);
@@ -83,6 +87,16 @@ impl Default for Jit {
 
 impl Jit {
     pub fn new() -> Self {
+        Self::create(std::ptr::null_mut())
+    }
+
+    /// A JIT that reaches `mem`'s readable and writable pages directly
+    /// through its page table. It must only run with that memory.
+    pub fn with_page_table(mem: &mut Memory) -> Self {
+        Self::create(mem.enable_page_table().cast())
+    }
+
+    fn create(page_table: *mut *mut u8) -> Self {
         let mut ctx = Box::new(Ctx {
             cpu: std::ptr::null_mut(),
             mem: std::ptr::null_mut(),
@@ -103,7 +117,7 @@ impl Jit {
         };
         // SAFETY: the shim copies the callback table; `ctx` is boxed, so
         // its address stays valid for the JIT's lifetime.
-        let raw = unsafe { ffi::emu_jit_new(&cb) };
+        let raw = unsafe { ffi::emu_jit_new(&cb, page_table, emu_memory::PAGE_TABLE_ADDRESS_BITS) };
         Jit { raw, ctx }
     }
 
@@ -348,6 +362,32 @@ mod tests {
         assert_eq!(cpu.read_xzr(0), 55);
         assert_eq!(mem.read_u64(DATA).unwrap(), 55);
         assert_eq!(cpu.pc(), CODE + 7 * 4);
+    }
+
+    #[test]
+    fn page_table_loads_and_stores() {
+        // str x0, [x2]; ldr x1, [x2, #8]; str x0, [x3]; ldr x4, [x3]; svc #1
+        let code = [
+            0xF900_0040,
+            0xF940_0441,
+            0xF900_0060,
+            0xF940_0064,
+            0xD400_0021,
+        ];
+        let (mut cpu, mut mem) = setup(&code);
+        mem.map(DATA + 0x1000, 0x1000, Perm::RW).unwrap();
+        // The first data page has data (in the table); the second is
+        // untouched (slow path) until the straddling store.
+        mem.write(DATA + 8, &0x1234u64.to_le_bytes()).unwrap();
+        let mut jit = Jit::with_page_table(&mut mem);
+        cpu.write_xzr(0, 0x1122_3344_5566_7788);
+        cpu.write_xzr(2, DATA);
+        cpu.write_xzr(3, DATA + 0xFFC);
+        assert_eq!(jit.run(&mut cpu, &mut mem, 100), Some(Exit::Svc(1)));
+        assert_eq!(cpu.read_xzr(1), 0x1234);
+        assert_eq!(cpu.read_xzr(4), 0x1122_3344_5566_7788);
+        assert_eq!(mem.read_u64(DATA).unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(mem.read_u64(DATA + 0xFFC).unwrap(), 0x1122_3344_5566_7788);
     }
 
     #[test]

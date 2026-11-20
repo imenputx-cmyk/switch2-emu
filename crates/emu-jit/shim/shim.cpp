@@ -233,7 +233,7 @@ void Callbacks::ExceptionRaised(std::uint64_t pc, Dynarmic::A64::Exception excep
 
 extern "C" {
 
-EmuJit* emu_jit_new(const EmuJitCallbacks* cb) {
+EmuJit* emu_jit_new(const EmuJitCallbacks* cb, void** page_table, std::uint32_t page_table_bits) {
     auto* e = new EmuJit;
     e->callbacks.parent = e;
     e->callbacks.cb = *cb;
@@ -247,8 +247,18 @@ EmuJit* emu_jit_new(const EmuJitCallbacks* cb) {
     config.cntfrq_el0 = 19'200'000;
     config.dczid_el0 = 4;
     config.ctr_el0 = 0x8444c004;
-    // Our memory is reached through callbacks (no page table yet), so a
-    // failed access stops the block right after it.
+    // Readable and writable pages with data are reached directly through
+    // the page table; everything else (and accesses straddling a page)
+    // goes through the callbacks, where a failed access stops the block
+    // right after it.
+    if (page_table != nullptr) {
+        config.page_table = page_table;
+        config.page_table_address_space_bits = page_table_bits;
+        config.silently_mirror_page_table = false;
+        config.absolute_offset_page_table = false;
+        config.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = true;
+    }
     config.check_halt_on_memory_access = true;
     config.enable_cycle_counting = true;
     config.code_cache_size = 128 * 1024 * 1024;

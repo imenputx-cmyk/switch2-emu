@@ -97,14 +97,54 @@ enum Access {
     Fetch,
 }
 
+/// Address bits the page table covers (Horizon's 39-bit address space).
+pub const PAGE_TABLE_ADDRESS_BITS: u32 = 39;
+const PAGE_TABLE_ENTRIES: usize = 1 << (PAGE_TABLE_ADDRESS_BITS - PAGE_BITS);
+
 #[derive(Default)]
 pub struct Memory {
     pages: HashMap<u64, Page>,
+    /// For the JIT's direct memory access: the host address of every
+    /// readable and writable page that has data, by page number (zero for
+    /// the others, which go through the slow path). Kept in step with
+    /// `pages` once enabled.
+    table: Option<Box<[usize]>>,
 }
 
 impl Memory {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Turns on the page table and returns its address (stable for the
+    /// memory's lifetime). The table is large (1 GiB of address space)
+    /// but untouched entries cost no physical memory.
+    pub fn enable_page_table(&mut self) -> *mut usize {
+        if self.table.is_none() {
+            self.table = Some(vec![0usize; PAGE_TABLE_ENTRIES].into_boxed_slice());
+            let pages: Vec<u64> = self.pages.keys().copied().collect();
+            for page in pages {
+                self.sync_entry(page);
+            }
+        }
+        self.table.as_mut().expect("enabled").as_mut_ptr()
+    }
+
+    /// Recomputes page table entry `page`.
+    fn sync_entry(&mut self, page: u64) {
+        let Some(table) = self.table.as_mut() else {
+            return;
+        };
+        let Some(slot) = table.get_mut(page as usize) else {
+            return;
+        };
+        *slot = match self.pages.get_mut(&page) {
+            Some(Page {
+                data: Some(d),
+                perm,
+            }) if perm.read && perm.write => d.as_mut_ptr() as usize,
+            _ => 0,
+        };
     }
 
     /// Maps `size` bytes at `addr` as zeroed memory. Both must be
@@ -120,6 +160,7 @@ impl Memory {
         let first = addr >> PAGE_BITS;
         for i in 0..(size >> PAGE_BITS) {
             self.pages.insert(first + i, Page { data: None, perm });
+            self.sync_entry(first + i);
         }
         Ok(())
     }
@@ -130,7 +171,10 @@ impl Memory {
         let last = addr.saturating_add(size.max(1) - 1) >> PAGE_BITS;
         for page in first..=last {
             match self.pages.get_mut(&page) {
-                Some(p) => p.perm = perm,
+                Some(p) => {
+                    p.perm = perm;
+                    self.sync_entry(page);
+                }
                 None => {
                     return Err(Fault {
                         addr: page << PAGE_BITS,
@@ -151,6 +195,7 @@ impl Memory {
         let first = addr >> PAGE_BITS;
         for i in 0..(size >> PAGE_BITS) {
             self.pages.remove(&(first + i));
+            self.sync_entry(first + i);
         }
         Ok(())
     }
@@ -175,7 +220,9 @@ impl Memory {
                 .pages
                 .remove(&((src >> PAGE_BITS) + i))
                 .expect("checked");
+            self.sync_entry((src >> PAGE_BITS) + i);
             self.pages.insert((dst >> PAGE_BITS) + i, page);
+            self.sync_entry((dst >> PAGE_BITS) + i);
         }
         Ok(())
     }
@@ -262,10 +309,14 @@ impl Memory {
             let off = (a & PAGE_MASK) as usize;
             let n = (PAGE_SIZE as usize - off).min(data.len() - done);
             let page = self.pages.get_mut(&(a >> PAGE_BITS)).expect("checked");
+            let fresh = page.data.is_none();
             let d = page
                 .data
                 .get_or_insert_with(|| Box::new([0; PAGE_SIZE as usize]));
             d[off..off + n].copy_from_slice(&data[done..done + n]);
+            if fresh {
+                self.sync_entry(a >> PAGE_BITS);
+            }
             done += n;
         }
     }
@@ -303,6 +354,34 @@ impl Memory {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn page_table_tracks_writable_pages() {
+        let mut m = Memory::new();
+        m.map(0x10_0000, 0x2000, Perm::RW).unwrap();
+        let table = m.enable_page_table();
+        let entry = |page: u64| unsafe { *table.add(page as usize) };
+        // Untouched pages stay on the slow path until written.
+        assert_eq!(entry(0x100), 0);
+        m.write(0x10_0008, &[1, 2, 3, 4]).unwrap();
+        let host = entry(0x100);
+        assert_ne!(host, 0);
+        assert_eq!(unsafe { *((host + 8) as *const u8) }, 1);
+        // Writes through the table are seen by reads.
+        unsafe { *((host + 0x10) as *mut u8) = 9 };
+        let mut b = [0u8; 1];
+        m.read(0x10_0010, &mut b).unwrap();
+        assert_eq!(b, [9]);
+        m.protect(0x10_0000, 0x1000, Perm::R).unwrap();
+        assert_eq!(entry(0x100), 0);
+        m.protect(0x10_0000, 0x1000, Perm::RW).unwrap();
+        assert_eq!(entry(0x100), host);
+        m.move_pages(0x10_0000, 0x20_0000, 0x1000).unwrap();
+        assert_eq!((entry(0x100), entry(0x200)), (0, host));
+        m.unmap(0x20_0000, 0x1000).unwrap();
+        assert_eq!(entry(0x200), 0);
+    }
+
     use super::*;
 
     #[test]
