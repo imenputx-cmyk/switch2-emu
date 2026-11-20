@@ -7,6 +7,10 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create (e.g. v0.1.0); empty for "nightly"
+        required: false
 
 permissions:
   contents: write
@@ -34,6 +38,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "nightly" }
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } elseif ("${{ inputs.tag }}" -ne "") { "${{ inputs.tag }}" } else { "nightly" }
           if ($tag -eq "nightly") { gh release delete $tag --yes --cleanup-tag 2>$null; $global:LASTEXITCODE = 0 }
           gh release create $tag switch2-emu-windows.zip --target ${{ github.sha }} --title "switch2-emu $tag" --notes "Windows build (emu-run.exe with the window front end) and test programs. Run from a terminal, e.g.: ``emu-run.exe --gpu=vulkan tests/programs/hb_triangle.nro``. Games need your own console's keys in %USERPROFILE%\.switch\prod.keys."
