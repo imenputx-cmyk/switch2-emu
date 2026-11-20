@@ -129,6 +129,8 @@ struct Session {
 }
 
 pub struct Horizon {
+    /// The running program's ID (from its NPDM; a homebrew default).
+    pub program_id: u64,
     pub mem: Memory,
     pub cpu: Cpu,
     pub map: MemoryMap,
@@ -169,6 +171,7 @@ impl Default for Horizon {
 impl Horizon {
     pub fn new() -> Self {
         Horizon {
+            program_id: 0x0100_0000_0000_1000,
             mem: Memory::new(),
             cpu: Cpu::new(),
             map: MemoryMap::new(),
@@ -252,7 +255,7 @@ impl Horizon {
             .write_privileged(base, &nro_file[..file_end])
             .expect("mapped above");
 
-        let stack_top = self.create_main_thread();
+        let stack_top = self.create_main_thread(0x2C);
         let info_addr = l.loader_page + 0x40;
         self.mem
             .write_privileged(info_addr, LOADER_INFO.as_bytes())
@@ -306,7 +309,7 @@ impl Horizon {
     /// Maps the main thread's stack and TLS, creates the thread and its
     /// handle, and the loader page with the return stub (BRK, recognised
     /// by `run`). Returns the stack top.
-    fn create_main_thread(&mut self) -> u64 {
+    fn create_main_thread(&mut self, priority: u32) -> u64 {
         let l = self.layout;
         let stack_top = l.stack.0 + l.main_stack_size;
         self.map_block(
@@ -317,7 +320,7 @@ impl Horizon {
         );
         let tls = self.alloc_tls();
         debug_assert_eq!(tls, l.tls_page);
-        let main = self.add_thread(Cpu::new(), 0x2C, tls, threads::ThreadState::Runnable);
+        let main = self.add_thread(Cpu::new(), priority, tls, threads::ThreadState::Runnable);
         self.current = main;
         self.main_thread_handle = self
             .handles
@@ -334,13 +337,26 @@ impl Horizon {
     /// Loads an application's modules (NSO, in ExeFS order: rtld, main,
     /// subsdk*, sdk) one after another and enters the first, the way the
     /// kernel starts an application: X0 = 0 (no arguments), X1 = the
-    /// main thread's handle.
+    /// main thread's handle. `npdm` (the ExeFS's `main.npdm`) sets the
+    /// program ID and the main thread's stack size and priority.
     pub fn boot_application(
         &mut self,
         modules: &[emu_loader::nso::Module],
+        npdm: Option<&emu_loader::npdm::Npdm>,
     ) -> Result<(), LoadError> {
         if modules.is_empty() {
             return Err(LoadError::Unsupported("no modules"));
+        }
+        let mut priority = 0x2C;
+        if let Some(n) = npdm {
+            if !n.is_64bit {
+                return Err(LoadError::Unsupported("32-bit programs"));
+            }
+            self.program_id = n.program_id;
+            if n.main_stack_size != 0 {
+                self.layout.main_stack_size = u64::from(n.main_stack_size).next_multiple_of(PAGE);
+            }
+            priority = u32::from(n.main_thread_priority);
         }
         let l = self.layout;
         let mut base = l.image_base;
@@ -372,7 +388,8 @@ impl Horizon {
                 .map_err(|e| LoadError::Memory(format!("{e:?}")))?;
             base += size.next_multiple_of(PAGE);
         }
-        let stack_top = self.create_main_thread();
+        let stack_top = self.create_main_thread(priority);
+        let l = self.layout;
         self.cpu = Cpu::new();
         self.cpu.set_pc(l.image_base);
         self.cpu.write_sp(31, stack_top);
@@ -1001,7 +1018,7 @@ impl Horizon {
                     14 => process_info(l.stack.0),
                     15 => process_info(l.stack.1),
                     16 | 17 => process_info(0), // System resource size.
-                    18 => process_info(0x0100_0000_0000_1000), // ProgramId
+                    18 => process_info(self.program_id), // ProgramId
                     23 => process_info(1),      // IsApplication
                     24 => process_info(64),     // FreeThreadCount
                     _ => process_info(0),       // AliasRegionExtraSize

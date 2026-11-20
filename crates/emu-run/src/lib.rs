@@ -159,8 +159,8 @@ pub fn run_nro_with(
 pub enum Program {
     /// A homebrew NRO.
     Homebrew(Vec<u8>),
-    /// An application's NSO modules, in ExeFS order.
-    Application(Vec<emu_loader::nso::Module>),
+    /// An application's NSO modules, in ExeFS order, and its NPDM.
+    Application(Vec<emu_loader::nso::Module>, Option<emu_loader::npdm::Npdm>),
 }
 
 impl Program {
@@ -194,14 +194,22 @@ impl Program {
             };
             let keys = emu_loader::nca::Keys::load(&keys_path).map_err(|e| format!("keys: {e}"))?;
             let exefs = emu_loader::nca::find_exefs(path, &keys).map_err(|e| e.to_string())?;
+            let read = |name: &str| {
+                exefs
+                    .open(name)
+                    .map(|s| s.read_vec(0, s.len() as usize).map_err(|e| e.to_string()))
+                    .transpose()
+            };
             let mut modules = Vec::new();
             for name in Program::module_names() {
-                if let Some(s) = exefs.open(&name) {
-                    let data = s.read_vec(0, s.len() as usize).map_err(|e| e.to_string())?;
+                if let Some(data) = read(&name)? {
                     modules.push(parse(&data, &name)?);
                 }
             }
-            return Ok(Program::Application(modules));
+            let npdm = read("main.npdm")?
+                .map(|d| emu_loader::npdm::Npdm::parse(&d).map_err(|e| format!("main.npdm: {e}")))
+                .transpose()?;
+            return Ok(Program::Application(modules, npdm));
         }
         if path.is_dir() {
             let mut modules = Vec::new();
@@ -214,13 +222,19 @@ impl Program {
             if modules.is_empty() {
                 return Err(format!("{}: no NSO modules", path.display()));
             }
-            return Ok(Program::Application(modules));
+            let npdm = match std::fs::read(path.join("main.npdm")) {
+                Ok(d) => {
+                    Some(emu_loader::npdm::Npdm::parse(&d).map_err(|e| format!("main.npdm: {e}"))?)
+                }
+                Err(_) => None,
+            };
+            return Ok(Program::Application(modules, npdm));
         }
         let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if emu_loader::nro::is_nro(&data) {
             Ok(Program::Homebrew(data))
         } else if emu_loader::nso::is_nso(&data) {
-            Ok(Program::Application(vec![parse(&data, "NSO")?]))
+            Ok(Program::Application(vec![parse(&data, "NSO")?], None))
         } else {
             Err(format!(
                 "{}: not an NRO, NSO or ExeFS directory",
@@ -266,7 +280,7 @@ pub fn run_program_presenting(
     hos.config = config;
     match program {
         Program::Homebrew(nro) => hos.boot_homebrew(nro),
-        Program::Application(modules) => hos.boot_application(modules),
+        Program::Application(modules, npdm) => hos.boot_application(modules, npdm.as_ref()),
     }
     .map_err(RunError::Load)?;
     let stop = hos.run(max_steps);

@@ -5,6 +5,7 @@
 //! - NSO ([`nso`]): system modules and games (LZ4 or Switch 2 ZBIC).
 
 pub mod nca;
+pub mod npdm;
 pub mod nro;
 pub mod nso;
 
