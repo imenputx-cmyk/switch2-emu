@@ -26,8 +26,8 @@
 //! instructions to Maxwell ones.
 
 use super::decode::{
-    AtomOp, Bop, DecodeError, Inst, IntFunc, IpaMode, Mods, MufuOp, Op, Operand, Pred, Round,
-    Space, PT, RZ,
+    AtomOp, Bop, DecodeError, HalfOp, HalfSrc, Inst, IntFunc, IpaMode, Mods, MufuOp, Op, Operand,
+    Pred, Round, Space, HALF_ZERO, PT, RZ,
 };
 
 /// Uniform predicates UP0-UP6 are IR predicates 8-14 (UPT is PT).
@@ -604,6 +604,113 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 }
             })
         }
+        // Packed half arithmetic and compares.
+        0x030 | 0x031 | 0x032 | 0x033 | 0x034 | 0x040 => {
+            if form >= 6 {
+                return err("half operation with a uniform operand");
+            }
+            let a = half_source(&i, index, 0)?;
+            let low = op & 0x1FF;
+            // HADD2/HSET2/HSETP2/HMNMX2 take their second operand in C's
+            // place in the forms where C is wide.
+            let second = if matches!(form, 2 | 3) && low != 0x031 && low != 0x032 {
+                half_source(&i, index, 2)?
+            } else {
+                half_source(&i, index, 1)?
+            };
+            match low {
+                0x030 | 0x032 => {
+                    if i.on(76) || i.on(78) || i.on(79) {
+                        return err("half add/multiply mode");
+                    }
+                    one(Op::Half2 {
+                        dst,
+                        op: if low == 0x030 {
+                            HalfOp::Add
+                        } else {
+                            HalfOp::Mul
+                        },
+                        a,
+                        b: second,
+                        c: HALF_ZERO,
+                        sat: i.on(77),
+                    })
+                }
+                0x031 => {
+                    if i.on(78) || i.on(79) || i.on(85) || i.on(86) {
+                        return err("HFMA2 mode");
+                    }
+                    one(Op::Half2 {
+                        dst,
+                        op: HalfOp::Fma,
+                        a,
+                        b: second,
+                        c: half_source(&i, index, 2)?,
+                        sat: i.on(77),
+                    })
+                }
+                0x040 => one(Op::Half2 {
+                    dst,
+                    op: HalfOp::Mnmx(i.pred_at(87)),
+                    a,
+                    b: second,
+                    c: HALF_ZERO,
+                    sat: false,
+                }),
+                0x033 => one(Op::Hset2 {
+                    dst,
+                    cmp: i.bits(76, 4) as u8,
+                    a,
+                    b: second,
+                    bop: bop(69)?,
+                    c: i.pred_at(87),
+                    bf: i.on(71),
+                }),
+                _ => one(Op::Hsetp2 {
+                    dst: i.bits(81, 3) as u8,
+                    dst2: i.bits(84, 3) as u8,
+                    cmp: i.bits(76, 4) as u8,
+                    a,
+                    b: second,
+                    bop: bop(69)?,
+                    c: i.pred_at(87),
+                    h_and: i.on(71),
+                }),
+            }
+        }
+        // F2FP.PACK_AB (MERGE_C with bit 78: the high half from C as is).
+        0x03E => {
+            if i.bits(72, 6) != 0 || i.bits(79, 12) != 0 || i.on(91) {
+                return err("F2FP mode");
+            }
+            let merge = i.on(78);
+            let (b, _) = src_b()?;
+            let a = if merge { src_c()?.0 } else { Operand::Reg(a) };
+            one(Op::F2fp { dst, a, b, merge })
+        }
+        // F2F.F16.F32 (round to nearest).
+        0x104 => {
+            if i.0[2] != 0x0020_0800 {
+                return err("F2F types");
+            }
+            let (src, mods) = src_b()?;
+            one(Op::F2h { dst, src, mods })
+        }
+        // P2R / R2P with an immediate mask; byte select at 76.
+        0x003 | 0x004 if form == 4 => {
+            let shift = 8 * i.bits(76, 2);
+            let mask = i.0[1] & 0x7F;
+            one(if op & 0x1FF == 0x003 {
+                Op::P2r {
+                    dst,
+                    a,
+                    mask,
+                    shift,
+                }
+            } else {
+                Op::R2p { a, mask, shift }
+            })
+        }
         // POPC, FLO, BREV, IABS on source B.
         0x109 | 0x100 | 0x101 | 0x013 => {
             let func = match op & 0x1FF {
@@ -1119,6 +1226,44 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
             _ => err("opcode not decoded yet"),
         },
     }
+}
+
+/// A packed half operand (Lichii's `half_source`): 0 is A, 1 is B and 2
+/// is C, each in the place the instruction's form puts it.
+fn half_source(i: &Instruction, index: usize, which: u32) -> Result<HalfSrc, DecodeError> {
+    let form = i.opcode() >> 9;
+    let at = |src, sw, abs, neg| HalfSrc {
+        src,
+        swizzle: i.bits(sw, 2) as u8,
+        abs: i.on(abs),
+        neg: i.on(neg),
+    };
+    if which == 0 {
+        return Ok(at(Operand::Reg(i.reg(24)), 74, 73, 72));
+    }
+    let wide = if which == 1 {
+        matches!(form, 4 | 5)
+    } else {
+        matches!(form, 2 | 3)
+    };
+    if wide {
+        return Ok(if matches!(form, 2 | 4) {
+            HalfSrc {
+                src: Operand::Imm(i.0[1]),
+                swizzle: 0,
+                abs: false,
+                neg: false,
+            }
+        } else {
+            at(cbuf_operand(i, index)?, 60, 62, 63)
+        });
+    }
+    let upper = which == 2 || matches!(form, 2 | 3);
+    Ok(if upper {
+        at(Operand::Reg(i.reg(64)), 81, 83, 84)
+    } else {
+        at(Operand::Reg(i.reg(32)), 60, 62, 63)
+    })
 }
 
 /// A constant buffer operand: banks 0-17, or NVN2 root tables (24-31,
@@ -1861,5 +2006,52 @@ mod more_tests {
         assert_eq!(r[4], 0x1122_3344);
         assert_eq!(r[5], 0xDD);
         assert_eq!(io.global.get(&0x1_0000_1008), Some(&0xDD));
+    }
+
+    #[test]
+    fn half_precision_ops() {
+        // 1.5h | 2.0h << 16 and 0.5h | -1.0h << 16.
+        let (x, y) = (0x3E00 | 0x4000 << 16, 0x3800 | 0xBC00 << 16);
+        let r = exec(
+            &[
+                // HADD2 R2 = R0 + R1
+                inst(0x230, 2, &[(24, 8, 0), (32, 8, 1)]),
+                // HMUL2 R3 = R0 * R1.H1_H1 (swizzle 3)
+                inst(0x232, 3, &[(24, 8, 0), (32, 8, 1), (60, 2, 3)]),
+                // HFMA2 R4 = R0 * R1 + R0
+                inst(0x231, 4, &[(24, 8, 0), (32, 8, 1), (64, 8, 0)]),
+                // HSETP2.GT.AND P0, P1 = R0 > R1 (per lane), PT
+                inst(
+                    0x234,
+                    0,
+                    &[
+                        (24, 8, 0),
+                        (32, 8, 1),
+                        (76, 4, 4),
+                        (81, 3, 0),
+                        (84, 3, 1),
+                        (87, 4, 7),
+                    ],
+                ),
+                // F2FP.PACK_AB R5 = half(R6) << 16 | half(R7)
+                inst(0x23E, 5, &[(24, 8, 6), (32, 8, 7)]),
+                // P2R R8 = P0..P1 (mask 3) into R9's low bits
+                inst(0x803, 8, &[(24, 8, 9), (32, 32, 3)]),
+                exit(),
+            ],
+            &[
+                (0, x),
+                (1, y),
+                (6, 3.0f32.to_bits()),
+                (7, 0.25f32.to_bits()),
+                (9, 0xF0),
+            ],
+            &mut Io::default(),
+        );
+        assert_eq!(r[2], 0x4000 | 0x3C00 << 16); // 2.0, 1.0
+        assert_eq!(r[3], 0xBE00 | 0xC000 << 16); // -1.5, -2.0
+        assert_eq!(r[4], 0x4080); // 1.5*0.5+1.5=2.25, 2*-1+2=0
+        assert_eq!(r[5], 0x4200 << 16 | 0x3400); // 3.0, 0.25
+        assert_eq!(r[8], 0xF3); // P0 and P1 both true
     }
 }

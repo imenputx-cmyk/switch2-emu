@@ -17,8 +17,8 @@
 //! can fall back to the software renderer.
 
 use super::decode::{
-    Bop, FCmp, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand, Pred, Round, Space,
-    XmadMode, PT, RZ,
+    Bop, FCmp, HalfOp, HalfSrc, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand,
+    Pred, Round, Space, XmadMode, PT, RZ,
 };
 use super::interp::{SSY_DEPTH, STEP_LIMIT};
 use super::{attr, Header, Stage};
@@ -165,6 +165,8 @@ const GLSL_SMAX: u32 = 42;
 const GLSL_NMIN: u32 = 79;
 const GLSL_NMAX: u32 = 80;
 const GLSL_FIND_S_MSB: u32 = 74;
+const GLSL_PACK_HALF_2X16: u32 = 58;
+const GLSL_UNPACK_HALF_2X16: u32 = 62;
 const GLSL_FIND_U_MSB: u32 = 75;
 
 #[derive(Default)]
@@ -863,6 +865,40 @@ impl Translator {
         let at = self.op2(op::I_ADD, uint, at, o);
         let two = self.constant_u(2);
         self.op2(op::SHIFT_RIGHT_LOGICAL, uint, at, two)
+    }
+
+    /// The two lanes (floats) of a packed half operand.
+    fn half_lanes(&mut self, s: HalfSrc) -> Result<[u32; 2], String> {
+        let v = self.operand_uint(s.src)?;
+        let lanes = if s.swizzle == 1 {
+            let f = self.bitcast_float(v);
+            [f, f]
+        } else {
+            let pair = self.glsl(self.c.vec2, GLSL_UNPACK_HALF_2X16, &[v]);
+            let lo = self.extract(self.c.float, pair, 0);
+            let hi = self.extract(self.c.float, pair, 1);
+            match s.swizzle {
+                0 => [lo, hi],
+                2 => [lo, lo],
+                _ => [hi, hi],
+            }
+        };
+        let m = Mods {
+            neg: s.neg,
+            abs: s.abs,
+        };
+        Ok(lanes.map(|f| self.mods(f, m)))
+    }
+
+    /// Two floats packed as halves.
+    fn pack_halves(&mut self, lo: u32, hi: u32) -> u32 {
+        let v = self.m.id();
+        inst(
+            &mut self.m.body,
+            op::COMPOSITE_CONSTRUCT,
+            &[self.c.vec2, v, lo, hi],
+        );
+        self.glsl(self.c.uint, GLSL_PACK_HALF_2X16, &[v])
     }
 
     /// Truth table of three booleans (bit i for (a, b, c) = (i >> 2, i >> 1, i) & 1).
@@ -1584,6 +1620,151 @@ impl Translator {
             }
             Op::Lds { .. } | Op::Sts { .. } | Op::Atom { .. } | Op::Bar => {
                 return Err("shared memory, atomics and barriers are not translated yet".into());
+            }
+            Op::Half2 {
+                dst,
+                op: hop,
+                a,
+                b,
+                c,
+                sat,
+            } => {
+                let x = self.half_lanes(a)?;
+                let y = self.half_lanes(b)?;
+                let z = self.half_lanes(c)?;
+                let mut r = [0u32; 2];
+                for k in 0..2 {
+                    let v = match hop {
+                        HalfOp::Add => self.op2(op::F_ADD, float, x[k], y[k]),
+                        HalfOp::Mul => self.op2(op::F_MUL, float, x[k], y[k]),
+                        HalfOp::Fma => self.glsl(float, GLSL_FMA, &[x[k], y[k], z[k]]),
+                        HalfOp::Mnmx(p) => {
+                            let lo = self.glsl(float, GLSL_NMIN, &[x[k], y[k]]);
+                            let hi = self.glsl(float, GLSL_NMAX, &[x[k], y[k]]);
+                            let c = self.load_pred(p);
+                            self.select(float, c, lo, hi)
+                        }
+                    };
+                    r[k] = if sat {
+                        let (zero, one) = (self.c.zero_f, self.c.one_f);
+                        self.glsl(float, GLSL_FCLAMP, &[v, zero, one])
+                    } else {
+                        v
+                    };
+                }
+                let packed = self.pack_halves(r[0], r[1]);
+                self.store_reg(dst, packed);
+            }
+            Op::Hsetp2 {
+                dst,
+                dst2,
+                cmp,
+                a,
+                b,
+                bop,
+                c,
+                h_and,
+            } => {
+                let x = self.half_lanes(a)?;
+                let y = self.half_lanes(b)?;
+                let r0 = self.fcmp(cmp, x[0], y[0]);
+                let r1 = self.fcmp(cmp, x[1], y[1]);
+                let c = self.load_pred(c);
+                let bool_t = self.c.bool_t;
+                let (p, q) = if h_and {
+                    let both = self.op2(op::LOGICAL_AND, bool_t, r0, r1);
+                    let not = self.op1(op::LOGICAL_NOT, bool_t, both);
+                    (self.bop(bop, both, c), self.bop(bop, not, c))
+                } else {
+                    (self.bop(bop, r0, c), self.bop(bop, r1, c))
+                };
+                self.store_pred(dst, p);
+                self.store_pred(dst2, q);
+            }
+            Op::Hset2 {
+                dst,
+                cmp,
+                a,
+                b,
+                bop,
+                c,
+                bf,
+            } => {
+                let x = self.half_lanes(a)?;
+                let y = self.half_lanes(b)?;
+                let c = self.load_pred(c);
+                let on = self.constant_u(if bf { 0x3C00 } else { 0xFFFF });
+                let mut lanes = [0u32; 2];
+                for k in 0..2 {
+                    let r = self.fcmp(cmp, x[k], y[k]);
+                    let r = self.bop(bop, r, c);
+                    lanes[k] = self.select(uint, r, on, self.c.zero_u);
+                }
+                let sixteen = self.constant_u(16);
+                let hi = self.op2(op::SHIFT_LEFT_LOGICAL, uint, lanes[1], sixteen);
+                let v = self.op2(op::BITWISE_OR, uint, lanes[0], hi);
+                self.store_reg(dst, v);
+            }
+            Op::F2fp { dst, a, b, merge } => {
+                let fb = self.operand_float(b, no)?;
+                let v = if merge {
+                    let raw = self.operand_uint(a)?;
+                    let low = self.pack_halves(fb, self.c.zero_f);
+                    let m = self.constant_u(0xFFFF);
+                    let ra = self.op2(op::BITWISE_AND, uint, raw, m);
+                    let sixteen = self.constant_u(16);
+                    let hi = self.op2(op::SHIFT_LEFT_LOGICAL, uint, ra, sixteen);
+                    self.op2(op::BITWISE_OR, uint, low, hi)
+                } else {
+                    let fa = self.operand_float(a, no)?;
+                    self.pack_halves(fb, fa)
+                };
+                self.store_reg(dst, v);
+            }
+            Op::F2h { dst, src, mods } => {
+                let f = self.operand_float(src, mods)?;
+                let v = self.pack_halves(f, self.c.zero_f);
+                self.store_reg(dst, v);
+            }
+            Op::P2r {
+                dst,
+                a,
+                mask,
+                shift,
+            } => {
+                let mut preds = self.c.zero_u;
+                for i in 0..7u8 {
+                    let p = self.load_pred(Pred {
+                        index: i,
+                        neg: false,
+                    });
+                    let bit = self.constant_u(1 << i);
+                    let v = self.select(uint, p, bit, self.c.zero_u);
+                    preds = self.op2(op::BITWISE_OR, uint, preds, v);
+                }
+                let m = self.constant_u(mask);
+                let keep = self.constant_u(!(mask << shift));
+                let sh = self.constant_u(shift);
+                let x = self.load_reg(a);
+                let x = self.op2(op::BITWISE_AND, uint, x, keep);
+                let p = self.op2(op::BITWISE_AND, uint, preds, m);
+                let p = self.op2(op::SHIFT_LEFT_LOGICAL, uint, p, sh);
+                let v = self.op2(op::BITWISE_OR, uint, x, p);
+                self.store_reg(dst, v);
+            }
+            Op::R2p { a, mask, shift } => {
+                let x = self.load_reg(a);
+                for i in 0..7u32 {
+                    if mask >> i & 1 == 0 {
+                        continue;
+                    }
+                    let sh = self.constant_u(shift + i);
+                    let one = self.constant_u(1);
+                    let v = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, x, sh);
+                    let v = self.op2(op::BITWISE_AND, uint, v, one);
+                    let p = self.op2(op::I_NOT_EQUAL, self.c.bool_t, v, self.c.zero_u);
+                    self.store_pred(i as u8, p);
+                }
             }
             Op::Ldg { .. } | Op::Stg { .. } => {
                 return Err("global memory access is not translated yet".into());
@@ -2347,6 +2528,55 @@ mod tests {
                     (84, 3, 7),
                 ],
             ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 0),
+                    (40, 10, 0x70),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            exit(),
+        ];
+        let mut code = crate::shader::sm86::asm::program(&insts);
+        code[..0x50].copy_from_slice(&vertex_header());
+        let h = super::super::Header::parse(&code);
+        let p =
+            crate::shader::sm86::decode_program(&code[crate::shader::sm86::HEADER_SIZE..]).unwrap();
+        let t = translate(&p, &h).unwrap();
+        validate(&t.words);
+    }
+
+    #[test]
+    fn switch2_half_ops_validate() {
+        use crate::shader::sm86::asm::{exit, inst};
+        let insts = [
+            inst(0x230, 2, &[(24, 8, 0), (32, 8, 1)]),
+            inst(0x231, 4, &[(24, 8, 0), (32, 8, 1), (64, 8, 0), (77, 1, 1)]),
+            inst(
+                0x234,
+                0,
+                &[
+                    (24, 8, 0),
+                    (32, 8, 1),
+                    (76, 4, 4),
+                    (81, 3, 0),
+                    (84, 3, 1),
+                    (87, 4, 7),
+                ],
+            ),
+            inst(
+                0x233,
+                6,
+                &[(24, 8, 0), (32, 8, 1), (76, 4, 1), (87, 4, 7), (71, 1, 1)],
+            ),
+            inst(0x240, 7, &[(24, 8, 0), (32, 8, 1), (87, 4, 7)]),
+            inst(0x23E, 5, &[(24, 8, 6), (32, 8, 7)]),
+            inst(0x803, 8, &[(24, 8, 9), (32, 32, 3)]),
+            inst(0x804, 0, &[(24, 8, 9), (32, 32, 3)]),
             inst(
                 0x322,
                 0,

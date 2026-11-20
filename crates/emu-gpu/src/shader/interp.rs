@@ -6,8 +6,8 @@
 //! pushes a reconvergence point and SYNC pops it and jumps there.
 
 use super::decode::{
-    sr, Bop, FCmp, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand, Pred, Round,
-    Space, XmadMode, RZ,
+    sr, Bop, FCmp, HalfOp, HalfSrc, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand,
+    Pred, Round, Space, XmadMode, RZ,
 };
 
 /// What a shader reads and writes besides its registers.
@@ -983,10 +983,185 @@ impl Machine<'_> {
                 self.mem_write(space, at, &new.to_le_bytes());
                 self.regs.set(dst, old);
             }
+            Op::Half2 {
+                dst,
+                op,
+                a,
+                b,
+                c,
+                sat: s,
+            } => {
+                let (x, y, z) = (
+                    half_lanes(self.operand(a.src), &a),
+                    half_lanes(self.operand(b.src), &b),
+                    half_lanes(self.operand(c.src), &c),
+                );
+                let r: [f32; 2] = std::array::from_fn(|k| {
+                    let v = match op {
+                        HalfOp::Add => x[k] + y[k],
+                        HalfOp::Mul => x[k] * y[k],
+                        HalfOp::Fma => x[k].mul_add(y[k], z[k]),
+                        HalfOp::Mnmx(p) => {
+                            if self.pred(p) {
+                                x[k].min(y[k])
+                            } else {
+                                x[k].max(y[k])
+                            }
+                        }
+                    };
+                    sat(v, s)
+                });
+                let v = u32::from(f32_to_f16(r[0])) | u32::from(f32_to_f16(r[1])) << 16;
+                self.regs.set(dst, v);
+            }
+            Op::Hsetp2 {
+                dst,
+                dst2,
+                cmp,
+                a,
+                b,
+                bop: o,
+                c,
+                h_and,
+            } => {
+                let x = half_lanes(self.operand(a.src), &a);
+                let y = half_lanes(self.operand(b.src), &b);
+                let r = [fcmp(cmp, x[0], y[0]), fcmp(cmp, x[1], y[1])];
+                let c = self.pred(c);
+                if h_and {
+                    let both = r[0] && r[1];
+                    self.set_pred(dst, bop(o, both, c));
+                    self.set_pred(dst2, bop(o, !both, c));
+                } else {
+                    self.set_pred(dst, bop(o, r[0], c));
+                    self.set_pred(dst2, bop(o, r[1], c));
+                }
+            }
+            Op::Hset2 {
+                dst,
+                cmp,
+                a,
+                b,
+                bop: o,
+                c,
+                bf,
+            } => {
+                let x = half_lanes(self.operand(a.src), &a);
+                let y = half_lanes(self.operand(b.src), &b);
+                let c = self.pred(c);
+                let lane = |k: usize| -> u32 {
+                    if bop(o, fcmp(cmp, x[k], y[k]), c) {
+                        if bf {
+                            0x3C00
+                        } else {
+                            0xFFFF
+                        }
+                    } else {
+                        0
+                    }
+                };
+                self.regs.set(dst, lane(0) | lane(1) << 16);
+            }
+            Op::F2fp { dst, a, b, merge } => {
+                let hi = if merge {
+                    self.operand(a) & 0xFFFF
+                } else {
+                    u32::from(f32_to_f16(f32::from_bits(self.operand(a))))
+                };
+                let lo = u32::from(f32_to_f16(f32::from_bits(self.operand(b))));
+                self.regs.set(dst, hi << 16 | lo);
+            }
+            Op::F2h { dst, src, mods } => {
+                let v = self.float(src, mods);
+                self.regs.set(dst, u32::from(f32_to_f16(v)));
+            }
+            Op::P2r {
+                dst,
+                a,
+                mask,
+                shift,
+            } => {
+                let preds = (0..7).fold(0u32, |r, i| r | u32::from(self.preds[i]) << i);
+                let m = mask << shift;
+                let v = (self.regs.get(a) & !m) | ((preds & mask) << shift);
+                self.regs.set(dst, v);
+            }
+            Op::R2p { a, mask, shift } => {
+                let v = self.regs.get(a) >> shift;
+                for i in 0..7usize {
+                    if mask >> i & 1 != 0 {
+                        self.preds[i] = v >> i & 1 != 0;
+                    }
+                }
+            }
             Op::Nop | Op::Bar | Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {
             }
         }
     }
+}
+
+/// f32 to IEEE half (round to nearest even), as bits.
+pub fn f32_to_f16(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xFF) as i32;
+    let mant = b & 0x7F_FFFF;
+    if exp == 0xFF {
+        return sign | 0x7C00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = mant | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rest = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let round = rest > mid || (rest == mid && half & 1 == 1);
+        return sign | (half + u32::from(round)) as u16;
+    }
+    let half = ((e as u32) << 10) | (mant >> 13);
+    let rest = mant & 0x1FFF;
+    let round = rest > 0x1000 || (rest == 0x1000 && half & 1 == 1);
+    sign | (half + u32::from(round)) as u16
+}
+
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from(h >> 10 & 0x1F);
+    let mant = f32::from(h & 0x3FF);
+    sign * match exp {
+        0 => mant * 2f32.powi(-24),
+        31 if mant == 0.0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => (1.0 + mant / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+/// The two lanes of a packed half operand's 32-bit value.
+pub fn half_lanes(v: u32, s: &HalfSrc) -> [f32; 2] {
+    let lo = f16_to_f32(v as u16);
+    let hi = f16_to_f32((v >> 16) as u16);
+    let lanes = match s.swizzle {
+        0 => [lo, hi],
+        1 => [f32::from_bits(v); 2],
+        2 => [lo, lo],
+        _ => [hi, hi],
+    };
+    lanes.map(|x| {
+        apply(
+            x,
+            Mods {
+                neg: s.neg,
+                abs: s.abs,
+            },
+        )
+    })
 }
 
 /// Most local memory an invocation may use.

@@ -562,6 +562,68 @@ pub enum Op {
     },
     /// Workgroup barrier (BAR.SYNC).
     Bar,
+    /// Packed half-precision arithmetic (HADD2/HMUL2/HFMA2/HMNMX2): each
+    /// 16-bit lane computed in f32 and rounded back.
+    Half2 {
+        dst: u8,
+        op: HalfOp,
+        a: HalfSrc,
+        b: HalfSrc,
+        c: HalfSrc,
+        sat: bool,
+    },
+    /// Packed half compare to predicates (HSETP2): dst from lane 0 and
+    /// dst2 from lane 1 (each combined with c), or with `h_and` dst from
+    /// both lanes and dst2 its negation.
+    Hsetp2 {
+        dst: u8,
+        dst2: u8,
+        cmp: FCmp,
+        a: HalfSrc,
+        b: HalfSrc,
+        bop: Bop,
+        c: Pred,
+        h_and: bool,
+    },
+    /// Packed half compare to a register (HSET2): per lane 1.0 (bf) or
+    /// 0xFFFF, else 0.
+    Hset2 {
+        dst: u8,
+        cmp: FCmp,
+        a: HalfSrc,
+        b: HalfSrc,
+        bop: Bop,
+        c: Pred,
+        bf: bool,
+    },
+    /// F2FP.PACK_AB: dst = half(a) << 16 | half(b); with `merge` the high
+    /// half is a's low 16 bits as they are.
+    F2fp {
+        dst: u8,
+        a: Operand,
+        b: Operand,
+        merge: bool,
+    },
+    /// F2F.F16.F32: the half of an f32 in the low 16 bits.
+    F2h {
+        dst: u8,
+        src: Operand,
+        mods: Mods,
+    },
+    /// P2R: dst = a with the bits of `mask << shift` replaced by
+    /// predicates P0-P6 (bit i = Pi) masked and shifted.
+    P2r {
+        dst: u8,
+        a: u8,
+        mask: u32,
+        shift: u32,
+    },
+    /// R2P: Pi = bit (i + shift) of a, for the bits of `mask`.
+    R2p {
+        a: u8,
+        mask: u32,
+        shift: u32,
+    },
     Bra {
         target: usize,
     },
@@ -575,6 +637,33 @@ pub enum Op {
     Kil,
     Exit,
     Nop,
+}
+
+/// A packed half operand: `swizzle` 0 takes (low, high) as lanes, 1 the
+/// value as an f32 for both, 2 the low half for both, 3 the high one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HalfSrc {
+    pub src: Operand,
+    pub swizzle: u8,
+    pub neg: bool,
+    pub abs: bool,
+}
+
+pub const HALF_ZERO: HalfSrc = HalfSrc {
+    src: Operand::Reg(RZ),
+    swizzle: 0,
+    neg: false,
+    abs: false,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalfOp {
+    Add,
+    Mul,
+    /// a * b + c.
+    Fma,
+    /// Minimum where the predicate holds, else maximum.
+    Mnmx(Pred),
 }
 
 /// Memory spaces of LDS/STS-style accesses and atomics.
