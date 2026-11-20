@@ -105,6 +105,11 @@ pub enum Stop {
     StepLimit,
     /// The host interrupted the emulation (Ctrl+C).
     Interrupted,
+    /// The program spins on a branch to itself (`b .`), how SDK code
+    /// halts after a fatal error.
+    Halted {
+        pc: u64,
+    },
 }
 
 /// Values of the homebrew loader config (https://switchbrew.org/wiki/Homebrew_ABI).
@@ -275,7 +280,7 @@ impl Horizon {
             .write_privileged(base, &nro_file[..file_end])
             .expect("mapped above");
 
-        let stack_top = self.create_main_thread(0x2C);
+        let stack_top = self.create_main_thread(0x2C, MemState::CodeStatic);
         let info_addr = l.loader_page + 0x40;
         self.mem
             .write_privileged(info_addr, LOADER_INFO.as_bytes())
@@ -329,7 +334,7 @@ impl Horizon {
     /// Maps the main thread's stack and TLS, creates the thread and its
     /// handle, and the loader page with the return stub (BRK, recognised
     /// by `run`). Returns the stack top.
-    fn create_main_thread(&mut self, priority: u32) -> u64 {
+    fn create_main_thread(&mut self, priority: u32, loader_state: MemState) -> u64 {
         let l = self.layout;
         let stack_top = l.stack.0 + l.main_stack_size;
         self.map_block(
@@ -346,7 +351,7 @@ impl Horizon {
             .handles
             .insert(KObject::Thread { id: main })
             .expect("empty table");
-        self.map_block(l.loader_page, PAGE, MemState::CodeStatic, PERM_R | PERM_X);
+        self.map_block(l.loader_page, PAGE, loader_state, PERM_R | PERM_X);
         let brk_loader: u32 = 0xD420_0000 | (0x4C44 << 5); // brk #0x4c44 ("LD")
         self.mem
             .write_privileged(l.loader_page, &brk_loader.to_le_bytes())
@@ -409,7 +414,10 @@ impl Horizon {
             self.modules.push((base, size));
             base += size.next_multiple_of(PAGE);
         }
-        let stack_top = self.create_main_thread(priority);
+        // The return stub page is not a module: an application's rtld
+        // scans every code region for a MOD0 header and halts on one
+        // without it, so the page is reported as inaccessible.
+        let stack_top = self.create_main_thread(priority, MemState::Inaccessible);
         let l = self.layout;
         self.cpu = Cpu::new();
         self.cpu.set_pc(l.image_base);
@@ -514,6 +522,10 @@ impl Horizon {
             }
             match self.cpu.run(&mut self.mem, budget.min(threads::TIME_SLICE)) {
                 None => {
+                    let pc = self.cpu.pc();
+                    if self.mem.read_uint(pc, 4) == Ok(0x1400_0000) && self.threads.len() == 1 {
+                        return Stop::Halted { pc };
+                    }
                     // Time slice over: let the other threads run.
                     if let Err(stop) = self.schedule(self.cpu.pc()) {
                         return stop;
