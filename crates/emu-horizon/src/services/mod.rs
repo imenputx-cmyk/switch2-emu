@@ -253,6 +253,89 @@ pub trait Service {
     fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError>;
 }
 
+/// `pctl*`: parental controls, never restricting.
+pub struct ParentalControl(String);
+
+impl Service for ParentalControl {
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            // CreateService, CreateServiceWithoutInitialize.
+            0 | 1 => ctx.push_object(obj(ParentalControlService::default())),
+            _ => return Err(CallError::Unimplemented),
+        }
+        Ok(())
+    }
+}
+
+/// `pctl::IParentalControlService`: no restrictions; everything is
+/// permitted, queries answer "not restricted".
+#[derive(Default)]
+pub struct ParentalControlService {
+    event: Option<usize>,
+}
+
+impl Service for ParentalControlService {
+    fn name(&self) -> &str {
+        "pctl::IParentalControlService"
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            // Initialize, Check*/Confirm* permission checks: allowed.
+            1 | 1001..=1017 | 1035 | 1046 | 1047 => {}
+            // IsRestrictionTemporaryUnlocked, IsRestrictionEnabled, ...
+            1031 | 1033 | 1034 | 1201..=1207 | 1403 | 1406 => ctx.push_u8(0),
+            // GetSafetyLevel, GetPlayTimerRemainingTime, ...
+            1032 | 1039 | 1453 | 1454 | 1455 => ctx.push_u64(0),
+            // Get*Event (unlock, play timer, synchronization).
+            1404 | 1432 | 1456 | 1457 | 1475 => ctx.push_event(&mut self.event, false),
+            _ => {
+                if !ctx.config.auto_stub {
+                    return Err(CallError::Unimplemented);
+                }
+                ctx.push_bytes(&[0; 0x10]);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `aoc:u`: add-on content (DLC). None installed.
+#[derive(Default)]
+pub struct AddOnContent {
+    event: Option<usize>,
+}
+
+impl Service for AddOnContent {
+    fn name(&self) -> &str {
+        "aoc:u"
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            // CountAddOnContent(ByApplicationId), ListAddOnContent(...).
+            0..=3 => ctx.push_u32(0),
+            // GetAddOnContentBaseId(ByApplicationId), PrepareAddOnContent.
+            4..=8 => ctx.push_u64(0),
+            // GetAddOnContentListChangedEvent(WithProcessId).
+            10 | 11 => ctx.push_event(&mut self.event, false),
+            // NotifyMountAddOnContent / Unmount, CheckAddOnContentMountStatus.
+            12..=13 | 50 => {}
+            _ => {
+                if !ctx.config.auto_stub {
+                    return Err(CallError::Unimplemented);
+                }
+                ctx.push_bytes(&[0; 0x10]);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `lm`: the log manager. Log messages are dropped.
 pub struct LogManager;
 
@@ -316,6 +399,10 @@ fn create_known(name: &str, config: &Config) -> Option<ServiceRef> {
         "sm:" => Rc::new(RefCell::new(sm::ServiceManager)),
         "set:sys" => Rc::new(RefCell::new(set::SystemSettings)),
         "lm" => Rc::new(RefCell::new(LogManager)),
+        "pctl" | "pctl:s" | "pctl:a" | "pctl:r" => {
+            Rc::new(RefCell::new(ParentalControl(name.to_string())))
+        }
+        "aoc:u" => Rc::new(RefCell::new(AddOnContent::default())),
         "apm" | "apm:p" => Rc::new(RefCell::new(apm::Manager)),
         "appletOE" => Rc::new(RefCell::new(am::AppletOE)),
         "vi:u" => Rc::new(RefCell::new(vi::RootService)),
