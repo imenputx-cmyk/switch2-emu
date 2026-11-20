@@ -131,6 +131,8 @@ struct Session {
 pub struct Horizon {
     /// The running program's ID (from its NPDM; a homebrew default).
     pub program_id: u64,
+    /// Commands answered by the auto stub, with counts.
+    pub stubbed: std::collections::HashMap<(String, u32), u64>,
     pub mem: Memory,
     pub cpu: Cpu,
     pub map: MemoryMap,
@@ -172,6 +174,7 @@ impl Horizon {
     pub fn new() -> Self {
         Horizon {
             program_id: 0x0100_0000_0000_1000,
+            stubbed: Default::default(),
             mem: Memory::new(),
             cpu: Cpu::new(),
             map: MemoryMap::new(),
@@ -848,6 +851,18 @@ impl Horizon {
         let req =
             ipc::parse_request(&msg, is_domain).map_err(|error| Stop::BadIpc { pc, error })?;
 
+        if req.kind == ipc::TYPE_TIPC_CLOSE {
+            self.sessions[id].closed = true;
+            self.ret(SUCCESS);
+            return Ok(());
+        }
+        if req.kind >= ipc::TYPE_TIPC_FIRST {
+            let reply = self.request(id, &req)?;
+            let out = ipc::write_tipc_reply(&reply, req.kind);
+            self.mem.write(tls, &out).expect("TLS is mapped");
+            self.ret(SUCCESS);
+            return Ok(());
+        }
         let reply = match req.kind {
             ipc::TYPE_CLOSE => {
                 self.sessions[id].closed = true;
@@ -904,11 +919,14 @@ impl Horizon {
             }
             command => {
                 let service = self.sessions[id].object.borrow().name().to_string();
-                return Err(Stop::UnimplementedIpc {
-                    service,
-                    command,
-                    control: true,
-                });
+                if !self.config.auto_stub {
+                    return Err(Stop::UnimplementedIpc {
+                        service,
+                        command,
+                        control: true,
+                    });
+                }
+                eprintln!("[stub] {service} control command {command} -> empty success");
             }
         }
         Ok(reply)
@@ -944,6 +962,8 @@ impl Horizon {
             out: Vec::new(),
             out_objects: Vec::new(),
             out_copy: Vec::new(),
+            out_sessions: Vec::new(),
+            handles: &self.handles,
             kernel: &mut self.kobjects,
             tick: self.cpu.counter,
             config: &self.config,
@@ -954,6 +974,7 @@ impl Horizon {
             out,
             out_objects,
             out_copy,
+            out_sessions,
             ..
         } = ctx;
         let mut reply = ipc::Reply::default();
@@ -962,6 +983,12 @@ impl Horizon {
                 reply.data = out;
                 for kobj in out_copy {
                     match self.handles.insert(kobj) {
+                        Some(h) => reply.copy_handles.push(h),
+                        None => reply.result = OUT_OF_HANDLES,
+                    }
+                }
+                for obj in out_sessions {
+                    match self.new_session(obj) {
                         Some(h) => reply.copy_handles.push(h),
                         None => reply.result = OUT_OF_HANDLES,
                     }
@@ -982,11 +1009,25 @@ impl Horizon {
             Err(services::CallError::Result(code)) => reply.result = code,
             Err(services::CallError::Unimplemented) => {
                 let service = object.borrow().name().to_string();
-                return Err(Stop::UnimplementedIpc {
-                    service,
-                    command: req.command,
-                    control: false,
-                });
+                if !self.config.auto_stub {
+                    return Err(Stop::UnimplementedIpc {
+                        service,
+                        command: req.command,
+                        control: false,
+                    });
+                }
+                // Empty success; logged the first few times per command.
+                let n = self
+                    .stubbed
+                    .entry((service.clone(), req.command))
+                    .or_insert(0);
+                *n += 1;
+                if *n <= 3 {
+                    eprintln!("[stub] {service} command {} -> empty success", req.command);
+                }
+                // Zeroed output words, so callers reading results the
+                // stub does not know get zeros, not stale message data.
+                reply.data = vec![0; 0x40];
             }
         }
         Ok(reply)

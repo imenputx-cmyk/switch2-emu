@@ -43,6 +43,11 @@ impl Service for FileSystemProxy {
                     .ok_or(CallError::Result(SD_CARD_NOT_PRESENT))?;
                 ctx.push_object(obj(HostFileSystem { root }));
             }
+            // OpenDataStorageByCurrentProcess: the application's RomFS.
+            203 => match &ctx.config.romfs {
+                Some(r) => ctx.push_object(obj(RomFsStorage(r.clone()))),
+                None => return Err(CallError::Result(RESULT_TARGET_NOT_FOUND)),
+            },
             1003 => {} // DisableAutoSaveDataCreation
             _ => return Err(CallError::Unimplemented),
         }
@@ -288,6 +293,36 @@ impl Service for HostDirectory {
                 ctx.push_u64(n as u64);
             }
             1 => ctx.push_u64((self.entries.len() - self.next) as u64),
+            _ => return Err(CallError::Unimplemented),
+        }
+        Ok(())
+    }
+}
+
+/// fs "target not found" (module 2, description 1001).
+const RESULT_TARGET_NOT_FOUND: u32 = 2 | (1001 << 9);
+
+/// `IStorage` over the application's RomFS.
+pub struct RomFsStorage(emu_loader::nca::RomFs);
+
+impl Service for RomFsStorage {
+    fn name(&self) -> &str {
+        "fsp-srv::IStorage (RomFS)"
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            // Read(offset, size) into the output buffer.
+            0 => {
+                let (offset, size) = (ctx.in_u64(0), ctx.in_u64(8));
+                let mut data = vec![0u8; size.min(64 << 20) as usize];
+                let n = self
+                    .0
+                    .read_at(offset, &mut data)
+                    .map_err(|_| CallError::Result(INVALID_ARGUMENT))?;
+                ctx.write_out_buffer(0, &data[..n])?;
+            }
+            4 => ctx.push_u64(self.0.len()), // GetSize
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())

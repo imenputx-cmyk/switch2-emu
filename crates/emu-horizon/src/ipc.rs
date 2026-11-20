@@ -185,6 +185,13 @@ pub fn parse_request(msg: &[u8; MESSAGE_SIZE], is_domain: bool) -> Result<Reques
         });
     }
 
+    if kind >= TYPE_TIPC_FIRST {
+        // TIPC: the command is in the type field; the data words follow
+        // the descriptors directly, without a CMIF header.
+        req.command = u32::from(kind - TYPE_TIPC_FIRST);
+        req.data = msg[data_start..data_end].to_vec();
+        return Ok(req);
+    }
     if kind == TYPE_CLOSE || n_data == 0 {
         return Ok(req);
     }
@@ -223,6 +230,41 @@ pub fn parse_request(msg: &[u8; MESSAGE_SIZE], is_domain: bool) -> Result<Reques
     req.command = word(msg, p + 8);
     req.data = msg[p + 16..payload_end].to_vec();
     Ok(req)
+}
+
+/// TIPC (the "tiny IPC" newer services use, Switch 2 graphics services
+/// among them) puts command `n` in the message type as `16 + n`; 15
+/// closes the session.
+pub const TYPE_TIPC_FIRST: u16 = 16;
+pub const TYPE_TIPC_CLOSE: u16 = 15;
+
+/// Writes a TIPC reply: the result word and the data words right after
+/// the header (and handles), no CMIF header. Returned interfaces must
+/// already be in `move_handles`.
+pub fn write_tipc_reply(reply: &Reply, kind: u16) -> [u8; MESSAGE_SIZE] {
+    let mut msg = [0u8; MESSAGE_SIZE];
+    let n_handles = reply.copy_handles.len() + reply.move_handles.len();
+    let special = n_handles > 0;
+    let mut off = 8;
+    if special {
+        let sp =
+            ((reply.copy_handles.len() as u32) << 1) | ((reply.move_handles.len() as u32) << 5);
+        msg[8..12].copy_from_slice(&sp.to_le_bytes());
+        off = 12;
+        for handle in reply.copy_handles.iter().chain(&reply.move_handles) {
+            msg[off..off + 4].copy_from_slice(&handle.to_le_bytes());
+            off += 4;
+        }
+    }
+    let n_words = 1 + reply.data.len().div_ceil(4);
+    msg[0..4].copy_from_slice(&u32::from(kind).to_le_bytes());
+    let h1 = (n_words as u32) | if special { 1 << 31 } else { 0 };
+    msg[4..8].copy_from_slice(&h1.to_le_bytes());
+    msg[off..off + 4].copy_from_slice(&reply.result.to_le_bytes());
+    off += 4;
+    let end = (off + reply.data.len()).min(MESSAGE_SIZE);
+    msg[off..end].copy_from_slice(&reply.data[..end - off]);
+    msg
 }
 
 /// What a service answers.
@@ -288,6 +330,32 @@ pub fn read_buffer(mem: &Memory, b: Buffer) -> Result<Vec<u8>, Fault> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tipc_request_and_reply() {
+        // TIPC command 204 with two copy handles and two data words.
+        let mut msg = [0u8; MESSAGE_SIZE];
+        let words: [u32; 7] = [16 + 204, (1 << 31) | 2, 2 << 1, 0x11, 0x22, 1, 0x40];
+        for (i, w) in words.iter().enumerate() {
+            msg[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let req = parse_request(&msg, false).unwrap();
+        assert_eq!(
+            (req.command, req.copy_handles.clone()),
+            (204, vec![0x11, 0x22])
+        );
+        assert_eq!(req.data, [1, 0, 0, 0, 0x40, 0, 0, 0]);
+        // Reply: one copy handle, the result, then data.
+        let reply = Reply {
+            data: vec![7, 0, 0, 0],
+            copy_handles: vec![0x33],
+            ..Default::default()
+        };
+        let out = write_tipc_reply(&reply, 16 + 202);
+        let w = |i: usize| u32::from_le_bytes(out[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!(w(1), (1 << 31) | 2);
+        assert_eq!((w(2), w(3), w(4), w(5)), (1 << 1, 0x33, 0, 7));
+    }
+
     use super::*;
 
     /// A request built by hand the way libnx's cmifMakeRequest lays it

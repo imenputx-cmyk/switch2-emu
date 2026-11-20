@@ -10,6 +10,7 @@ pub mod fs;
 pub mod hid;
 pub mod nv;
 pub mod nvgpu;
+pub mod nx2;
 pub mod set;
 pub mod sm;
 pub mod time;
@@ -51,6 +52,11 @@ pub struct Ctx<'a> {
     pub out_objects: Vec<ServiceRef>,
     /// Kernel objects returned as copy handles.
     pub out_copy: Vec<KObject>,
+    /// Interfaces returned as new raw sessions (copy handles), even on a
+    /// domain session.
+    pub out_sessions: Vec<ServiceRef>,
+    /// The client's handle table, to look up handles it sent.
+    pub handles: &'a crate::handles::HandleTable,
     pub kernel: &'a mut KernelObjects,
     /// The current system tick (19.2 MHz), for clocks.
     pub tick: u64,
@@ -120,6 +126,13 @@ pub struct Config {
     pub trace_unimplemented: bool,
     /// How GPU work is carried out.
     pub gpu_backend: GpuBackend,
+    /// Answer unknown commands (and services) with an empty success
+    /// instead of stopping, logging each one; Lichii's
+    /// `EDEN_NX2_AUTO_STUB`, how its notes push Switch 2 titles through
+    /// boot.
+    pub auto_stub: bool,
+    /// The application's RomFS (from its program NCA).
+    pub romfs: Option<emu_loader::nca::RomFs>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -168,6 +181,17 @@ impl Ctx<'_> {
 
     pub fn push_copy(&mut self, obj: KObject) {
         self.out_copy.push(obj);
+    }
+
+    /// Returns `obj` as a new session's handle (a copy handle).
+    pub fn push_session(&mut self, obj: ServiceRef) {
+        self.out_sessions.push(obj);
+    }
+
+    /// The kernel object of the request's `index`-th copy handle.
+    pub fn copy_handle(&self, index: usize) -> Option<KObject> {
+        let h = *self.req.copy_handles.get(index)?;
+        self.handles.get(h).cloned()
     }
 
     /// Returns a lazily created event stored in `slot`, as a copy handle.
@@ -229,8 +253,32 @@ pub trait Service {
     fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError>;
 }
 
-/// Creates the service registered under `name`, if it is implemented.
+/// A service or interface that answers every command with an empty
+/// success (`Config::auto_stub`).
+pub struct AutoStub(pub String);
+
+impl Service for AutoStub {
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn call(&mut self, _command: u32, _ctx: &mut Ctx) -> Result<(), CallError> {
+        Err(CallError::Unimplemented)
+    }
+}
+
+/// Creates the service registered under `name`: implemented services,
+/// and with `auto_stub` any other name.
 pub fn create(name: &str, config: &Config) -> Option<ServiceRef> {
+    create_known(name, config).or_else(|| {
+        config.auto_stub.then(|| {
+            eprintln!("[stub] service {name} is not implemented; stubbing it");
+            Rc::new(RefCell::new(AutoStub(name.to_string()))) as ServiceRef
+        })
+    })
+}
+
+fn create_known(name: &str, config: &Config) -> Option<ServiceRef> {
     Some(match name {
         "sm:" => Rc::new(RefCell::new(sm::ServiceManager)),
         "set:sys" => Rc::new(RefCell::new(set::SystemSettings)),

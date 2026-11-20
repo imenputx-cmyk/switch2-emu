@@ -469,9 +469,54 @@ pub fn open_package(storage: Storage, keys: &Keys) -> Result<(Vec<Storage>, Titl
     Ok((ncas, title_keys))
 }
 
+/// A RomFS image inside an NCA section, decrypted as it is read.
+#[derive(Clone)]
+pub struct RomFs {
+    section: Section,
+    offset: u64,
+    size: u64,
+}
+
+impl std::fmt::Debug for RomFs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RomFs({:#x} bytes)", self.size)
+    }
+}
+
+impl RomFs {
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Reads up to `buf.len()` bytes at `offset`; returns how many.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, LoadError> {
+        if offset >= self.size {
+            return Ok(0);
+        }
+        let n = (buf.len() as u64).min(self.size - offset) as usize;
+        self.section.read_at(self.offset + offset, &mut buf[..n])?;
+        Ok(n)
+    }
+}
+
+/// The program's ExeFS and RomFS (if any) in a package or NCA.
+pub struct Program {
+    pub exefs: Partition,
+    pub romfs: Option<RomFs>,
+}
+
 /// Finds the program's ExeFS (the partition with a `main` NSO) in a
 /// package or a single NCA.
 pub fn find_exefs(path: &Path, keys: &Keys) -> Result<Partition, LoadError> {
+    find_program(path, keys).map(|p| p.exefs)
+}
+
+/// Finds the program NCA's ExeFS and RomFS.
+pub fn find_program(path: &Path, keys: &Keys) -> Result<Program, LoadError> {
     let storage = Storage::open(path)?;
     let is_nca = path
         .extension()
@@ -497,14 +542,27 @@ pub fn find_exefs(path: &Path, keys: &Keys) -> Result<Partition, LoadError> {
         } else {
             nca
         };
+        let mut exefs = None;
+        let mut romfs = None;
         for i in 0..nca.section_count() {
             if nca.is_partition(i) {
                 match nca.partition(i) {
-                    Ok(p) if p.entries.iter().any(|e| e.name == "main") => return Ok(p),
+                    Ok(p) if p.entries.iter().any(|e| e.name == "main") => exefs = Some(p),
                     Ok(_) => {}
                     Err(e) => last_error = e,
                 }
+            } else if nca.sections.get(i).is_some_and(|s| s.is_some()) && romfs.is_none() {
+                if let Ok((section, offset, size)) = nca.section_data(i) {
+                    romfs = Some(RomFs {
+                        section,
+                        offset,
+                        size,
+                    });
+                }
             }
+        }
+        if let Some(exefs) = exefs {
+            return Ok(Program { exefs, romfs });
         }
     }
     Err(last_error)

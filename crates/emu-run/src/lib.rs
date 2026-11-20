@@ -159,8 +159,12 @@ pub fn run_nro_with(
 pub enum Program {
     /// A homebrew NRO.
     Homebrew(Vec<u8>),
-    /// An application's NSO modules, in ExeFS order, and its NPDM.
-    Application(Vec<emu_loader::nso::Module>, Option<emu_loader::npdm::Npdm>),
+    /// An application's NSO modules, in ExeFS order, its NPDM and RomFS.
+    Application(
+        Vec<emu_loader::nso::Module>,
+        Option<emu_loader::npdm::Npdm>,
+        Option<emu_loader::nca::RomFs>,
+    ),
 }
 
 impl Program {
@@ -193,7 +197,8 @@ impl Program {
                     .ok_or("no --keys and no home directory")?,
             };
             let keys = emu_loader::nca::Keys::load(&keys_path).map_err(|e| format!("keys: {e}"))?;
-            let exefs = emu_loader::nca::find_exefs(path, &keys).map_err(|e| e.to_string())?;
+            let emu_loader::nca::Program { exefs, romfs } =
+                emu_loader::nca::find_program(path, &keys).map_err(|e| e.to_string())?;
             let read = |name: &str| {
                 exefs
                     .open(name)
@@ -209,7 +214,7 @@ impl Program {
             let npdm = read("main.npdm")?
                 .map(|d| emu_loader::npdm::Npdm::parse(&d).map_err(|e| format!("main.npdm: {e}")))
                 .transpose()?;
-            return Ok(Program::Application(modules, npdm));
+            return Ok(Program::Application(modules, npdm, romfs));
         }
         if path.is_dir() {
             let mut modules = Vec::new();
@@ -228,13 +233,13 @@ impl Program {
                 }
                 Err(_) => None,
             };
-            return Ok(Program::Application(modules, npdm));
+            return Ok(Program::Application(modules, npdm, None));
         }
         let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if emu_loader::nro::is_nro(&data) {
             Ok(Program::Homebrew(data))
         } else if emu_loader::nso::is_nso(&data) {
-            Ok(Program::Application(vec![parse(&data, "NSO")?], None))
+            Ok(Program::Application(vec![parse(&data, "NSO")?], None, None))
         } else {
             Err(format!(
                 "{}: not an NRO, NSO or ExeFS directory",
@@ -279,9 +284,12 @@ pub fn run_program_presenting(
     }
     hos.trace_svcs = trace_svcs;
     hos.config = config;
+    if let Program::Application(_, _, Some(romfs)) = program {
+        hos.config.romfs = Some(romfs.clone());
+    }
     match program {
         Program::Homebrew(nro) => hos.boot_homebrew(nro),
-        Program::Application(modules, npdm) => hos.boot_application(modules, npdm.as_ref()),
+        Program::Application(modules, npdm, _) => hos.boot_application(modules, npdm.as_ref()),
     }
     .map_err(RunError::Load)?;
     let stop = hos.run(max_steps);

@@ -506,7 +506,7 @@ fn homebrew_booted_as_an_application_nso() {
         ..Default::default()
     };
     let r = emu_run::run_program_presenting(
-        &emu_run::Program::Application(vec![module], None),
+        &emu_run::Program::Application(vec![module], None, None),
         10_000_000,
         false,
         config,

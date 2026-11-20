@@ -7,7 +7,7 @@ fn main() -> ExitCode {
     let trace = args.iter().any(|a| a == "--trace-svc");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
         eprintln!(
-            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] [--keys=prod.keys] <program.elf | homebrew.nro | game.nso | exefs-dir | game.nsp | game.xci>\n\
+            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] [--keys=prod.keys] [--auto-stub] <program.elf | homebrew.nro | game.nso | exefs-dir | game.nsp | game.xci>\n\
              (built with --features window, frames are shown in a window unless --frames is given)"
         );
         return ExitCode::from(2);
@@ -34,6 +34,8 @@ fn main() -> ExitCode {
                 .map(Into::into),
             boot_time: None,
             trace_unimplemented: trace,
+            auto_stub: args.iter().any(|a| a == "--auto-stub"),
+            romfs: None,
             gpu_backend: if args.iter().any(|a| a == "--gpu=vulkan") {
                 emu_horizon::services::GpuBackend::Vulkan
             } else {
