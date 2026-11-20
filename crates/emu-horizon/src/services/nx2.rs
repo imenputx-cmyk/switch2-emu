@@ -107,6 +107,9 @@ impl Service for Gsv {
             }
             305 => ctx.push_session(obj(Vi2::default())),
             497 => ctx.push_session(obj(Gpu::default())),
+            // OpenNvsrvSession: NVIDIA's driver server, which speaks the
+            // nvdrv protocol (Lichii).
+            1402 => ctx.push_session(obj(super::nv::NvDrv::nvsrv())),
             // CalculateRequirements: block-linear size and alignment of a
             // window image, 4 bytes per pixel (Lichii blocker 33). Input:
             // width, height.

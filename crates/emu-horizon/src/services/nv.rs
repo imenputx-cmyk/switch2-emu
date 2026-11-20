@@ -31,6 +31,9 @@ enum Device {
     CtrlGpu,
     /// A GPU channel (index into `Gpu::channels`).
     Gpu(usize),
+    /// Switch 2 devices with no emulated state yet (`/dev/nvhost-tsg-gpu`
+    /// etc.): every ioctl succeeds.
+    Stub,
 }
 
 #[derive(Default)]
@@ -38,6 +41,22 @@ pub struct NvDrv {
     fds: HashMap<u32, Device>,
     next_fd: u32,
     events: HashMap<u32, usize>,
+    /// A Switch 2 NvRm is the client (it asked for the 0xD0-byte
+    /// characteristics block). Unknown ioctls then echo their input with
+    /// success, as in Lichii (`nx2_stub_device.h`): its NvRm uses ioctls
+    /// Switch 1 never had.
+    nx2: bool,
+    name: &'static str,
+}
+
+impl NvDrv {
+    /// The `nx2:nvsrv` session gsv 1402 hands out: the same protocol.
+    pub fn nvsrv() -> Self {
+        NvDrv {
+            name: "nx2:nvsrv",
+            ..Self::default()
+        }
+    }
 }
 
 /// Fields of an ioctl request word.
@@ -74,6 +93,7 @@ impl NvDrv {
         io: &Ioctl,
         data: &mut [u8],
         extra: &[u8],
+        inline_out: &mut [u8],
         ctx: &mut Ctx,
     ) -> Result<u32, CallError> {
         let fds = &self.fds;
@@ -82,11 +102,24 @@ impl NvDrv {
             _ => None,
         };
         Ok(match (dev, io.kind, io.nr) {
-            (Device::AsGpu(a), 0x41, nr) => nvgpu::as_gpu(a, nr, data, ctx, channel_of_fd),
-            (Device::CtrlGpu, 0x47, nr) => nvgpu::ctrl_gpu(nr, data, ctx),
-            (Device::Gpu(c), kind @ (0x47 | 0x48), nr) => {
-                nvgpu::channel(c, kind, nr, data, extra, ctx)
+            (Device::AsGpu(_), 0x41, 0x0B) if self.nx2 => nvgpu::syncpoint_shim(data),
+            (Device::AsGpu(a), 0x41, nr) => match nvgpu::as_gpu(a, nr, data, ctx, channel_of_fd) {
+                NV_NOT_IMPLEMENTED if self.nx2 => echo(data),
+                r => r,
+            },
+            (Device::CtrlGpu, 0x47, nr) => {
+                match nvgpu::ctrl_gpu(nr, data, inline_out, &mut self.nx2, ctx) {
+                    NV_NOT_IMPLEMENTED if self.nx2 => echo(data),
+                    r => r,
+                }
             }
+            (Device::Gpu(c), kind @ (0x47 | 0x48), nr) => {
+                match nvgpu::channel(c, kind, nr, data, extra, ctx) {
+                    NV_NOT_IMPLEMENTED if self.nx2 => echo(data),
+                    r => r,
+                }
+            }
+            (Device::Stub, ..) => echo(data),
             // NVMAP_IOC_CREATE {size in, handle out}
             (Device::NvMap, 1, 0x01) => {
                 let size = u32_at(data, 0);
@@ -199,6 +232,15 @@ impl NvDrv {
             }
             // EVENT_SIGNAL, EVENT_REGISTER, EVENT_UNREGISTER
             (Device::NvHostCtrl, 0, 0x1C | 0x1F | 0x20) => NV_SUCCESS,
+            _ if self.nx2 => {
+                if ctx.config.trace_unimplemented {
+                    eprintln!(
+                        "[nvdrv] Switch 2 ioctl {dev:?} type {:#x} nr {:#x}: echoed",
+                        io.kind, io.nr
+                    );
+                }
+                echo(data)
+            }
             _ => {
                 if ctx.config.trace_unimplemented {
                     eprintln!(
@@ -212,9 +254,19 @@ impl NvDrv {
     }
 }
 
+/// The reply Lichii gives Switch 2 ioctls it does not know: the input
+/// back, with success.
+fn echo(_data: &mut [u8]) -> u32 {
+    NV_SUCCESS
+}
+
 impl Service for NvDrv {
     fn name(&self) -> &str {
-        "nvdrv"
+        if self.name.is_empty() {
+            "nvdrv"
+        } else {
+            self.name
+        }
     }
 
     fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
@@ -231,6 +283,9 @@ impl Service for NvDrv {
                     }
                     b"/dev/nvhost-ctrl-gpu" => Some(Device::CtrlGpu),
                     b"/dev/nvhost-gpu" => Some(Device::Gpu(ctx.system.gpu.new_channel())),
+                    // Switch 2 NvRm binds its channels to a TSG.
+                    b"/dev/nvhost-tsg-gpu" => Some(Device::Stub),
+                    p if self.nx2 && p.starts_with(b"/dev/nvhost-") => Some(Device::Stub),
                     _ => None,
                 };
                 match dev {
@@ -268,9 +323,17 @@ impl Service for NvDrv {
                 } else {
                     Vec::new()
                 };
-                let err = self.ioctl(dev, &io, &mut data, &extra, ctx)?;
+                // Ioctl3's second output buffer ("inline output").
+                let mut inline_out = match (command, ctx.out_buffer(1)) {
+                    (12, Some(b)) => vec![0u8; b.size as usize],
+                    _ => Vec::new(),
+                };
+                let err = self.ioctl(dev, &io, &mut data, &extra, &mut inline_out, ctx)?;
                 if request >> 30 & 2 != 0 && err == NV_SUCCESS {
                     ctx.write_out_buffer(0, &data)?;
+                }
+                if !inline_out.is_empty() && err == NV_SUCCESS {
+                    ctx.write_out_buffer(1, &inline_out)?;
                 }
                 ctx.push_u32(err);
             }
