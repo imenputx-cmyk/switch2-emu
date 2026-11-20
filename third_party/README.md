@@ -3,7 +3,7 @@
 | Directory | Project | License | Notes |
 |---|---|---|---|
 | `dynarmic/` | [dynarmic](https://github.com/azahar-emu/dynarmic) (Azahar fork) | 0BSD | AArch64 → x86-64 / arm64 JIT used by `emu-jit`. Bundled externals: fmt (MIT), mcl (MIT), robin-map (MIT), xbyak (BSD-3-Clause). |
-| `boost/` | [Boost](https://www.boost.org) 1.88.0 | BSL-1.0 | Only the header subset dynarmic includes. |
+| `boost/` | [Boost](https://www.boost.org) 1.88.0 | BSL-1.0 | The header-only libraries dynarmic includes (complete directories, MPL preprocessed headers only for `plain`/`gcc`). |
 
 Local changes to dynarmic:
 
