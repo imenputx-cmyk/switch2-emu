@@ -360,6 +360,51 @@ pub enum Op {
         comps: u8,
         lz: bool,
     },
+    /// Three-input integer add (SM70+ IADD3): a + b + c, each optionally
+    /// negated.
+    Iadd3 {
+        dst: u8,
+        a: u8,
+        neg_a: bool,
+        b: Operand,
+        neg_b: bool,
+        c: Operand,
+        neg_c: bool,
+    },
+    /// Three-input logic by truth table (LOP3.LUT): bit i of `lut` is the
+    /// result for (a, b, c) = (i >> 2 & 1, i >> 1 & 1, i & 1). `pred`
+    /// (PT for none) is set to result != 0.
+    Lop3 {
+        dst: u8,
+        a: u8,
+        b: Operand,
+        c: Operand,
+        lut: u8,
+        pred: u8,
+    },
+    /// Integer multiply-add, low 32 bits (IMAD): a * b + c.
+    Imad {
+        dst: u8,
+        a: u8,
+        b: Operand,
+        c: Operand,
+        neg_c: bool,
+    },
+    /// Funnel shift (SHF) of the 64-bit value c:a (high:low) by b.
+    Shf {
+        dst: u8,
+        a: u8,
+        b: Operand,
+        c: Operand,
+        right: bool,
+        /// Return the high 32 bits of the shifted value.
+        hi: bool,
+        /// Shift amount modulo the width instead of clamped to it.
+        wrap: bool,
+        /// 64-bit type (shifts up to 63) rather than 32-bit.
+        wide: bool,
+        signed: bool,
+    },
     Bra {
         target: usize,
     },
@@ -400,6 +445,13 @@ pub enum DecodeError {
     Unknown(u64),
     /// A branch to a scheduling word or before the program.
     BadTarget(u64),
+    /// A Switch 2 (SM86) instruction that is not decoded: its index,
+    /// 12-bit opcode and what is missing.
+    Native {
+        index: usize,
+        opcode: u32,
+        what: &'static str,
+    },
 }
 
 fn bits(v: u64, lo: u32, len: u32) -> u64 {

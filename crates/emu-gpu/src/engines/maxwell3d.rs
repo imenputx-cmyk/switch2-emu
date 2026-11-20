@@ -470,8 +470,13 @@ impl Maxwell3D {
             ctx.guest
                 .read(addr, &mut code)
                 .map_err(|f| format!("shader at {addr:#x}: {f:?}"))?;
-            let insts = decode_program(&code[HEADER_SIZE..])
-                .map_err(|e| format!("shader at {addr:#x}: {e:x?}"))?;
+            // Switch 2 programs are SM86 code after a 0x80-byte header.
+            let insts = if self.ampere {
+                crate::shader::sm86::decode_program(&code[crate::shader::sm86::HEADER_SIZE..])
+            } else {
+                decode_program(&code[HEADER_SIZE..])
+            }
+            .map_err(|e| format!("shader at {addr:#x}: {e:x?}"))?;
             if is_complete(&insts) {
                 let p = (Header::parse(&code[..HEADER_SIZE]), insts);
                 self.programs.insert(addr, p.clone());
@@ -494,10 +499,17 @@ impl Maxwell3D {
         if self.reg(base) & 1 == 0 {
             return Ok(None);
         }
-        let region = u64::from(self.reg(reg::PROGRAM_REGION_A) & 0xFF) << 32
-            | u64::from(self.reg(reg::PROGRAM_REGION_A + 4));
-        self.program(region + u64::from(self.reg(base + 4)), ctx)
-            .map(Some)
+        // Ampere pipelines hold a full program address (words 5 and 6 of
+        // the slot) instead of an offset into the program region (Lichii
+        // shader_cache.cpp).
+        let addr = if self.ampere {
+            u64::from(self.reg(base + 0x14) & 0xFF) << 32 | u64::from(self.reg(base + 0x18))
+        } else {
+            let region = u64::from(self.reg(reg::PROGRAM_REGION_A) & 0xFF) << 32
+                | u64::from(self.reg(reg::PROGRAM_REGION_A + 4));
+            region + u64::from(self.reg(base + 4))
+        };
+        self.program(addr, ctx).map(Some)
     }
 
     /// Color target `index` as a surface.

@@ -627,6 +627,16 @@ impl Translator {
         self.select(self.c.uint, cond, t, self.c.zero_u)
     }
 
+    /// A logical shift that gives 0 for amounts of 32 or more (SPIR-V
+    /// leaves those undefined).
+    fn safe_shift(&mut self, opcode: u16, v: u32, s: u32) -> u32 {
+        let uint = self.c.uint;
+        let shifted = self.op2(opcode, uint, v, s);
+        let w = self.constant_u(32);
+        let big = self.op2(op::U_GREATER_THAN_EQUAL, self.c.bool_t, s, w);
+        self.select(uint, big, self.c.zero_u, shifted)
+    }
+
     fn negate_int(&mut self, v: u32, on: bool) -> u32 {
         if on {
             self.op1(op::S_NEGATE, self.c.uint, v)
@@ -1016,6 +1026,121 @@ impl Translator {
                 let hi = self.glsl(uint, fmax, &[x, y]);
                 let c = self.load_pred(min);
                 let r = self.select(uint, c, lo, hi);
+                self.store_reg(dst, r);
+            }
+            Op::Iadd3 {
+                dst,
+                a,
+                neg_a,
+                b,
+                neg_b,
+                c,
+                neg_c,
+            } => {
+                let x = self.load_reg(a);
+                let x = self.negate_int(x, neg_a);
+                let y = self.operand_uint(b)?;
+                let y = self.negate_int(y, neg_b);
+                let z = self.operand_uint(c)?;
+                let z = self.negate_int(z, neg_c);
+                let r = self.op2(op::I_ADD, uint, x, y);
+                let r = self.op2(op::I_ADD, uint, r, z);
+                self.store_reg(dst, r);
+            }
+            Op::Lop3 {
+                dst,
+                a,
+                b,
+                c,
+                lut,
+                pred,
+            } => {
+                let x = self.load_reg(a);
+                let y = self.operand_uint(b)?;
+                let z = self.operand_uint(c)?;
+                let inv = [
+                    self.op1(op::NOT, uint, x),
+                    self.op1(op::NOT, uint, y),
+                    self.op1(op::NOT, uint, z),
+                ];
+                let mut r = self.c.zero_u;
+                for i in 0..8u32 {
+                    if lut >> i & 1 == 0 {
+                        continue;
+                    }
+                    let pa = if i & 4 != 0 { x } else { inv[0] };
+                    let pb = if i & 2 != 0 { y } else { inv[1] };
+                    let pc = if i & 1 != 0 { z } else { inv[2] };
+                    let t = self.op2(op::BITWISE_AND, uint, pa, pb);
+                    let t = self.op2(op::BITWISE_AND, uint, t, pc);
+                    r = self.op2(op::BITWISE_OR, uint, r, t);
+                }
+                self.store_reg(dst, r);
+                if pred != 7 {
+                    let nz = self.op2(op::I_NOT_EQUAL, self.c.bool_t, r, self.c.zero_u);
+                    self.store_pred(pred, nz);
+                }
+            }
+            Op::Imad {
+                dst,
+                a,
+                b,
+                c,
+                neg_c,
+            } => {
+                let x = self.load_reg(a);
+                let y = self.operand_uint(b)?;
+                let z = self.operand_uint(c)?;
+                let z = self.negate_int(z, neg_c);
+                let p = self.op2(op::I_MUL, uint, x, y);
+                let r = self.op2(op::I_ADD, uint, p, z);
+                self.store_reg(dst, r);
+            }
+            Op::Shf {
+                dst,
+                a,
+                b,
+                c,
+                right,
+                hi,
+                wrap,
+                wide,
+                signed,
+            } => {
+                if wide {
+                    return Err("SHF with a 64-bit type".into());
+                }
+                let low = self.load_reg(a);
+                let amount = self.operand_uint(b)?;
+                let high = self.operand_uint(c)?;
+                let s = if wrap {
+                    let m = self.constant_u(31);
+                    self.op2(op::BITWISE_AND, uint, amount, m)
+                } else {
+                    let w = self.constant_u(32);
+                    self.glsl(uint, GLSL_UMIN, &[amount, w])
+                };
+                let w = self.constant_u(32);
+                let rest = self.op2(op::I_SUB, uint, w, s);
+                let r = match (right, hi) {
+                    (false, false) => self.safe_shift(op::SHIFT_LEFT_LOGICAL, low, s),
+                    (false, true) => {
+                        let h = self.safe_shift(op::SHIFT_LEFT_LOGICAL, high, s);
+                        let l = self.safe_shift(op::SHIFT_RIGHT_LOGICAL, low, rest);
+                        self.op2(op::BITWISE_OR, uint, h, l)
+                    }
+                    (true, false) => {
+                        let l = self.safe_shift(op::SHIFT_RIGHT_LOGICAL, low, s);
+                        let h = self.safe_shift(op::SHIFT_LEFT_LOGICAL, high, rest);
+                        self.op2(op::BITWISE_OR, uint, l, h)
+                    }
+                    (true, true) if signed => {
+                        let m = self.constant_u(31);
+                        let s = self.glsl(uint, GLSL_UMIN, &[s, m]);
+                        self.op2(op::SHIFT_RIGHT_ARITHMETIC, uint, high, s)
+                    }
+                    (true, true) => self.safe_shift(op::SHIFT_RIGHT_LOGICAL, high, s),
+                };
                 self.store_reg(dst, r);
             }
             Op::Sel { dst, a, b, cond } => {
@@ -1666,6 +1791,76 @@ mod tests {
         let h = super::super::Header::parse(&ps);
         let t = translate(&decode_program(&ps[0x50..]).unwrap(), &h).unwrap();
         assert_eq!(t.cbufs, 1 << 3);
+        validate(&t.words);
+    }
+
+    #[test]
+    fn switch2_vertex_shader_validates() {
+        use crate::shader::sm86::asm::{exit, inst};
+        // ALD 4 words; IADD3, LOP3, IMAD, SHF (both directions), FFMA, MUFU;
+        // AST position.
+        let insts = [
+            inst(
+                0x321,
+                0,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x80), (74, 2, 3)],
+            ),
+            inst(
+                0x810,
+                4,
+                &[(24, 8, 0), (32, 32, 3), (64, 8, 1), (81, 6, 0x3F)],
+            ),
+            inst(
+                0x212,
+                5,
+                &[
+                    (24, 8, 4),
+                    (32, 8, 1),
+                    (64, 8, 2),
+                    (72, 8, 0x96),
+                    (81, 3, 1),
+                    (87, 4, 15),
+                ],
+            ),
+            inst(0x224, 6, &[(24, 8, 5), (32, 8, 4), (64, 8, 3)]),
+            inst(
+                0x819,
+                7,
+                &[(24, 8, 6), (32, 32, 5), (64, 8, 5), (73, 2, 3), (80, 1, 1)],
+            ),
+            inst(
+                0x819,
+                8,
+                &[
+                    (24, 8, 7),
+                    (32, 32, 3),
+                    (64, 8, 6),
+                    (73, 2, 2),
+                    (76, 1, 1),
+                    (80, 1, 1),
+                ],
+            ),
+            inst(0x223, 0, &[(24, 8, 0), (32, 8, 1), (64, 8, 2)]),
+            inst(0x308, 1, &[(32, 8, 1), (74, 6, 1)]),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 0),
+                    (40, 10, 0x70),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            exit(),
+        ];
+        let mut code = crate::shader::sm86::asm::program(&insts);
+        code[..0x50].copy_from_slice(&vertex_header());
+        let h = super::super::Header::parse(&code);
+        let p =
+            crate::shader::sm86::decode_program(&code[crate::shader::sm86::HEADER_SIZE..]).unwrap();
+        let t = translate(&p, &h).unwrap();
         validate(&t.words);
     }
 

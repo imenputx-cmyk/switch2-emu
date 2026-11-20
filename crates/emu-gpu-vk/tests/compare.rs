@@ -368,6 +368,18 @@ fn shaded_draw(
     max_differing: usize,
     extra: &[u32],
 ) -> Option<(Vec<u8>, Vec<u8>)> {
+    shaded_draw_on(vs, ps, max_differing, extra, false)
+}
+
+/// [`shaded_draw`] on the Maxwell 3D class, or on the Switch 2 (Ampere)
+/// one with SM86 programs at full pipeline addresses.
+fn shaded_draw_on(
+    vs: Vec<u8>,
+    ps: Vec<u8>,
+    max_differing: usize,
+    extra: &[u32],
+    ampere: bool,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let vk = vulkan()?;
     let verts: Vec<f32> = vec![
         -0.9, -0.8, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, //
@@ -435,6 +447,16 @@ fn shaded_draw(
         incr(0, 0x2410 + 4 * 32, 1),
         1, // stage 4 (PS), slot 0
     ]);
+    if ampere {
+        w[1] = class::AMPERE_THREED;
+        for (slot, at) in [(1u32, code), (5, code + 0x200)] {
+            w.extend([
+                incr(0, 0x2000 + 64 * slot + 0x14, 2),
+                (at >> 32) as u32,
+                at as u32,
+            ]);
+        }
+    }
     w.extend(extra);
     w.extend([
         // A triangle, then a strip over vertices 1..4.
@@ -650,4 +672,73 @@ fn indexed_draws_with_constant_buffers() {
         white[0] > 230 && (115..140).contains(&white[1]) && (55..75).contains(&white[2]),
         "{white:?}"
     );
+}
+
+#[test]
+fn switch2_sm86_shaders() {
+    use emu_gpu::shader::asm::{pixel_header, vertex_header};
+    use emu_gpu::shader::sm86::asm::{exit, inst, program};
+    let with_header = |header: &[u8], insts: &[emu_gpu::shader::sm86::Instruction]| {
+        let mut p = program(insts);
+        p[..header.len()].copy_from_slice(header);
+        p
+    };
+    // VS: ALD position and color, store both.
+    let vs = with_header(
+        &vertex_header(),
+        &[
+            inst(
+                0x321,
+                0,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x80), (74, 2, 3)],
+            ),
+            inst(
+                0x321,
+                4,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x90), (74, 2, 3)],
+            ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 0),
+                    (40, 10, 0x70),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 4),
+                    (40, 10, 0x80),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            exit(),
+        ],
+    );
+    // PS: IPA color; G += 0.25; B = B * 0.5 + 0.25 (FFMA, C immediate);
+    // A = 1.0.
+    let ps = with_header(
+        &pixel_header(),
+        &[
+            inst(0x326, 0, &[(32, 8, 255), (64, 8, 0x20), (81, 3, 7)]),
+            inst(0x326, 1, &[(32, 8, 255), (64, 8, 0x21), (81, 3, 7)]),
+            inst(0x326, 2, &[(32, 8, 255), (64, 8, 0x22), (81, 3, 7)]),
+            inst(0x821, 1, &[(24, 8, 1), (32, 32, 0.25f32.to_bits())]),
+            inst(
+                0x423,
+                2,
+                &[(24, 8, 2), (64, 8, 255), (32, 32, 0.25f32.to_bits())],
+            ),
+            inst(0x802, 3, &[(32, 32, 1.0f32.to_bits()), (72, 4, 15)]),
+            exit(),
+        ],
+    );
+    shaded_draw_on(vs, ps, 8, &[], true);
 }

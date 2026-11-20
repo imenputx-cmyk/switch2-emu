@@ -12,6 +12,7 @@
 pub mod asm;
 pub mod decode;
 pub mod interp;
+pub mod sm86;
 pub mod spirv;
 
 /// Bytes of the program header before the first instruction.

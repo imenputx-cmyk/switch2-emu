@@ -430,6 +430,72 @@ impl Machine<'_> {
                 };
                 self.regs.set(dst, v);
             }
+            Op::Iadd3 {
+                dst,
+                a,
+                neg_a,
+                b,
+                neg_b,
+                c,
+                neg_c,
+            } => {
+                let n = |v: u32, on: bool| if on { v.wrapping_neg() } else { v };
+                let v = n(self.regs.get(a), neg_a)
+                    .wrapping_add(n(self.operand(b), neg_b))
+                    .wrapping_add(n(self.operand(c), neg_c));
+                self.regs.set(dst, v);
+            }
+            Op::Lop3 {
+                dst,
+                a,
+                b,
+                c,
+                lut,
+                pred,
+            } => {
+                let v = lop3(self.regs.get(a), self.operand(b), self.operand(c), lut);
+                self.regs.set(dst, v);
+                self.set_pred(pred, v != 0);
+            }
+            Op::Imad {
+                dst,
+                a,
+                b,
+                c,
+                neg_c,
+            } => {
+                let c = self.operand(c);
+                let c = if neg_c { c.wrapping_neg() } else { c };
+                let v = self
+                    .regs
+                    .get(a)
+                    .wrapping_mul(self.operand(b))
+                    .wrapping_add(c);
+                self.regs.set(dst, v);
+            }
+            Op::Shf {
+                dst,
+                a,
+                b,
+                c,
+                right,
+                hi,
+                wrap,
+                wide,
+                signed,
+            } => {
+                let v = shf(
+                    self.regs.get(a),
+                    self.operand(b),
+                    self.operand(c),
+                    right,
+                    hi,
+                    wrap,
+                    wide,
+                    signed,
+                );
+                self.regs.set(dst, v);
+            }
             Op::Sel { dst, a, b, cond } => {
                 let v = if self.pred(cond) {
                     self.regs.get(a)
@@ -637,6 +703,55 @@ pub fn run(program: &[Inst], io: &mut dyn ShaderIo) -> Option<Regs> {
         }
     }
     Some(m.regs)
+}
+
+/// LOP3.LUT on three words.
+pub fn lop3(a: u32, b: u32, c: u32, lut: u8) -> u32 {
+    let mut r = 0;
+    for i in 0..8u32 {
+        if lut >> i & 1 != 0 {
+            let pick = |v: u32, bit: u32| if i >> bit & 1 != 0 { v } else { !v };
+            r |= pick(a, 2) & pick(b, 1) & pick(c, 0);
+        }
+    }
+    r
+}
+
+/// SHF: shifts the 64-bit value `high:low` and returns its low or high word.
+#[allow(clippy::too_many_arguments)]
+pub fn shf(
+    low: u32,
+    amount: u32,
+    high: u32,
+    right: bool,
+    hi: bool,
+    wrap: bool,
+    wide: bool,
+    signed: bool,
+) -> u32 {
+    let width = if wide { 64 } else { 32 };
+    let s = if wrap {
+        amount & (width - 1)
+    } else {
+        amount.min(width)
+    };
+    let v = (u64::from(high) << 32) | u64::from(low);
+    let r = if right {
+        if signed {
+            (v as i64)
+                .checked_shr(s)
+                .unwrap_or(if (v as i64) < 0 { -1 } else { 0 }) as u64
+        } else {
+            v.checked_shr(s).unwrap_or(0)
+        }
+    } else {
+        v.checked_shl(s).unwrap_or(0)
+    };
+    if hi {
+        (r >> 32) as u32
+    } else {
+        r as u32
+    }
 }
 
 #[cfg(test)]
