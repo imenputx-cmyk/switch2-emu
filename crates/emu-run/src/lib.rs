@@ -184,11 +184,22 @@ impl Program {
         let parse = |data: &[u8], name: &str| {
             emu_loader::nso::parse_nso(data).map_err(|e| format!("{name}: {e}"))
         };
+        // Extracted dumps: a title folder with exefs/ (and romfs/), or the
+        // exefs/main file itself, stand for the ExeFS directory.
+        let mut path = path.to_path_buf();
+        if path.is_dir() && path.join("exefs").is_dir() {
+            path = path.join("exefs");
+        }
+        if path.is_file() && path.parent().is_some_and(|p| p.join("main.npdm").is_file()) {
+            path = path.parent().unwrap().to_path_buf();
+        }
+        let path = path.as_path();
         let ext = path
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        if matches!(ext.as_str(), "nsp" | "xci" | "nca") {
+        let package_dir = path.is_dir() && emu_loader::nca::is_nca_directory(path);
+        if package_dir || matches!(ext.as_str(), "nsp" | "xci" | "nca") {
             let keys_path = match keys {
                 Some(k) => k.to_path_buf(),
                 None => std::env::var_os("HOME")
@@ -233,7 +244,21 @@ impl Program {
                 }
                 Err(_) => None,
             };
-            return Ok(Program::Application(modules, npdm, None));
+            // An extracted RomFS next to the ExeFS (title/exefs, title/romfs).
+            let romfs = match path.parent().map(|p| p.join("romfs")) {
+                Some(dir) if dir.is_dir() => {
+                    let r = emu_loader::romfs::DirRomFs::build(&dir)
+                        .map_err(|e| format!("romfs: {e}"))?;
+                    eprintln!(
+                        "[emu-run] RomFS from {}: {:#x} bytes",
+                        dir.display(),
+                        r.len()
+                    );
+                    Some(emu_loader::nca::RomFs::Dir(std::sync::Arc::new(r)))
+                }
+                _ => None,
+            };
+            return Ok(Program::Application(modules, npdm, romfs));
         }
         let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if emu_loader::nro::is_nro(&data) {
@@ -242,7 +267,7 @@ impl Program {
             Ok(Program::Application(vec![parse(&data, "NSO")?], None, None))
         } else {
             Err(format!(
-                "{}: not an NRO, NSO or ExeFS directory",
+                "{}: not an NRO, NSO, ExeFS directory or game package",
                 path.display()
             ))
         }

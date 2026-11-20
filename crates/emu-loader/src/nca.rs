@@ -119,13 +119,13 @@ impl Storage {
 }
 
 #[cfg(unix)]
-fn read_file_at(f: &File, offset: u64, buf: &mut [u8]) -> Result<(), LoadError> {
+pub(crate) fn read_file_at(f: &File, offset: u64, buf: &mut [u8]) -> Result<(), LoadError> {
     std::os::unix::fs::FileExt::read_exact_at(f, buf, offset)
         .map_err(|e| LoadError::Memory(e.to_string()))
 }
 
 #[cfg(windows)]
-fn read_file_at(f: &File, mut offset: u64, mut buf: &mut [u8]) -> Result<(), LoadError> {
+pub(crate) fn read_file_at(f: &File, mut offset: u64, mut buf: &mut [u8]) -> Result<(), LoadError> {
     while !buf.is_empty() {
         let n = std::os::windows::fs::FileExt::seek_read(f, buf, offset)
             .map_err(|e| LoadError::Memory(e.to_string()))?;
@@ -469,37 +469,53 @@ pub fn open_package(storage: Storage, keys: &Keys) -> Result<(Vec<Storage>, Titl
     Ok((ncas, title_keys))
 }
 
-/// A RomFS image inside an NCA section, decrypted as it is read.
+/// An application's RomFS: inside an NCA section (decrypted as it is
+/// read) or built from an extracted `romfs/` directory.
 #[derive(Clone)]
-pub struct RomFs {
-    section: Section,
-    offset: u64,
-    size: u64,
+pub enum RomFs {
+    Nca {
+        section: Section,
+        offset: u64,
+        size: u64,
+    },
+    Dir(Arc<crate::romfs::DirRomFs>),
 }
 
 impl std::fmt::Debug for RomFs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RomFs({:#x} bytes)", self.size)
+        write!(f, "RomFs({:#x} bytes)", self.len())
     }
 }
 
 impl RomFs {
     pub fn len(&self) -> u64 {
-        self.size
+        match self {
+            RomFs::Nca { size, .. } => *size,
+            RomFs::Dir(d) => d.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.size == 0
+        self.len() == 0
     }
 
     /// Reads up to `buf.len()` bytes at `offset`; returns how many.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, LoadError> {
-        if offset >= self.size {
-            return Ok(0);
+        match self {
+            RomFs::Nca {
+                section,
+                offset: start,
+                size,
+            } => {
+                if offset >= *size {
+                    return Ok(0);
+                }
+                let n = (buf.len() as u64).min(size - offset) as usize;
+                section.read_at(start + offset, &mut buf[..n])?;
+                Ok(n)
+            }
+            RomFs::Dir(d) => d.read_at(offset, buf),
         }
-        let n = (buf.len() as u64).min(self.size - offset) as usize;
-        self.section.read_at(self.offset + offset, &mut buf[..n])?;
-        Ok(n)
     }
 }
 
@@ -507,6 +523,45 @@ impl RomFs {
 pub struct Program {
     pub exefs: Partition,
     pub romfs: Option<RomFs>,
+}
+
+/// An extracted NSP: a directory with the package's `.nca` and `.tik`
+/// files.
+pub fn open_directory(dir: &Path, keys: &Keys) -> Result<(Vec<Storage>, TitleKeys), LoadError> {
+    let mut ncas = Vec::new();
+    let mut title_keys = HashMap::new();
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| LoadError::Memory(format!("{}: {e}", dir.display())))?;
+    for e in entries.filter_map(Result::ok) {
+        let path = e.path();
+        let ext = path
+            .extension()
+            .map(|x| x.to_string_lossy().to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("nca") => ncas.push(Storage::open(&path)?),
+            Some("tik") => {
+                let ticket = std::fs::read(&path).map_err(|e| LoadError::Memory(e.to_string()))?;
+                if let Ok((rights, key)) = title_key(&ticket, keys) {
+                    title_keys.insert(rights, key);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((ncas, title_keys))
+}
+
+/// Does a directory hold an extracted package (NCA files)?
+pub fn is_nca_directory(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut it| {
+        it.any(|e| {
+            e.is_ok_and(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("nca"))
+            })
+        })
+    })
 }
 
 /// Finds the program's ExeFS (the partition with a `main` NSO) in a
@@ -553,7 +608,7 @@ pub fn find_program(path: &Path, keys: &Keys) -> Result<Program, LoadError> {
                 }
             } else if nca.sections.get(i).is_some_and(|s| s.is_some()) && romfs.is_none() {
                 if let Ok((section, offset, size)) = nca.section_data(i) {
-                    romfs = Some(RomFs {
+                    romfs = Some(RomFs::Nca {
                         section,
                         offset,
                         size,

@@ -8,6 +8,7 @@ pub mod nca;
 pub mod npdm;
 pub mod nro;
 pub mod nso;
+pub mod romfs;
 
 use emu_memory::{Memory, Perm, PAGE_SIZE};
 use std::collections::BTreeMap;
