@@ -1,6 +1,8 @@
 /* Triangles drawn by the GPU: Maxwell vertex and pixel shaders
  * (triangle_shaders.h), a vertex buffer with positions and colors, the
- * 3D engine's draw methods, into the display's framebuffers. Uses
+ * 3D engine's draw methods, into the display's framebuffers. Frame 2
+ * draws indexed quads whose shaders read constant buffers (a transform
+ * and a tint) uploaded through the 3D engine. Uses
  * libnx's own (ISC) nvidia and display code. Method numbers are from
  * NVIDIA's open-gpu-doc class headers (MIT). */
 #include <string.h>
@@ -116,6 +118,10 @@ int hb_main(void *ctx, u64 x1, void *saved_lr) {
     Vertex *vtx = __libnx_aligned_alloc(0x1000, 0x1000);
     memcpy(code, vertex_shader, sizeof(vertex_shader));
     memcpy(code + 0x200, pixel_shader, sizeof(pixel_shader));
+    memcpy(code + 0x400, vertex_shader_cb, sizeof(vertex_shader_cb));
+    memcpy(code + 0x600, pixel_shader_cb, sizeof(pixel_shader_cb));
+    u16 *idx = (u16 *)((u8 *)vtx + 0x800);
+    iova_t cbuf_iova;
     nvMapCreate(&cmd_map, cmd_mem, 0x10000, 0x1000, NvKind_Pitch, true);
     nvMapCreate(&code_map, code, 0x1000, 0x1000, NvKind_Pitch, true);
     nvMapCreate(&vtx_map, vtx, 0x1000, 0x1000, NvKind_Pitch, true);
@@ -149,7 +155,7 @@ int hb_main(void *ctx, u64 x1, void *saved_lr) {
         { -0.7f, -0.6f, 0, 1, 0, 1, 0, 1 },
         { 0.7f, -0.6f, 0, 1, 0, 0, 1, 1 },
     };
-    for (u32 frame = 0; frame < 2; frame++) {
+    for (u32 frame = 0; frame < 3; frame++) {
         /* Frame 1 moves the triangle right and draws a strip quad too. */
         float dx = frame * 0.25f;
         for (int i = 0; i < 3; i++) { vtx[i] = tri[i]; vtx[i].x += dx; }
@@ -171,6 +177,41 @@ int hb_main(void *ctx, u64 x1, void *saved_lr) {
         set1(SUB_3D, 0x1614, 0);                                          /* END */
         if (frame == 1)                                                   /* strip in one method */
             set1(SUB_3D, 0x1214, 3 | 4 << 16 | 5u << 28);
+        if (frame == 2) {
+            /* Two quads from 4 shared corners each, indexed (u16), drawn
+             * with the constant-buffer shaders; the second quad uses a
+             * base vertex of 4 and another transform/tint. */
+            static const Vertex corners[8] = {
+                { -1, -1, 0, 1, 1, 0, 0, 1 }, { 1, -1, 0, 1, 0, 1, 0, 1 },
+                { 1, 1, 0, 1, 0, 0, 1, 1 },   { -1, 1, 0, 1, 1, 1, 1, 1 },
+                { -1, -1, 0, 1, 1, 1, 1, 1 }, { 1, -1, 0, 1, 1, 1, 1, 1 },
+                { 1, 1, 0, 1, 1, 1, 1, 1 },   { -1, 1, 0, 1, 1, 1, 1, 1 },
+            };
+            for (int i = 0; i < 8; i++) vtx[16 + i] = corners[i];
+            static const u16 quad_idx[6] = { 0, 1, 2, 0, 2, 3 };
+            for (int i = 0; i < 6; i++) idx[i] = quad_idx[i];
+            cbuf_iova = vtx_iova + 0xC00;                                 /* 2 x 256 bytes */
+            incr(SUB_3D, 0x2000 + 1 * 64, 2); w(1 | 1 << 4); w(0x400);
+            incr(SUB_3D, 0x2000 + 5 * 64, 2); w(1 | 5 << 4); w(0x600);
+            incr(SUB_3D, 0x17C8, 2); w((vtx_iova + 0x800) >> 32); w((u32)(vtx_iova + 0x800));
+            set1(SUB_3D, 0x17D8, 1);                                      /* 16-bit indices */
+            for (int q = 0; q < 2; q++) {
+                iova_t cb = cbuf_iova + q * 0x100;
+                /* c0: scale xy, offset xy; c1 (at +0x40): tint rgb. */
+                incr(SUB_3D, 0x2380, 4); w(0x100); w(cb >> 32); w((u32)cb); w(0);
+                incr(SUB_3D, 0x2390, 4);
+                w(fbits(0.3f)); w(fbits(0.3f)); w(fbits(q ? 0.5f : -0.5f)); w(fbits(-0.3f));
+                set1(SUB_3D, 0x2410, 1 | 0 << 4);                         /* VS slot 0 */
+                incr(SUB_3D, 0x2380, 4); w(0x40); w((cb + 0x40) >> 32); w((u32)(cb + 0x40)); w(0);
+                incr(SUB_3D, 0x2390, 3); w(fbits(1.0f)); w(fbits(q ? 1.0f : 0.5f)); w(fbits(q ? 0.2f : 1.0f));
+                set1(SUB_3D, 0x2410 + 4 * 32, 1 | 1 << 4);                /* PS slot 1 */
+                set1(SUB_3D, 0x1434, 16 + q * 4);                         /* base vertex */
+                set1(SUB_3D, 0x17E8, 0 | 6 << 16 | 4u << 28);             /* 16-bit indexed, triangles */
+            }
+            /* Back to the plain shaders for the next frame. */
+            incr(SUB_3D, 0x2000 + 1 * 64, 2); w(1 | 1 << 4); w(0);
+            incr(SUB_3D, 0x2000 + 5 * 64, 2); w(1 | 5 << 4); w(0x200);
+        }
         Result rc = flush();
         if (rc) { line("frame submit failed: ", rc); return 1; }
         framebufferEnd(&fb);

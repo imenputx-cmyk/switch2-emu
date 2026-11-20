@@ -53,6 +53,16 @@ pub fn fmul(dst: u8, a: u8, b: u8) -> u64 {
     op(0x5c68) | r(dst, 0) | r(a, 8) | r(b, 20)
 }
 
+/// dst = a * c[index][offset].
+pub fn fmul_cbuf(dst: u8, a: u8, index: u8, offset: u32) -> u64 {
+    op(0x4c68) | r(dst, 0) | r(a, 8) | u64::from(index) << 34 | u64::from(offset / 4) << 20
+}
+
+/// dst = a + c[index][offset].
+pub fn fadd_cbuf(dst: u8, a: u8, index: u8, offset: u32) -> u64 {
+    op(0x4c58) | r(dst, 0) | r(a, 8) | u64::from(index) << 34 | u64::from(offset / 4) << 20
+}
+
 pub fn fmul32i(dst: u8, a: u8, b: f32) -> u64 {
     op(0x1e00) | r(dst, 0) | r(a, 8) | u64::from(b.to_bits()) << 20
 }
@@ -266,6 +276,33 @@ mod tests {
         for (bits, inst) in cases {
             assert_eq!(decode(bits), Ok(inst), "{bits:#018x}");
         }
+        assert_eq!(
+            decode(fmul_cbuf(1, 2, 3, 0x20)),
+            Ok(Inst::Fmul {
+                dst: 1,
+                a: 2,
+                b: Operand::Cbuf {
+                    index: 3,
+                    offset: 0x20
+                },
+                neg_b: false,
+                sat: false
+            })
+        );
+        assert_eq!(
+            decode(fadd_cbuf(1, 2, 0, 4)),
+            Ok(Inst::Fadd {
+                dst: 1,
+                a: 2,
+                a_mods: Mods::default(),
+                b: Operand::Cbuf {
+                    index: 0,
+                    offset: 4
+                },
+                b_mods: Mods::default(),
+                sat: false
+            })
+        );
         assert_eq!(decode(exit()), Ok(Inst::Exit));
         assert_eq!(decode(nop()), Ok(Inst::Nop));
         assert_eq!(

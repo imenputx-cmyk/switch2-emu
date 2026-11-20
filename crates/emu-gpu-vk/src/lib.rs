@@ -70,7 +70,11 @@ pub struct VulkanBackend {
     recording: bool,
     images: HashMap<(usize, Surface), Image>,
     software: SoftwareBackend,
-    pipeline_layout: vk::PipelineLayout,
+    /// Descriptor set and pipeline layouts by the constant buffers the
+    /// vertex and pixel shaders read (bit masks).
+    layouts: HashMap<(u32, u32), (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    /// Descriptor sets of the current batch come from here; reset at flush.
+    descriptor_pool: vk::DescriptorPool,
     /// Pipelines by a hash of their shaders and fixed state.
     pipelines: HashMap<u64, (vk::Pipeline, [vk::ShaderModule; 2])>,
     /// Vertex buffers of the current batch, freed at flush.
@@ -165,9 +169,18 @@ impl VulkanBackend {
         let fence = device
             .create_fence(&vk::FenceCreateInfo::default(), None)
             .map_err(err("fence"))?;
-        let pipeline_layout = device
-            .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
-            .map_err(err("pipeline layout"))?;
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 8192,
+        }];
+        let descriptor_pool = device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1024)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+            .map_err(err("descriptor pool"))?;
         Ok(VulkanBackend {
             memory_props: instance.get_physical_device_memory_properties(pd),
             _entry: entry,
@@ -181,7 +194,8 @@ impl VulkanBackend {
             recording: false,
             images: HashMap::new(),
             software: SoftwareBackend,
-            pipeline_layout,
+            layouts: HashMap::new(),
+            descriptor_pool,
             pipelines: HashMap::new(),
             transient: Vec::new(),
             gpu_draws: 0,
@@ -475,6 +489,9 @@ impl VulkanBackend {
             self.device.destroy_buffer(b.buffer, None);
             self.device.free_memory(b.memory, None);
         }
+        self.device
+            .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
+            .map_err(err("reset descriptor pool"))?;
         let mut result = Ok(());
         for key in keys {
             let img = self.images.remove(&key).unwrap();
@@ -492,8 +509,8 @@ impl VulkanBackend {
 
 /// What a draw needs on Vulkan, worked out before touching the device.
 struct Plan {
-    vs: Vec<u32>,
-    ps: Vec<u32>,
+    vs: spirv::Translated,
+    ps: spirv::Translated,
     topology: vk::PrimitiveTopology,
     /// (location, stream, offset, format)
     attributes: Vec<(u32, u32, u32, vk::Format)>,
@@ -595,19 +612,90 @@ impl VulkanBackend {
             .map_err(err("shader module"))
     }
 
+    /// Layouts for shaders reading the constant buffers in the masks.
+    unsafe fn layout(
+        &mut self,
+        vs: u32,
+        ps: u32,
+    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), String> {
+        if let Some(&l) = self.layouts.get(&(vs, ps)) {
+            return Ok(l);
+        }
+        let mut bindings = Vec::new();
+        for (mask, stage, flags) in [
+            (
+                vs,
+                emu_gpu::shader::Stage::Vertex,
+                vk::ShaderStageFlags::VERTEX,
+            ),
+            (
+                ps,
+                emu_gpu::shader::Stage::Pixel,
+                vk::ShaderStageFlags::FRAGMENT,
+            ),
+        ] {
+            for i in (0..32).filter(|i| mask & (1 << i) != 0) {
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(spirv::cbuf_binding(stage, i))
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(flags),
+                );
+            }
+        }
+        let dsl = self
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+            .map_err(err("descriptor set layout"))?;
+        let sets = [dsl];
+        let layout = self
+            .device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets),
+                None,
+            )
+            .map_err(err("pipeline layout"))?;
+        self.layouts.insert((vs, ps), (dsl, layout));
+        Ok((dsl, layout))
+    }
+
+    /// A host-visible buffer with `data`, freed at the next flush.
+    unsafe fn transient_buffer(
+        &mut self,
+        data: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> Result<vk::Buffer, String> {
+        let b = self.create_buffer_with(data.len().max(16), usage)?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), b.ptr, data.len());
+        let buffer = b.buffer;
+        self.transient.push(b);
+        Ok(buffer)
+    }
+
     unsafe fn pipeline(&mut self, p: &Plan, format: vk::Format) -> Result<vk::Pipeline, String> {
         let mut h = DefaultHasher::new();
-        (&p.vs, &p.ps, p.topology.as_raw(), format.as_raw()).hash(&mut h);
+        (
+            &p.vs.words,
+            &p.ps.words,
+            p.topology.as_raw(),
+            format.as_raw(),
+        )
+            .hash(&mut h);
         for a in &p.attributes {
             (a.0, a.1, a.2, a.3.as_raw()).hash(&mut h);
         }
         p.bindings.hash(&mut h);
         let key = h.finish();
+        let (_, layout) = self.layout(p.vs.cbufs, p.ps.cbufs)?;
         if let Some((pipe, _)) = self.pipelines.get(&key) {
             return Ok(*pipe);
         }
-        let vs = self.shader_module(&p.vs)?;
-        let ps = self.shader_module(&p.ps)?;
+        let vs = self.shader_module(&p.vs.words)?;
+        let ps = self.shader_module(&p.ps.words)?;
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -670,7 +758,7 @@ impl VulkanBackend {
             .multisample_state(&multisample)
             .color_blend_state(&blend)
             .dynamic_state(&dynamic)
-            .layout(self.pipeline_layout)
+            .layout(layout)
             .push_next(&mut rendering);
         let pipe = self
             .device
@@ -689,8 +777,29 @@ impl VulkanBackend {
     ) -> Result<(), String> {
         let view = self.image(g, target)?;
         let pipe = self.pipeline(&p, vk_format(target.format))?;
+        // Indices (as u32) of all runs, and how many vertices are used.
+        let mut indices = Vec::new();
+        let mut runs = Vec::new(); // (first vertex or index, count)
+        let last = match &d.index {
+            Some(ib) => {
+                let mut max = 0i64;
+                for &(first, count) in &d.ranges {
+                    let ix = emu_gpu::draw::read_indices(g, ib, first, count)?;
+                    max = ix
+                        .iter()
+                        .map(|&i| i as i64 + i64::from(ib.base_vertex) + 1)
+                        .fold(max, i64::max);
+                    runs.push((indices.len() as u32, count));
+                    indices.extend(ix);
+                }
+                max.max(0) as u32
+            }
+            None => {
+                runs.extend(&d.ranges);
+                d.ranges.iter().map(|&(f, c)| f + c).max().unwrap_or(0)
+            }
+        };
         // Vertex data: each stream from its start to the last vertex used.
-        let last = d.ranges.iter().map(|&(f, c)| f + c).max().unwrap_or(0);
         let mut buffers = Vec::new();
         for &(stream, stride) in &p.bindings {
             let s = d.streams[stream as usize];
@@ -698,11 +807,74 @@ impl VulkanBackend {
             let mut data = vec![0u8; size];
             g.read(s.addr, &mut data)
                 .map_err(|f| format!("vertex buffer: {f:?}"))?;
-            let b = self.create_buffer_with(size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), b.ptr, size);
-            buffers.push((stream, b.buffer));
-            self.transient.push(b);
+            buffers.push((
+                stream,
+                self.transient_buffer(&data, vk::BufferUsageFlags::VERTEX_BUFFER)?,
+            ));
         }
+        let index_buffer = if d.index.is_some() {
+            let bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+            Some(self.transient_buffer(&bytes, vk::BufferUsageFlags::INDEX_BUFFER)?)
+        } else {
+            None
+        };
+        // Constant buffers: uploaded and bound in one descriptor set.
+        let (dsl, layout) = self.layout(p.vs.cbufs, p.ps.cbufs)?;
+        let mut writes = Vec::new();
+        for (mask, bound, stage) in [
+            (p.vs.cbufs, &d.vs_cbufs, emu_gpu::shader::Stage::Vertex),
+            (p.ps.cbufs, &d.ps_cbufs, emu_gpu::shader::Stage::Pixel),
+        ] {
+            for i in (0..32u32).filter(|i| mask & (1 << i) != 0) {
+                let data = match bound.get(i as usize).copied().flatten() {
+                    Some(cb) => {
+                        let mut data = vec![0u8; (cb.size as usize).next_multiple_of(16).max(16)];
+                        g.read(cb.addr, &mut data[..cb.size as usize])
+                            .map_err(|f| format!("constant buffer: {f:?}"))?;
+                        data
+                    }
+                    None => vec![0u8; 16],
+                };
+                let buffer = self.transient_buffer(&data, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+                writes.push((spirv::cbuf_binding(stage, i), buffer, data.len() as u64));
+            }
+        }
+        let set = if writes.is_empty() {
+            None
+        } else {
+            let layouts = [dsl];
+            let set = self
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(self.descriptor_pool)
+                        .set_layouts(&layouts),
+                )
+                .map_err(err("descriptor set"))?[0];
+            let infos: Vec<[vk::DescriptorBufferInfo; 1]> = writes
+                .iter()
+                .map(|&(_, buffer, range)| {
+                    [vk::DescriptorBufferInfo {
+                        buffer,
+                        offset: 0,
+                        range,
+                    }]
+                })
+                .collect();
+            let w: Vec<_> = writes
+                .iter()
+                .zip(&infos)
+                .map(|(&(binding, ..), info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(binding)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(info)
+                })
+                .collect();
+            self.device.update_descriptor_sets(&w, &[]);
+            Some(set)
+        };
         self.begin()?;
         let attachments = [vk::RenderingAttachmentInfo::default()
             .image_view(view)
@@ -747,8 +919,30 @@ impl VulkanBackend {
             self.device
                 .cmd_bind_vertex_buffers(self.cmd, stream, &[buffer], &[0]);
         }
-        for &(first, count) in &d.ranges {
-            self.device.cmd_draw(self.cmd, count, 1, first, 0);
+        if let Some(set) = set {
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[set],
+                &[],
+            );
+        }
+        match (index_buffer, &d.index) {
+            (Some(ib), Some(desc)) => {
+                self.device
+                    .cmd_bind_index_buffer(self.cmd, ib, 0, vk::IndexType::UINT32);
+                for &(first, count) in &runs {
+                    self.device
+                        .cmd_draw_indexed(self.cmd, count, 1, first, desc.base_vertex, 0);
+                }
+            }
+            _ => {
+                for &(first, count) in &runs {
+                    self.device.cmd_draw(self.cmd, count, 1, first, 0);
+                }
+            }
         }
         self.device.cmd_end_rendering(self.cmd);
         Ok(())
@@ -879,8 +1073,12 @@ impl Drop for VulkanBackend {
                     self.device.destroy_shader_module(m, None);
                 }
             }
+            for (_, (dsl, layout)) in std::mem::take(&mut self.layouts) {
+                self.device.destroy_pipeline_layout(layout, None);
+                self.device.destroy_descriptor_set_layout(dsl, None);
+            }
             self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
+                .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);

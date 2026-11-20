@@ -8,7 +8,9 @@ use super::inline::InlineToMemory;
 use super::mme::{self, MacroTarget};
 use super::{bits, EngineCtx};
 use crate::backend::{Layout, Rect, Surface};
-use crate::draw::{Draw, VertexAttribute, VertexStream, Viewport};
+use crate::draw::{
+    ConstBuffer, Draw, IndexBuffer, VertexAttribute, VertexStream, Viewport, CBUF_SLOTS,
+};
 use crate::shader::decode::{decode_program, Inst};
 use crate::shader::{Header, Stage, HEADER_SIZE};
 use crate::surface::ColorFormat;
@@ -49,6 +51,15 @@ mod reg {
     pub const BEGIN: u32 = 0x1618;
     pub const VERTEX_STREAM: u32 = 0x1C00; // + 16 * j: format, location a, b
     pub const PIPELINE: u32 = 0x2000; // + 64 * j: shader, program
+    pub const GLOBAL_BASE_VERTEX: u32 = 0x1434;
+    pub const INDEX_BUFFER_A: u32 = 0x17C8; // A/B address, C/D limit, E size, F first
+    pub const INDEX_BUFFER_E: u32 = 0x17D8;
+    pub const INDEX_BUFFER_F: u32 = 0x17DC;
+    pub const DRAW_INDEX_BUFFER: u32 = 0x17E0;
+    pub const CBUF_SELECTOR: u32 = 0x2380; // size, address upper, lower
+    pub const LOAD_CBUF_OFFSET: u32 = 0x238C;
+    pub const LOAD_CBUF: u32 = 0x2390; // ..0x23CC
+    pub const BIND_GROUP_CBUF: u32 = 0x2410; // + 32 * stage
 }
 
 /// Draws that are not emulated yet (indexed, auto, inline indices).
@@ -70,9 +81,13 @@ pub struct Maxwell3D {
     pending_call: Option<(usize, Vec<u32>)>,
     /// Macros run (for diagnostics and tests).
     pub macro_calls: u64,
-    /// Topology from BEGIN and vertex runs queued until END.
+    /// Topology from BEGIN and vertex/index runs queued until END.
     topology: u32,
     ranges: Vec<(u32, u32)>,
+    index_ranges: Vec<(u32, u32)>,
+    /// Constant buffers bound per stage group (0 VS, 1-3 tess/geometry,
+    /// 4 PS) and slot.
+    cbufs: [[Option<ConstBuffer>; CBUF_SLOTS]; 5],
     /// Decoded programs by GPU address.
     programs: std::collections::HashMap<u64, (Header, Vec<Inst>)>,
     /// Draws executed (for diagnostics and tests).
@@ -111,6 +126,8 @@ impl Default for Maxwell3D {
             macro_calls: 0,
             topology: 0,
             ranges: Vec::new(),
+            index_ranges: Vec::new(),
+            cbufs: [[None; CBUF_SLOTS]; 5],
             programs: Default::default(),
             draws: 0,
         }
@@ -215,18 +232,55 @@ impl Maxwell3D {
             reg::BEGIN => {
                 self.topology = value & 0xFFFF;
                 self.ranges.clear();
+                self.index_ranges.clear();
             }
             reg::DRAW_VERTEX_ARRAY => self.ranges.push((self.reg(reg::VERTEX_ARRAY_START), value)),
+            reg::DRAW_INDEX_BUFFER => self
+                .index_ranges
+                .push((self.reg(reg::INDEX_BUFFER_F), value)),
             reg::END => {
                 let ranges = std::mem::take(&mut self.ranges);
                 if !ranges.is_empty() {
-                    self.draw(self.topology, ranges, ctx);
+                    self.draw(self.topology, ranges, None, ctx);
+                }
+                let ranges = std::mem::take(&mut self.index_ranges);
+                if !ranges.is_empty() {
+                    let size = 1 << (self.reg(reg::INDEX_BUFFER_E) & 3);
+                    self.draw(self.topology, ranges, Some(size), ctx);
+                }
+            }
+            // DRAW_INDEX_BUFFER{32,16,8}_BEGIN_END_INSTANCE_{FIRST,SUBSEQUENT}
+            0x17E4..=0x17F8 => {
+                let size = [4, 2, 1][((offset - 0x17E4) / 4 % 3) as usize];
+                self.draw(
+                    value >> 28,
+                    vec![(value & 0xFFFF, (value >> 16) & 0xFFF)],
+                    Some(size),
+                    ctx,
+                );
+            }
+            reg::LOAD_CBUF..=0x23CC => {
+                // Constant buffer update: written to memory at the
+                // selected buffer + offset, which advances.
+                let off = self.reg(reg::LOAD_CBUF_OFFSET);
+                let addr = self.selected_cbuf().addr + u64::from(off);
+                ctx.write(addr, &value.to_le_bytes());
+                self.regs[reg::LOAD_CBUF_OFFSET as usize / 4] = off.wrapping_add(4);
+            }
+            o if (reg::BIND_GROUP_CBUF..reg::BIND_GROUP_CBUF + 5 * 32).contains(&o)
+                && (o - reg::BIND_GROUP_CBUF).is_multiple_of(32) =>
+            {
+                let stage = ((o - reg::BIND_GROUP_CBUF) / 32) as usize;
+                let slot = bits(value, 8, 4) as usize;
+                if slot < CBUF_SLOTS {
+                    self.cbufs[stage][slot] = (value & 1 != 0).then(|| self.selected_cbuf());
                 }
             }
             reg::DRAW_ARRAY_FIRST | reg::DRAW_ARRAY_SUBSEQUENT => {
                 self.draw(
                     value >> 28,
                     vec![(value & 0xFFFF, (value >> 16) & 0xFFF)],
+                    None,
                     ctx,
                 );
             }
@@ -301,8 +355,24 @@ impl Maxwell3D {
         })
     }
 
-    fn draw(&mut self, topology: u32, ranges: Vec<(u32, u32)>, ctx: &mut EngineCtx) {
-        if let Err(e) = self.try_draw(topology, ranges, ctx) {
+    /// The constant buffer named by the selector registers.
+    fn selected_cbuf(&self) -> ConstBuffer {
+        ConstBuffer {
+            addr: u64::from(self.reg(reg::CBUF_SELECTOR + 4) & 0xFF) << 32
+                | u64::from(self.reg(reg::CBUF_SELECTOR + 8)),
+            size: self.reg(reg::CBUF_SELECTOR) & 0x1_FFFF,
+        }
+    }
+
+    /// `index_size`: bytes per index for indexed draws.
+    fn draw(
+        &mut self,
+        topology: u32,
+        ranges: Vec<(u32, u32)>,
+        index_size: Option<u32>,
+        ctx: &mut EngineCtx,
+    ) {
+        if let Err(e) = self.try_draw(topology, ranges, index_size, ctx) {
             ctx.faults.push(format!("draw: {e}"));
         }
     }
@@ -311,6 +381,7 @@ impl Maxwell3D {
         &mut self,
         topology: u32,
         ranges: Vec<(u32, u32)>,
+        index_size: Option<u32>,
         ctx: &mut EngineCtx,
     ) -> Result<(), String> {
         let mut vs = None;
@@ -385,6 +456,14 @@ impl Maxwell3D {
             ps_header,
             topology,
             ranges,
+            index: index_size.map(|size| IndexBuffer {
+                addr: u64::from(self.reg(reg::INDEX_BUFFER_A) & 0xFF) << 32
+                    | u64::from(self.reg(reg::INDEX_BUFFER_A + 4)),
+                size,
+                base_vertex: self.reg(reg::GLOBAL_BASE_VERTEX) as i32,
+            }),
+            vs_cbufs: self.cbufs[0],
+            ps_cbufs: self.cbufs[4],
             attributes,
             streams,
             viewport,

@@ -437,13 +437,14 @@ fn shaded_triangles() {
     // tests/programs/libnx_compat/hb_triangle.c draws with Maxwell vertex
     // and pixel shaders (triangle_shaders.h) from a vertex buffer: a
     // triangle with red/green/blue corners, then (frame 1) moved right
-    // plus a strip quad drawn with the single-method draw.
+    // plus a strip quad drawn with the single-method draw, then (frame 2)
+    // indexed quads whose shaders read constant buffers.
     let r = emu_run::run_nro(&program("hb_triangle.nro"), 200_000_000, false).expect("boots");
     assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0));
     assert!(String::from_utf8(r.debug_output)
         .unwrap()
-        .ends_with("triangle frame 0x1\n"));
-    assert_eq!(r.frames.len(), 2);
+        .ends_with("triangle frame 0x2\n"));
+    assert_eq!(r.frames.len(), 3);
     let px = |f: &emu_horizon::services::Frame, x: u32, y: u32| {
         let at = ((y * f.width + x) * 4) as usize;
         [f.rgba[at], f.rgba[at + 1], f.rgba[at + 2], f.rgba[at + 3]]
@@ -475,4 +476,14 @@ fn shaded_triangles() {
     assert_eq!(px(&r.frames[0], 40, 70), bg);
     assert!(near(px(&r.frames[1], 33, 70), [255, 255, 0, 255], 3));
     assert!(near(px(&r.frames[1], 286, 70), [255, 0, 255, 255], 3));
+    // Frame 2: the right quad (x 768..1152, y 360..576) is white tinted
+    // (1, 1, 0.2); the left one (x 128..512) has its green halved.
+    let f = &r.frames[2];
+    assert_eq!(px(f, 900, 450), [255, 255, 51, 255]);
+    let left = px(f, 140, 370); // near the white corner (-1, 1)
+    assert!(
+        left[0] > 240 && (110..140).contains(&left[1]) && left[2] > 240,
+        "{left:?}"
+    );
+    assert_eq!(px(f, 120, 450), bg);
 }

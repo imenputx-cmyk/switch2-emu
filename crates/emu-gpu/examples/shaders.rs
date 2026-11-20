@@ -45,6 +45,38 @@ fn main() {
             exit(),
         ],
     );
+    // Vertex shader with a transform from constant buffer 0:
+    // position.xy = attribute0.xy * c0[0].xy + c0[0].zw.
+    let vs_cb = program(
+        &vertex_header(),
+        &[
+            ald(0, attr::generic(0), 4),
+            ald(4, attr::generic(1), 4),
+            mov_cbuf(8, 0, 8),
+            mov_cbuf(9, 0, 12),
+            ffma_cbuf(0, 0, 0, 0, 8),
+            ffma_cbuf(1, 1, 0, 4, 9),
+            ast(0, attr::POSITION, 4),
+            ast(4, attr::generic(0), 4),
+            exit(),
+        ],
+    );
+    // Pixel shader tinting the color with constant buffer 1 (rgb).
+    let ps_cb = program(
+        &pixel_header(),
+        &[
+            ipa(0, attr::generic(0)),
+            ipa(1, attr::generic(0) + 4),
+            ipa(2, attr::generic(0) + 8),
+            ipa(3, attr::generic(0) + 12),
+            fmul_cbuf(0, 0, 1, 0),
+            fmul_cbuf(1, 1, 1, 4),
+            fmul_cbuf(2, 2, 1, 8),
+            exit(),
+        ],
+    );
     print("vertex_shader", &vs);
     print("pixel_shader", &ps);
+    print("vertex_shader_cb", &vs_cb);
+    print("pixel_shader_cb", &ps_cb);
 }

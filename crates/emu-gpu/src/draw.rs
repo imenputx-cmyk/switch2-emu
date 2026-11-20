@@ -4,8 +4,8 @@
 //! perspective-correct interpolation, the pixel shader, and the color
 //! write). The software renderer is the reference for the Vulkan one.
 //!
-//! Not yet: indexed draws, constant buffers, textures, depth/stencil,
-//! blending, culling, clipping against the near plane.
+//! Not yet: instancing, textures, depth/stencil, blending, culling,
+//! clipping against the near plane.
 
 use crate::backend::{GuestMemory, Rect, Surface};
 use crate::shader::decode::{Inst, IpaMode};
@@ -47,6 +47,25 @@ pub struct Viewport {
     pub offset: [f32; 3],
 }
 
+/// A bound constant buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConstBuffer {
+    pub addr: u64,
+    pub size: u32,
+}
+
+/// Number of constant buffer slots per shader stage.
+pub const CBUF_SLOTS: usize = 18;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexBuffer {
+    pub addr: u64,
+    /// Bytes per index: 1, 2 or 4.
+    pub size: u32,
+    /// Added to every index.
+    pub base_vertex: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Draw {
     /// Color target 0, if color is written.
@@ -55,8 +74,12 @@ pub struct Draw {
     pub ps: Vec<Inst>,
     pub ps_header: Header,
     pub topology: u32,
-    /// (first vertex, count) runs.
+    /// (first vertex, count) runs; with an index buffer, (first index,
+    /// count) runs.
     pub ranges: Vec<(u32, u32)>,
+    pub index: Option<IndexBuffer>,
+    pub vs_cbufs: [Option<ConstBuffer>; CBUF_SLOTS],
+    pub ps_cbufs: [Option<ConstBuffer>; CBUF_SLOTS],
     pub attributes: Vec<VertexAttribute>,
     pub streams: Vec<VertexStream>,
     pub viewport: Viewport,
@@ -162,9 +185,39 @@ impl Varyings {
     }
 }
 
+/// Constant buffer contents, read once per draw.
+struct Cbufs(Vec<Vec<u8>>);
+
+impl Cbufs {
+    fn load(g: &GuestMemory, bound: &[Option<ConstBuffer>; CBUF_SLOTS]) -> Result<Cbufs, String> {
+        bound
+            .iter()
+            .map(|b| match b {
+                Some(b) => {
+                    let mut data = vec![0u8; b.size as usize];
+                    g.read(b.addr, &mut data)
+                        .map_err(|f| format!("constant buffer: {f:?}"))?;
+                    Ok(data)
+                }
+                None => Ok(Vec::new()),
+            })
+            .collect::<Result<_, _>>()
+            .map(Cbufs)
+    }
+
+    /// Out-of-range reads return 0.
+    fn get(&self, index: u8, offset: u32) -> u32 {
+        self.0
+            .get(index as usize)
+            .and_then(|b| b.get(offset as usize..offset as usize + 4))
+            .map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()))
+    }
+}
+
 struct VertexIo<'a> {
     inputs: &'a [[u32; 4]],
     out: Varyings,
+    cbufs: &'a Cbufs,
 }
 
 impl ShaderIo for VertexIo<'_> {
@@ -186,13 +239,14 @@ impl ShaderIo for VertexIo<'_> {
     fn interpolate(&self, _: u32, _: IpaMode) -> f32 {
         0.0
     }
-    fn cbuf(&self, _: u8, _: u32) -> u32 {
-        0
+    fn cbuf(&self, index: u8, offset: u32) -> u32 {
+        self.cbufs.get(index, offset)
     }
 }
 
 struct PixelIo<'a> {
     v: [&'a Varyings; 3],
+    cbufs: &'a Cbufs,
     /// Perspective-correct barycentrics, and screen-space ones.
     persp: [f32; 3],
     frag: [f32; 4],
@@ -212,9 +266,29 @@ impl ShaderIo for PixelIo<'_> {
             _ => (0..3).map(|i| self.persp[i] * self.v[i].f(addr)).sum(),
         }
     }
-    fn cbuf(&self, _: u8, _: u32) -> u32 {
-        0
+    fn cbuf(&self, index: u8, offset: u32) -> u32 {
+        self.cbufs.get(index, offset)
     }
+}
+
+/// Reads `count` indices from `first` on.
+pub fn read_indices(
+    g: &GuestMemory,
+    ib: &IndexBuffer,
+    first: u32,
+    count: u32,
+) -> Result<Vec<u32>, String> {
+    let mut raw = vec![0u8; (count * ib.size) as usize];
+    g.read(ib.addr + u64::from(first) * u64::from(ib.size), &mut raw)
+        .map_err(|f| format!("index buffer: {f:?}"))?;
+    Ok(raw
+        .chunks(ib.size as usize)
+        .map(|c| match c.len() {
+            1 => u32::from(c[0]),
+            2 => u32::from(u16::from_le_bytes([c[0], c[1]])),
+            _ => u32::from_le_bytes(c.try_into().unwrap()),
+        })
+        .collect())
 }
 
 /// Triangles (vertex index triples) for a topology and vertex count.
@@ -247,10 +321,20 @@ pub fn draw_software(g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
     let Some(target) = d.target else {
         return Ok(());
     };
+    let vs_cbufs = Cbufs::load(g, &d.vs_cbufs)?;
+    let ps_cbufs = Cbufs::load(g, &d.ps_cbufs)?;
     for &(first, count) in &d.ranges {
+        // The vertices to shade, in order.
+        let vertices: Vec<u32> = match &d.index {
+            Some(ib) => read_indices(g, ib, first, count)?
+                .into_iter()
+                .map(|i| (i as i64 + i64::from(ib.base_vertex)) as u32)
+                .collect(),
+            None => (first..first + count).collect(),
+        };
         // Vertex stage.
-        let mut shaded = Vec::with_capacity(count as usize);
-        for v in first..first + count {
+        let mut shaded = Vec::with_capacity(vertices.len());
+        for &v in &vertices {
             let inputs = d
                 .attributes
                 .iter()
@@ -266,13 +350,14 @@ pub fn draw_software(g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
             let mut io = VertexIo {
                 inputs: &inputs,
                 out: Varyings { words: [0; 128] },
+                cbufs: &vs_cbufs,
             };
             interp::run(&d.vs, &mut io);
             shaded.push(io.out);
         }
         for tri in triangles(d.topology, count)? {
             let v = tri.map(|i| &shaded[i as usize]);
-            rasterize(g, d, &target, v)?;
+            rasterize(g, d, &target, v, &ps_cbufs)?;
         }
     }
     Ok(())
@@ -283,6 +368,7 @@ fn rasterize(
     d: &Draw,
     target: &Surface,
     v: [&Varyings; 3],
+    cbufs: &Cbufs,
 ) -> Result<(), String> {
     // Clip space -> window space.
     let mut win = [[0f32; 4]; 3];
@@ -354,6 +440,7 @@ fn rasterize(
             let z: f32 = (0..3).map(|i| b[i] * win[i][2]).sum();
             let mut io = PixelIo {
                 v,
+                cbufs,
                 persp,
                 frag: [px, py, z, inv_w],
             };
@@ -485,6 +572,9 @@ mod raster_tests {
                 ps_header: Header::parse(&asm::pixel_header()),
                 topology: topology::TRIANGLES,
                 ranges: vec![(0, 3)],
+                index: None,
+                vs_cbufs: Default::default(),
+                ps_cbufs: Default::default(),
                 attributes: vec![VertexAttribute {
                     stream: 0,
                     constant: false,

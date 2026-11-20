@@ -7,9 +7,12 @@
 //! position input is `BuiltIn FragCoord`. Pixel shader outputs are the
 //! registers named by the header's output map, written at the end.
 //!
-//! Straight-line programs only for now (no branches); constant buffers
-//! are not supported yet. Anything unsupported returns an error so the
-//! caller can fall back to the software renderer.
+//! Constant buffer `i` is a uniform block `{ uvec4 data[4096]; }` at
+//! descriptor set 0, binding [`cbuf_binding`]`(stage, i)`.
+//!
+//! Straight-line programs only for now (no branches). Anything
+//! unsupported returns an error so the caller can fall back to the
+//! software renderer.
 
 use super::decode::{Inst, IpaMode, Mods, Operand, RZ};
 use super::{attr, Header, Stage};
@@ -37,6 +40,9 @@ mod op {
     pub const STORE: u16 = 62;
     pub const ACCESS_CHAIN: u16 = 65;
     pub const DECORATE: u16 = 71;
+    pub const MEMBER_DECORATE: u16 = 72;
+    pub const TYPE_ARRAY: u16 = 28;
+    pub const TYPE_STRUCT: u16 = 30;
     pub const COMPOSITE_CONSTRUCT: u16 = 80;
     pub const BITCAST: u16 = 124;
     pub const F_NEGATE: u16 = 127;
@@ -51,6 +57,12 @@ const INPUT: u32 = 1;
 const OUTPUT: u32 = 3;
 const PRIVATE: u32 = 6;
 const LOCATION: u32 = 30;
+const UNIFORM: u32 = 2;
+const BLOCK: u32 = 2;
+const ARRAY_STRIDE: u32 = 6;
+const OFFSET: u32 = 35;
+const BINDING: u32 = 33;
+const DESCRIPTOR_SET: u32 = 34;
 const BUILTIN: u32 = 11;
 const FLAT: u32 = 14;
 const BUILTIN_POSITION: u32 = 0;
@@ -107,6 +119,23 @@ struct Common {
     p_in_float: u32,
     p_out_float: u32,
     component: [u32; 4],
+    p_uniform_cbuf: u32,
+    p_uniform_uint: u32,
+}
+
+/// Descriptor binding of constant buffer `index` for a stage.
+pub fn cbuf_binding(stage: Stage, index: u32) -> u32 {
+    match stage {
+        Stage::Pixel => 18 + index,
+        _ => index,
+    }
+}
+
+/// A translated shader.
+pub struct Translated {
+    pub words: Vec<u32>,
+    /// Bit `i` set: constant buffer `i` is read.
+    pub cbufs: u32,
 }
 
 struct Translator {
@@ -116,6 +145,8 @@ struct Translator {
     inputs: BTreeMap<u32, u32>,
     outputs: BTreeMap<u32, u32>,
     flat: BTreeSet<u32>,
+    cbufs: BTreeMap<u8, u32>,
+    stage: Stage,
 }
 
 impl Translator {
@@ -157,8 +188,52 @@ impl Translator {
         match o {
             Operand::Reg(r) => Ok(self.load_reg(r)),
             Operand::Imm(v) => Ok(self.constant_u(v)),
-            Operand::Cbuf { .. } => Err("constant buffers are not translated yet".into()),
+            Operand::Cbuf { index, offset } => {
+                if offset >= 0x1_0000 || !offset.is_multiple_of(4) {
+                    return Err(format!("constant buffer offset {offset:#x}"));
+                }
+                let var = self.cbuf_var(index);
+                let (zero, vec, comp) = (
+                    self.c.zero_u,
+                    self.constant_u(offset / 16),
+                    self.c.component[((offset / 4) % 4) as usize],
+                );
+                let p = self.m.id();
+                inst(
+                    &mut self.m.body,
+                    op::ACCESS_CHAIN,
+                    &[self.c.p_uniform_uint, p, var, zero, vec, comp],
+                );
+                let v = self.m.id();
+                inst(&mut self.m.body, op::LOAD, &[self.c.uint, v, p]);
+                Ok(v)
+            }
         }
+    }
+
+    fn cbuf_var(&mut self, index: u8) -> u32 {
+        if let Some(&v) = self.cbufs.get(&index) {
+            return v;
+        }
+        let v = self.m.id();
+        inst(
+            &mut self.m.globals,
+            op::VARIABLE,
+            &[self.c.p_uniform_cbuf, v, UNIFORM],
+        );
+        let binding = cbuf_binding(self.stage, u32::from(index));
+        inst(
+            &mut self.m.annotations,
+            op::DECORATE,
+            &[v, DESCRIPTOR_SET, 0],
+        );
+        inst(
+            &mut self.m.annotations,
+            op::DECORATE,
+            &[v, BINDING, binding],
+        );
+        self.cbufs.insert(index, v);
+        v
     }
 
     fn bitcast(&mut self, ty: u32, v: u32) -> u32 {
@@ -408,7 +483,7 @@ impl Translator {
 
 /// Translates a vertex or pixel program to a SPIR-V module with entry
 /// point "main".
-pub fn translate(program: &[Inst], header: &Header) -> Result<Vec<u32>, String> {
+pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String> {
     let stage = header.stage;
     let model = match stage {
         Stage::Vertex => 0,
@@ -422,6 +497,8 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Vec<u32>, String> 
         (m.id(), m.id(), m.id(), m.id(), m.id());
     let (zero_u, zero_f, one_f) = (m.id(), m.id(), m.id());
     let component = [m.id(), m.id(), m.id(), m.id()];
+    let (uvec4, len_4096, arr, cbuf_struct, p_uniform_cbuf, p_uniform_uint) =
+        (m.id(), m.id(), m.id(), m.id(), m.id(), m.id());
     let g = &mut m.globals;
     inst(g, op::TYPE_VOID, &[void]);
     inst(g, op::TYPE_FUNCTION, &[fn_ty, void]);
@@ -439,6 +516,17 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Vec<u32>, String> 
     for (i, c) in component.iter().enumerate() {
         inst(g, op::CONSTANT, &[uint, *c, i as u32]);
     }
+    // The constant buffer block type.
+    inst(g, op::TYPE_VECTOR, &[uvec4, uint, 4]);
+    inst(g, op::CONSTANT, &[uint, len_4096, 4096]);
+    inst(g, op::TYPE_ARRAY, &[arr, uvec4, len_4096]);
+    inst(g, op::TYPE_STRUCT, &[cbuf_struct, arr]);
+    inst(g, op::TYPE_POINTER, &[p_uniform_cbuf, UNIFORM, cbuf_struct]);
+    inst(g, op::TYPE_POINTER, &[p_uniform_uint, UNIFORM, uint]);
+    let a = &mut m.annotations;
+    inst(a, op::DECORATE, &[arr, ARRAY_STRIDE, 16]);
+    inst(a, op::DECORATE, &[cbuf_struct, BLOCK]);
+    inst(a, op::MEMBER_DECORATE, &[cbuf_struct, 0, OFFSET, 0]);
     let c = Common {
         glsl,
         float,
@@ -453,6 +541,8 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Vec<u32>, String> 
         p_in_float,
         p_out_float,
         component,
+        p_uniform_cbuf,
+        p_uniform_uint,
     };
     let mut t = Translator {
         m,
@@ -461,6 +551,8 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Vec<u32>, String> 
         inputs: BTreeMap::new(),
         outputs: BTreeMap::new(),
         flat: BTreeSet::new(),
+        cbufs: BTreeMap::new(),
+        stage,
     };
     let main = t.m.id();
     let label = t.m.id();
@@ -531,7 +623,10 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Vec<u32>, String> 
     words.extend(&t.m.body);
     inst(&mut words, op::RETURN, &[]);
     inst(&mut words, op::FUNCTION_END, &[]);
-    Ok(words)
+    Ok(Translated {
+        words,
+        cbufs: t.cbufs.keys().fold(0, |m, &i| m | 1 << i),
+    })
 }
 
 #[cfg(test)]
@@ -574,14 +669,17 @@ mod tests {
                 ffma(1, 1, 1, 0),
                 fadd_imm(2, 2, -0.5),
                 mov32i(3, 0x3F80_0000),
+                mov_cbuf(5, 2, 0x1234),
+                ffma_cbuf(6, 5, 0, 0x40, 4),
                 ast(0, 0x70, 4),
                 ast(4, 0x80, 4),
                 exit(),
             ],
         );
         let h = super::super::Header::parse(&vs);
-        let words = translate(&decode_program(&vs[0x50..]).unwrap(), &h).unwrap();
-        validate(&words);
+        let t = translate(&decode_program(&vs[0x50..]).unwrap(), &h).unwrap();
+        assert_eq!(t.cbufs, 0b101);
+        validate(&t.words);
         let ps = program(
             &pixel_header(),
             &[
@@ -590,11 +688,13 @@ mod tests {
                 ipa(2, 0x88),
                 mov(3, 255),
                 fadd(0, 0, 1),
+                fmul_cbuf(2, 2, 3, 0x10),
                 exit(),
             ],
         );
         let h = super::super::Header::parse(&ps);
-        let words = translate(&decode_program(&ps[0x50..]).unwrap(), &h).unwrap();
-        validate(&words);
+        let t = translate(&decode_program(&ps[0x50..]).unwrap(), &h).unwrap();
+        assert_eq!(t.cbufs, 1 << 3);
+        validate(&t.words);
     }
 }

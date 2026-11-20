@@ -269,3 +269,170 @@ fn draws_with_translated_shaders() {
         "the draw covered little"
     );
 }
+
+#[test]
+fn indexed_draws_with_constant_buffers() {
+    use emu_gpu::shader::{asm, attr};
+    let Some(vk) = vulkan() else { return };
+    // VS: position.xy = attr0.xy * c0[0].xy + c0[0].zw; color = attr1.
+    // PS: color * c3[1] (a tint).
+    let vs = asm::program(
+        &asm::vertex_header(),
+        &[
+            asm::ald(0, attr::generic(0), 4),
+            asm::ald(4, attr::generic(1), 4),
+            asm::mov_cbuf(8, 0, 8),
+            asm::mov_cbuf(9, 0, 12),
+            asm::ffma_cbuf(0, 0, 0, 0, 8),
+            asm::ffma_cbuf(1, 1, 0, 4, 9),
+            asm::ast(0, attr::POSITION, 4),
+            asm::ast(4, attr::generic(0), 4),
+            asm::exit(),
+        ],
+    );
+    let ps = asm::program(
+        &asm::pixel_header(),
+        &[
+            asm::ipa(0, 0x80),
+            asm::ipa(1, 0x84),
+            asm::ipa(2, 0x88),
+            asm::ipa(3, 0x8C),
+            asm::fmul_cbuf(0, 0, 3, 0x10),
+            asm::fmul_cbuf(1, 1, 3, 0x14),
+            asm::fmul_cbuf(2, 2, 3, 0x18),
+            asm::exit(),
+        ],
+    );
+    // 2 dummy vertices, then a quad's 4 corners (base vertex 2).
+    let verts: Vec<f32> = vec![
+        9.0, 9.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+        9.0, 9.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, //
+        -1.0, -1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, //
+        1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, //
+        1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, //
+        -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    ];
+    let indices: [u16; 8] = [7, 7, 0, 1, 2, 0, 2, 3]; // first = 2
+    let setup = move |mem: &mut Memory| {
+        mem.write(GUEST + 0x3_0000, &vs).unwrap();
+        mem.write(GUEST + 0x3_0200, &ps).unwrap();
+        let bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_le_bytes()).collect();
+        mem.write(GUEST + 0x3_1000, &bytes).unwrap();
+        let ib: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        mem.write(GUEST + 0x3_2000, &ib).unwrap();
+    };
+    let (code, vtx, ib, cb0, cb3) = (
+        GPU_VA + 0x3_0000,
+        GPU_VA + 0x3_1000,
+        GPU_VA + 0x3_2000,
+        GPU_VA + 0x3_3000,
+        GPU_VA + 0x3_4000,
+    );
+    let f = |v: f32| v.to_bits();
+    let mut w = target(0x4_0000, 96, 64, RGBA8, 2 << 4);
+    w.extend(clear([0.2, 0.2, 0.2, 1.0], None, 0x3C));
+    w.extend([
+        incr(0, 0x1608, 2),
+        (code >> 32) as u32,
+        code as u32,
+        incr(0, 0x2000 + 64, 2),
+        1 | 1 << 4,
+        0,
+        incr(0, 0x2000 + 5 * 64, 2),
+        1 | 5 << 4,
+        0x200,
+        incr(0, 0x1160, 2),
+        1 << 21 | 7 << 27,
+        16 << 7 | 1 << 21 | 7 << 27,
+        incr(0, 0x1C00, 3),
+        32 | 1 << 12,
+        (vtx >> 32) as u32,
+        vtx as u32,
+        incr(0, 0xA00, 6),
+        f(48.0),
+        f(-32.0),
+        f(1.0),
+        f(48.0),
+        f(32.0),
+        0,
+        incr(0, 0x121C, 1),
+        1,
+        incr(0, 0xE00, 1),
+        0,
+        // Constant buffer 0 for the VS: scale (0.5, 0.75), offset (0.2, -0.1),
+        // uploaded through LOAD_CONSTANT_BUFFER.
+        incr(0, 0x2380, 4),
+        256,
+        (cb0 >> 32) as u32,
+        cb0 as u32,
+        0,
+        incr(0, 0x2390, 4),
+        f(0.5),
+        f(0.75),
+        f(0.2),
+        f(-0.1),
+        incr(0, 0x2410, 1),
+        1, // stage 0 (VS), slot 0, valid
+        // Constant buffer 3 for the PS: tint at offset 0x10.
+        incr(0, 0x2380, 4),
+        256,
+        (cb3 >> 32) as u32,
+        cb3 as u32,
+        0x10,
+        incr(0, 0x2390, 3),
+        f(1.0),
+        f(0.5),
+        f(0.25),
+        incr(0, 0x2410 + 4 * 32, 1),
+        1 | 3 << 4, // stage 4 (PS), slot 3
+        // Index buffer: 16-bit at ib, base vertex 2; draw 6 indices from 2.
+        incr(0, 0x17C8, 2),
+        (ib >> 32) as u32,
+        ib as u32,
+        incr(0, 0x17D8, 2),
+        1,
+        2,
+        incr(0, 0x1434, 1),
+        2,
+        incr(0, 0x1618, 1),
+        4,
+        incr(0, 0x17E0, 1),
+        6,
+        incr(0, 0x1614, 1),
+        0,
+    ]);
+    let (soft, _) = run_with(
+        Box::new(emu_gpu::backend::SoftwareBackend),
+        &w,
+        setup.clone(),
+    );
+    let (hard, backend) = run_with(vk, &w, setup);
+    let vkb = backend.as_any().downcast_ref::<VulkanBackend>().unwrap();
+    assert_eq!(
+        (vkb.gpu_draws, vkb.fallback_draws),
+        (1, 0),
+        "the draw must run on the GPU"
+    );
+    let rt = 0x4_0000 - 0x1_0000;
+    let size = emu_gpu::blocklinear::size(96 * 4, 64, 2);
+    let (a, b) = (&soft[rt..rt + size], &hard[rt..rt + size]);
+    let worst = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+    let differing = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x != y).count();
+    eprintln!("software vs Vulkan: {differing} pixels differ, by at most {worst}");
+    assert!(
+        worst <= 2 || differing <= 8,
+        "worst {worst}, {differing} pixels differ"
+    );
+    // The quad covers x 33.6..81.6 and y 11.2..59.2, and is
+    // tinted: red scaled by 1, green by 0.5, blue by 0.25.
+    let lin = emu_gpu::blocklinear::deswizzle_width(a, 96 * 4, 96 * 4, 64, 2);
+    let px = |x: usize, y: usize| &lin[(y * 96 + x) * 4..(y * 96 + x) * 4 + 4];
+    assert_eq!(px(20, 32), [51, 51, 51, 255]);
+    let corner = px(35, 57); // near the (-1,-1) vertex (33.6, 59.2): red
+    assert!(corner[0] > 200 && corner[1] < 30, "{corner:?}");
+    let white = px(35, 13); // near the (-1, 1) vertex (33.6, 11.2): white, tinted
+    assert!(
+        white[0] > 230 && (115..140).contains(&white[1]) && (55..75).contains(&white[2]),
+        "{white:?}"
+    );
+}
