@@ -274,6 +274,7 @@ pub fn run_program_presenting(
     hos.system.on_present = on_present;
     if config.gpu_backend == emu_horizon::services::GpuBackend::Vulkan {
         let vk = emu_gpu_vk::VulkanBackend::new().map_err(RunError::Gpu)?;
+        eprintln!("[emu-run] Vulkan device: {}", vk.device_name);
         hos.system.gpu.backend = Box::new(vk);
     }
     hos.trace_svcs = trace_svcs;

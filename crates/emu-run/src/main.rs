@@ -42,9 +42,12 @@ fn main() -> ExitCode {
         };
         let dump_frames = args.iter().any(|a| a.starts_with("--frames="));
         #[cfg(feature = "window")]
-        let presenter = (!dump_frames).then(|| emu_run::window::presenter(&path));
+        let (presenter, shown) = match (!dump_frames).then(|| emu_run::window::presenter(&path)) {
+            Some((p, s)) => (Some(p), Some(s)),
+            None => (None, None),
+        };
         #[cfg(not(feature = "window"))]
-        let presenter = None;
+        let (presenter, shown): (_, Option<()>) = (None, None);
         let _ = dump_frames;
         // With a window the program runs until it exits or the window
         // closes; otherwise stop after 10^10 instructions.
@@ -56,7 +59,8 @@ fn main() -> ExitCode {
             } else {
                 10_000_000_000
             });
-        return match emu_run::run_program_presenting(&program, limit, trace, config, presenter) {
+        let result = emu_run::run_program_presenting(&program, limit, trace, config, presenter);
+        return match result {
             Ok(r) => {
                 std::io::stdout().write_all(&r.debug_output).unwrap();
                 if let Some(dir) = args.iter().find_map(|a| a.strip_prefix("--frames=")) {
@@ -76,9 +80,14 @@ fn main() -> ExitCode {
                 }
                 let secs = start.elapsed().as_secs_f64();
                 eprintln!(
-                    "[emu-run] homebrew stopped: {:?}, {} instructions in {:.3}s",
+                    "[emu-run] program stopped: {:?}, {} instructions in {:.3}s",
                     r.stop, r.instructions, secs
                 );
+                #[cfg(feature = "window")]
+                if let Some(shown) = &shown {
+                    shown.wait_until_closed();
+                }
+                let _ = &shown;
                 match r.stop {
                     emu_horizon::Stop::ReturnedToLoader(code) => ExitCode::from(code as u8),
                     emu_horizon::Stop::ExitProcess => ExitCode::SUCCESS,

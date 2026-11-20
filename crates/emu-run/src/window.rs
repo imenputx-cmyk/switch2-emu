@@ -15,15 +15,41 @@
 use emu_horizon::services::hid::{button, InputState};
 use emu_horizon::services::{Frame, Presenter};
 use minifb::{Key, ScaleMode, Window, WindowOptions};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// The window, once the first frame opened it.
+#[derive(Clone, Default)]
+pub struct Shown(Rc<RefCell<Option<Window>>>);
+
+impl Shown {
+    /// Keeps the window (with the last frame) open until it is closed or
+    /// Escape is pressed. Does nothing if no frame was shown.
+    pub fn wait_until_closed(&self) {
+        let mut w = self.0.borrow_mut();
+        let Some(win) = w.as_mut() else { return };
+        if !win.is_open() || win.is_key_down(Key::Escape) {
+            return;
+        }
+        eprintln!("[emu-run] the program has stopped; close the window or press Escape");
+        while win.is_open() && !win.is_key_down(Key::Escape) {
+            win.update();
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+    }
+}
 
 /// Returns a frame callback that draws into a window; it returns false
-/// once the window is closed or Escape is pressed.
-pub fn presenter(title: &str) -> Presenter {
+/// once the window is closed or Escape is pressed. `Shown` gives access
+/// to the window after the program stops.
+pub fn presenter(title: &str) -> (Presenter, Shown) {
     let title = title.to_string();
-    let mut window: Option<Window> = None;
+    let shown = Shown::default();
+    let window = shown.clone();
     let mut pixels: Vec<u32> = Vec::new();
-    Box::new(move |frame: &Frame, input: &mut InputState| {
+    let present = Box::new(move |frame: &Frame, input: &mut InputState| {
         let (w, h) = (frame.width as usize, frame.height as usize);
+        let mut window = window.0.borrow_mut();
         let win = match window.as_mut() {
             Some(win) => win,
             None => {
@@ -54,7 +80,8 @@ pub fn presenter(title: &str) -> Presenter {
         let ok = win.update_with_buffer(&pixels, w, h).is_ok();
         *input = read_keys(win);
         ok
-    })
+    });
+    (present, shown)
 }
 
 fn read_keys(win: &Window) -> InputState {
