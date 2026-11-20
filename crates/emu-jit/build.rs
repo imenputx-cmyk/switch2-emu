@@ -8,6 +8,12 @@ fn main() {
         .join("../..")
         .canonicalize()
         .unwrap();
+    // On Windows canonicalize() gives a verbatim `\\?\` path, which MSBuild
+    // and cl.exe cannot open.
+    let root = match root.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) => PathBuf::from(plain),
+        None => root,
+    };
     let dynarmic_src = root.join("third_party/dynarmic");
     let boost = root.join("third_party/boost");
 
