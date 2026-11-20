@@ -85,4 +85,9 @@ cargo run --release -p emu-run --features window -- tests/programs/hb_triangle.n
 - `tests/programs/hb_gpu.nro` links libnx's nvidia code (address spaces, channels, fences).
 - [envytools](https://github.com/envytools/envytools) (MIT): the macro (MME) and Maxwell shader instruction encodings, from its disassembler tables (envydis) and macro simulator. The shader program header follows NVIDIA's [Shader Program Header specification](https://github.com/NVIDIA/open-gpu-doc/tree/master/Shader-Program-Header) (MIT).
 - Ryujinx (MIT) and yuzu: overall structure of a kernel HLE. Only used as background; no code is copied.
-- [oboromi](https://github.com/0xNikilite/oboromi) (GPL-3.0): used only as an architectural reference for how a Switch 2 emulator can be organized (multi-core CPU manager, HIPC/service layer, SM86 GPU decoding). No code is copied from it, so this project keeps its own MIT/Apache-2.0 license.
+- [oboromi](https://github.com/0xNikilite/oboromi) (GPL-3.0): an architectural reference for how a Switch 2 emulator can be organized (multi-core CPU manager, HIPC/service layer, SM86 GPU decoding).
+- [Eden](https://git.eden-emu.dev/eden-emu/eden) and its NX2 branch (GPL-3.0-or-later, derived from yuzu, GPL-2.0-or-later): Switch 2 specifics (NX2 services, GPU profile, video decoding) and the Switch HLE in general. Code taken from it keeps its copyright notice in the file it lands in.
+
+## License
+
+GPL-3.0-or-later (see `LICENSE`), so that code from GPL emulators (Eden, yuzu) can be used directly. Parts taken from permissively licensed projects (deko3d: zlib, envytools and open-gpu-doc: MIT, libnx: ISC) keep their original notices; those licenses are compatible with the GPL.
