@@ -624,6 +624,18 @@ pub enum Op {
         mask: u32,
         shift: u32,
     },
+    /// Texture sample or fetch of any type (1D/2D/3D/cube, arrays):
+    /// coordinates in `coords` (RZ for none), the array layer in `layer`
+    /// (an integer; RZ for none). Level 0 only. Outputs like TEXS.
+    TexN {
+        dst0: u8,
+        dst1: u8,
+        coords: [u8; 3],
+        layer: u8,
+        handle: u32,
+        comps: u8,
+        fetch: bool,
+    },
     Bra {
         target: usize,
     },

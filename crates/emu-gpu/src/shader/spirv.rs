@@ -1766,6 +1766,9 @@ impl Translator {
                     self.store_pred(i as u8, p);
                 }
             }
+            Op::TexN { .. } => {
+                return Err("textures other than 2D are not translated yet".into());
+            }
             Op::Ldg { .. } | Op::Stg { .. } => {
                 return Err("global memory access is not translated yet".into());
             }

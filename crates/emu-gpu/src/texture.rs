@@ -54,6 +54,26 @@ pub struct Tic {
     pub pitch: Option<u32>,
     pub block_height_log2: u32,
     pub srgb: bool,
+    /// Texture type (see [`ty`]).
+    pub ty: u32,
+    /// Slices of a 3D texture, layers of an array, cubes of a cube array.
+    pub depth: u32,
+    pub block_depth_log2: u32,
+    /// Mip levels the view covers (for the layer stride).
+    pub levels: u32,
+}
+
+/// Texture types (TIC word 4).
+pub mod ty {
+    pub const D1: u32 = 0;
+    pub const D2: u32 = 1;
+    pub const D3: u32 = 2;
+    pub const CUBE: u32 = 3;
+    pub const D1_ARRAY: u32 = 4;
+    pub const D2_ARRAY: u32 = 5;
+    pub const D1_BUFFER: u32 = 6;
+    pub const D2_NO_MIPMAP: u32 = 7;
+    pub const CUBE_ARRAY: u32 = 8;
 }
 
 /// Bit widths of the R, G, B, A components from the least significant
@@ -149,7 +169,7 @@ impl Tic {
         let swizzle = [0, 1, 2, 3].map(|i| bits(w(0), 19 + 3 * i, 3) as u8);
         let version = bits(w(2), 21, 3);
         let ty = bits(w(4), 23, 4);
-        if ty != 1 && ty != 7 {
+        if ty == ty::D1_BUFFER || ty > ty::CUBE_ARRAY {
             return Err(format!("texture type {ty} not supported"));
         }
         let pitch = match version {
@@ -167,6 +187,10 @@ impl Tic {
             pitch,
             block_height_log2: bits(w(3), 3, 3),
             srgb: w(4) >> 22 & 1 != 0,
+            ty,
+            depth: bits(w(5), 16, 14) + 1,
+            block_depth_log2: bits(w(3), 6, 3),
+            levels: bits(w(7), 4, 4) + 1,
         })
     }
 
@@ -175,6 +199,39 @@ impl Tic {
     pub fn element(&self) -> (u32, u32, u32) {
         compressed(self.format)
             .unwrap_or_else(|| (1, 1, layout(self.format).unwrap().iter().sum::<u32>() / 8))
+    }
+
+    /// Images stored: slices (3D), layers, or 6 faces per cube.
+    pub fn layers(&self) -> u32 {
+        match self.ty {
+            ty::D3 | ty::D1_ARRAY | ty::D2_ARRAY => self.depth,
+            ty::CUBE => 6,
+            ty::CUBE_ARRAY => 6 * self.depth,
+            _ => 1,
+        }
+    }
+
+    /// Bytes between array layers (cube faces): all mip levels of one
+    /// layer, aligned to a level-0 block.
+    pub fn layer_stride(&self) -> u64 {
+        let (bw, bh, bytes) = self.element();
+        if let Some(p) = self.pitch {
+            return u64::from(p) * u64::from(self.height.div_ceil(bh));
+        }
+        let mut total = 0u64;
+        for level in 0..self.levels {
+            let w = (self.width >> level).max(1);
+            let h = (self.height >> level).max(1);
+            let rows = h.div_ceil(bh);
+            // Small levels use smaller blocks.
+            let mut gobs = self.block_height_log2;
+            while gobs > 0 && rows <= (4 << gobs) {
+                gobs -= 1;
+            }
+            total += blocklinear::size(w.div_ceil(bw) * bytes, rows, gobs) as u64;
+        }
+        let align = 512u64 << self.block_height_log2;
+        total.next_multiple_of(align)
     }
 
     /// Bytes of level 0 (an upper bound for block-linear layouts).
@@ -224,6 +281,9 @@ impl Tsc {
 pub struct Texture {
     pub width: u32,
     pub height: u32,
+    /// Images (slices, layers or cube faces) stored one after another.
+    pub layers: u32,
+    pub ty: u32,
     pub texels: Vec<[f32; 4]>,
 }
 
@@ -282,6 +342,42 @@ fn components(tic: &Tic, raw: &[u8]) -> [f32; 4] {
     out
 }
 
+/// Texels of one image from its tightly packed storage rows.
+fn convert(tic: &Tic, linear: &[u8]) -> Vec<[f32; 4]> {
+    let (bw, bh, bpp) = tic.element();
+    if (bw, bh) == (1, 1) {
+        return linear
+            .chunks_exact(bpp as usize)
+            .map(|t| swizzle(tic, components(tic, t)))
+            .collect();
+    }
+    let cols = tic.width.div_ceil(bw);
+    let (w, h) = (tic.width as usize, tic.height as usize);
+    let mut texels = vec![[0f32; 4]; w * h];
+    let mut block = vec![0u32; (bw * bh) as usize];
+    for (i, data) in linear.chunks_exact(bpp as usize).enumerate() {
+        let (bx, by) = (i as u32 % cols, i as u32 / cols);
+        decode_block(tic.format, bw, bh, data, &mut block);
+        for (k, &p) in block.iter().enumerate() {
+            let (x, y) = (
+                (bx * bw) as usize + k % bw as usize,
+                (by * bh) as usize + k / bw as usize,
+            );
+            if x < w && y < h {
+                let [b, gr, r, a] = p.to_le_bytes();
+                let mut c = [r, gr, b, a].map(|v| f32::from(v) / 255.0);
+                if tic.srgb {
+                    for v in &mut c[..3] {
+                        *v = srgb_to_linear(*v);
+                    }
+                }
+                texels[y * w + x] = swizzle(tic, c);
+            }
+        }
+    }
+    texels
+}
+
 fn swizzle(tic: &Tic, c: [f32; 4]) -> [f32; 4] {
     tic.swizzle.map(|s| match s {
         2..=5 => c[(s - 2) as usize],
@@ -297,70 +393,197 @@ impl Texture {
         let (bw, bh, bpp) = tic.element();
         let (cols, rows) = (tic.width.div_ceil(bw), tic.height.div_ceil(bh));
         let row = cols * bpp;
-        let linear = match tic.pitch {
-            Some(pitch) => {
-                let mut raw = vec![0u8; (pitch * (rows - 1) + row) as usize];
-                g.read(tic.addr, &mut raw)
-                    .map_err(|f| format!("texture: {f:?}"))?;
-                let mut out = Vec::with_capacity((row * rows) as usize);
-                for y in 0..rows {
-                    let s = (y * pitch) as usize;
-                    out.extend_from_slice(&raw[s..s + row as usize]);
-                }
-                out
-            }
-            None => {
-                // Small textures use smaller blocks than the header says
-                // only for mip levels; level 0 uses the header's value.
-                let size = blocklinear::size(row, rows, tic.block_height_log2);
-                let mut raw = vec![0u8; size];
-                g.read(tic.addr, &mut raw)
-                    .map_err(|f| format!("texture: {f:?}"))?;
-                blocklinear::deswizzle_width(
-                    &raw,
-                    row,
-                    row.next_multiple_of(16),
-                    rows,
-                    tic.block_height_log2,
-                )
-            }
+        let layers = tic.layers().clamp(1, 2048);
+        let mut texels = Vec::with_capacity((tic.width * tic.height * layers) as usize);
+        let read = |at: u64, len: usize| -> Result<Vec<u8>, String> {
+            let mut raw = vec![0u8; len];
+            g.read(at, &mut raw)
+                .map_err(|f| format!("texture: {f:?}"))?;
+            Ok(raw)
         };
-        let texels = if (bw, bh) == (1, 1) {
-            linear
-                .chunks_exact(bpp as usize)
-                .map(|t| swizzle(tic, components(tic, t)))
-                .collect()
-        } else {
-            let (w, h) = (tic.width as usize, tic.height as usize);
-            let mut texels = vec![[0f32; 4]; w * h];
-            let mut block = vec![0u32; (bw * bh) as usize];
-            for (i, data) in linear.chunks_exact(bpp as usize).enumerate() {
-                let (bx, by) = (i as u32 % cols, i as u32 / cols);
-                decode_block(tic.format, bw, bh, data, &mut block);
-                for (k, &p) in block.iter().enumerate() {
-                    let (x, y) = (
-                        (bx * bw) as usize + k % bw as usize,
-                        (by * bh) as usize + k / bw as usize,
-                    );
-                    if x < w && y < h {
-                        let [b, gr, r, a] = p.to_le_bytes();
-                        let mut c = [r, gr, b, a].map(|v| f32::from(v) / 255.0);
-                        if tic.srgb {
-                            for v in &mut c[..3] {
-                                *v = srgb_to_linear(*v);
-                            }
+        if tic.ty == ty::D3 && tic.pitch.is_none() {
+            // Block-linear 3D: slices interleave inside blocks.
+            let block_rows = 8u32 << tic.block_height_log2;
+            let size = (cols * bpp).div_ceil(64) as usize
+                * 64
+                * rows.next_multiple_of(block_rows) as usize
+                * layers.next_multiple_of(1 << tic.block_depth_log2) as usize;
+            let raw = read(tic.addr, size)?;
+            for z in 0..layers {
+                let mut linear = vec![0u8; (row * rows) as usize];
+                for y in 0..rows {
+                    for x in (0..row.next_multiple_of(16)).step_by(16) {
+                        let n = 16.min(row - x) as usize;
+                        let from = blocklinear::offset3d(
+                            x,
+                            y,
+                            z,
+                            row,
+                            rows,
+                            tic.block_height_log2,
+                            tic.block_depth_log2,
+                        );
+                        let to = (y * row + x) as usize;
+                        if let Some(piece) = raw.get(from..from + n) {
+                            linear[to..to + n].copy_from_slice(piece);
                         }
-                        texels[y * w + x] = swizzle(tic, c);
                     }
                 }
+                texels.extend(convert(tic, &linear));
             }
-            texels
-        };
+        } else {
+            let stride = if tic.ty == ty::D3 {
+                u64::from(tic.pitch.unwrap_or(row)) * u64::from(rows)
+            } else {
+                tic.layer_stride()
+            };
+            for layer in 0..layers {
+                let at = tic.addr + u64::from(layer) * stride;
+                let linear = match tic.pitch {
+                    Some(pitch) => {
+                        let raw = read(at, (pitch * (rows - 1) + row) as usize)?;
+                        let mut out = Vec::with_capacity((row * rows) as usize);
+                        for y in 0..rows {
+                            let s = (y * pitch) as usize;
+                            out.extend_from_slice(&raw[s..s + row as usize]);
+                        }
+                        out
+                    }
+                    None => {
+                        // Level 0 uses the header's block height.
+                        let size = blocklinear::size(row, rows, tic.block_height_log2);
+                        let raw = read(at, size)?;
+                        blocklinear::deswizzle_width(
+                            &raw,
+                            row,
+                            row.next_multiple_of(16),
+                            rows,
+                            tic.block_height_log2,
+                        )
+                    }
+                };
+                texels.extend(convert(tic, &linear));
+            }
+        }
         Ok(Texture {
             width: tic.width,
             height: tic.height,
+            layers,
+            ty: tic.ty,
             texels,
         })
+    }
+
+    /// Texel (x, y) of image `layer`, with the sampler's address modes.
+    fn texel_in(&self, layer: u32, x: i64, y: i64, s: &Tsc) -> [f32; 4] {
+        let base = (layer.min(self.layers - 1) * self.width * self.height) as usize;
+        let t = self.texel(x, y, s);
+        if layer == 0 {
+            return t;
+        }
+        // Same addressing, offset into the layer.
+        let fix = |c: i64, n: u32| c.clamp(0, i64::from(n) - 1) as u32;
+        match (s.wrap[0], s.wrap[1]) {
+            (wrap::CLAMP_TO_BORDER, _) | (_, wrap::CLAMP_TO_BORDER)
+                if x < 0 || y < 0 || x >= i64::from(self.width) || y >= i64::from(self.height) =>
+            {
+                s.border
+            }
+            _ => {
+                let wx = match s.wrap[0] {
+                    wrap::REPEAT => x.rem_euclid(i64::from(self.width)) as u32,
+                    _ => fix(x, self.width),
+                };
+                let wy = match s.wrap[1] {
+                    wrap::REPEAT => y.rem_euclid(i64::from(self.height)) as u32,
+                    _ => fix(y, self.height),
+                };
+                self.texels[base + (wy * self.width + wx) as usize]
+            }
+        }
+    }
+
+    /// Bilinear (or nearest) sample of image `layer` at (u, v).
+    pub fn sample_layer(&self, s: &Tsc, u: f32, v: f32, layer: u32) -> [f32; 4] {
+        if layer == 0 {
+            return self.sample(s, u, v);
+        }
+        let (x, y) = (u * self.width as f32, v * self.height as f32);
+        if !x.is_finite() || !y.is_finite() {
+            return [0.0; 4];
+        }
+        if !s.linear {
+            return self.texel_in(layer, x.floor() as i64, y.floor() as i64, s);
+        }
+        let (x, y) = (x - 0.5, y - 0.5);
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let t = [
+            self.texel_in(layer, x0, y0, s),
+            self.texel_in(layer, x0 + 1, y0, s),
+            self.texel_in(layer, x0, y0 + 1, s),
+            self.texel_in(layer, x0 + 1, y0 + 1, s),
+        ];
+        std::array::from_fn(|c| {
+            let top = t[0][c] + (t[1][c] - t[0][c]) * fx;
+            let bottom = t[2][c] + (t[3][c] - t[2][c]) * fx;
+            top + (bottom - top) * fy
+        })
+    }
+
+    /// Samples by the texture's own type: `c` holds (u, v, w) for 2D/3D,
+    /// a direction for cubes; `layer` the array layer.
+    pub fn sample_any(&self, s: &Tsc, c: [f32; 3], layer: f32) -> [f32; 4] {
+        let layer_index = |n: u32| (layer.round().max(0.0) as u32).min(n.saturating_sub(1));
+        match self.ty {
+            ty::D3 => {
+                let z = c[2] * self.layers as f32 - 0.5;
+                if !z.is_finite() {
+                    return [0.0; 4];
+                }
+                if !s.linear {
+                    let z = (c[2] * self.layers as f32)
+                        .floor()
+                        .clamp(0.0, (self.layers - 1) as f32);
+                    return self.sample_layer(s, c[0], c[1], z as u32);
+                }
+                let z0 = z.floor();
+                let f = z - z0;
+                let clamp = |z: f32| z.clamp(0.0, (self.layers - 1) as f32) as u32;
+                let a = self.sample_layer(s, c[0], c[1], clamp(z0));
+                let b = self.sample_layer(s, c[0], c[1], clamp(z0 + 1.0));
+                std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f)
+            }
+            ty::CUBE | ty::CUBE_ARRAY => {
+                let (face, u, v) = cube_face(c);
+                let cube = layer_index(self.layers / 6);
+                let edge = Tsc {
+                    wrap: [wrap::CLAMP_TO_EDGE; 3],
+                    ..*s
+                };
+                self.sample_layer(&edge, u, v, cube * 6 + face)
+            }
+            ty::D1_ARRAY | ty::D2_ARRAY => {
+                self.sample_layer(s, c[0], c[1], layer_index(self.layers))
+            }
+            _ => self.sample(s, c[0], c[1]),
+        }
+    }
+
+    /// Fetches texel (x, y) of image `layer` (z for 3D), zero outside.
+    pub fn fetch_layer(&self, x: i32, y: i32, layer: i32) -> [f32; 4] {
+        if x < 0
+            || y < 0
+            || layer < 0
+            || x as u32 >= self.width
+            || y as u32 >= self.height
+            || layer as u32 >= self.layers
+        {
+            return [0.0; 4];
+        }
+        let base = (layer as u32 * self.width * self.height) as usize;
+        self.texels[base + (y as u32 * self.width + x as u32) as usize]
     }
 
     fn texel(&self, x: i64, y: i64, s: &Tsc) -> [f32; 4] {
@@ -435,6 +658,33 @@ impl Texture {
     }
 }
 
+/// The cube face a direction points at and the (u, v) on it.
+pub fn cube_face(d: [f32; 3]) -> (u32, f32, f32) {
+    let [x, y, z] = d;
+    let (ax, ay, az) = (x.abs(), y.abs(), z.abs());
+    let (face, sc, tc, ma) = if ax >= ay && ax >= az {
+        if x >= 0.0 {
+            (0, -z, -y, ax)
+        } else {
+            (1, z, -y, ax)
+        }
+    } else if ay >= az {
+        if y >= 0.0 {
+            (2, x, z, ay)
+        } else {
+            (3, x, -z, ay)
+        }
+    } else if z >= 0.0 {
+        (4, x, -y, az)
+    } else {
+        (5, -x, -y, az)
+    };
+    if ma == 0.0 {
+        return (0, 0.5, 0.5);
+    }
+    (face, (sc / ma + 1.0) / 2.0, (tc / ma + 1.0) / 2.0)
+}
+
 /// The texture and sampler a handle word names.
 pub fn resolve(g: &GuestMemory, pools: &Pools, handle: u32) -> Result<(Tic, Tsc), String> {
     let (tic_index, tsc_index) = (handle & 0xF_FFFF, handle >> 20);
@@ -466,6 +716,18 @@ impl Bound {
         self.0.get(&handle).map_or([0.0; 4], |(t, _)| t.fetch(x, y))
     }
 
+    pub fn sample_any(&self, handle: u32, c: [f32; 3], layer: f32) -> [f32; 4] {
+        self.0
+            .get(&handle)
+            .map_or([0.0; 4], |(t, s)| t.sample_any(s, c, layer))
+    }
+
+    pub fn fetch_layer(&self, handle: u32, x: i32, y: i32, layer: i32) -> [f32; 4] {
+        self.0
+            .get(&handle)
+            .map_or([0.0; 4], |(t, _)| t.fetch_layer(x, y, layer))
+    }
+
     pub fn gather(&self, handle: u32, u: f32, v: f32, comp: u8) -> [f32; 4] {
         self.0
             .get(&handle)
@@ -475,7 +737,13 @@ impl Bound {
     /// Width, height, depth and levels (only level 0 is kept).
     pub fn size(&self, handle: u32, lod: u32) -> [u32; 4] {
         match self.0.get(&handle) {
-            Some((t, _)) if lod == 0 => [t.width, t.height, 1, 1],
+            Some((t, _)) if lod == 0 => {
+                let depth = match t.ty {
+                    ty::CUBE | ty::CUBE_ARRAY => t.layers / 6,
+                    _ => t.layers,
+                };
+                [t.width, t.height, depth, 1]
+            }
             Some(_) => [0, 0, 0, 1],
             None => [0; 4],
         }
@@ -584,6 +852,8 @@ mod tests {
         let tex = Texture {
             width: 2,
             height: 1,
+            layers: 1,
+            ty: ty::D2,
             texels: vec![[0.0; 4], [1.0; 4]],
         };
         let mut s = Tsc {
@@ -603,5 +873,42 @@ mod tests {
         s.wrap = [wrap::CLAMP_TO_BORDER; 3];
         s.linear = false;
         assert_eq!(tex.sample(&s, -0.25, 0.5), [0.5; 4]);
+    }
+
+    #[test]
+    fn arrays_3d_and_cubes() {
+        let s = Tsc {
+            wrap: [wrap::CLAMP_TO_EDGE; 3],
+            linear: false,
+            border: [0.0; 4],
+        };
+        // Six 1x1 faces (or layers, or slices) holding their index.
+        let texels: Vec<[f32; 4]> = (0..6).map(|i| [i as f32; 4]).collect();
+        let tex = |ty| Texture {
+            width: 1,
+            height: 1,
+            layers: 6,
+            ty,
+            texels: texels.clone(),
+        };
+        assert_eq!(
+            tex(ty::D2_ARRAY).sample_any(&s, [0.5, 0.5, 0.0], 3.0)[0],
+            3.0
+        );
+        assert_eq!(tex(ty::D3).sample_any(&s, [0.5, 0.5, 0.9], 0.0)[0], 5.0);
+        let cube = tex(ty::CUBE);
+        assert_eq!(cube.sample_any(&s, [1.0, 0.0, 0.0], 0.0)[0], 0.0);
+        assert_eq!(cube.sample_any(&s, [0.0, -1.0, 0.0], 0.0)[0], 3.0);
+        assert_eq!(cube.sample_any(&s, [0.0, 0.0, -1.0], 0.0)[0], 5.0);
+        assert_eq!(tex(ty::D2_ARRAY).fetch_layer(0, 0, 4)[0], 4.0);
+    }
+
+    #[test]
+    fn three_d_block_linear_offsets() {
+        // With one slice per block, slices follow each other.
+        let plane = crate::blocklinear::size(64, 8, 0);
+        assert_eq!(crate::blocklinear::offset3d(0, 0, 1, 64, 8, 0, 0), plane);
+        // Two slices per block: slice 1 is the next GOB.
+        assert_eq!(crate::blocklinear::offset3d(0, 0, 1, 64, 8, 0, 1), 512);
     }
 }

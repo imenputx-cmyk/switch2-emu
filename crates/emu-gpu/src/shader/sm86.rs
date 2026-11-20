@@ -826,13 +826,18 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 let mask = i.bits(72, 4) as u8;
                 let lod = i.bits(87, 3);
                 let fetch = op == 0xB66;
-                if i.bits(61, 3) != 1 {
-                    return err("texture dimension other than 2D");
+                let dim = i.bits(61, 3);
+                if dim == 6 {
+                    return err("texture dimension 6");
                 }
                 if i.bits(76, 4) != 0 || i.bits(81, 3) != 7 || i.on(59) || mask == 0 {
                     return err("texture offsets, depth compare, FP16 or predicate");
                 }
-                if (fetch && lod != 1) || (!fetch && lod > 1) {
+                // Level modes: 0 auto, 1 zero (LZ), 2 bias (LB), 3 level
+                // (LL); 6/7 the same with a clamp. Only level 0 is kept,
+                // so a bias or level operand is read past and ignored.
+                let has_lod = matches!(lod, 2 | 3 | 6 | 7);
+                if (fetch && !matches!(lod, 1 | 3)) || (!fetch && lod > 3 && lod < 6) {
                     return err("texture level mode");
                 }
                 let bank = i.bits(54, 5);
@@ -846,26 +851,56 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                     (RZ, d) => d.wrapping_add(2),
                     (s, _) => s,
                 };
-                let (a, b) = (i.reg(24), i.reg(32));
-                one(if fetch {
-                    Op::Tld {
-                        dst0: dst,
-                        dst1,
-                        a,
-                        b,
-                        handle,
-                        comps: mask,
+                let (ra, rb) = (i.reg(24), i.reg(32));
+                if dim == 1 && !has_lod {
+                    return one(if fetch {
+                        Op::Tld {
+                            dst0: dst,
+                            dst1,
+                            a: ra,
+                            b: rb,
+                            handle,
+                            comps: mask,
+                        }
+                    } else {
+                        Op::Texs {
+                            dst0: dst,
+                            dst1,
+                            a: ra,
+                            b: rb,
+                            handle,
+                            comps: mask,
+                            lz: lod == 1,
+                        }
+                    });
+                }
+                // The operand list (array layer first, coordinates, then
+                // the level) packs into Ra.. and Rb.. (Lichii general_tex).
+                let array = matches!(dim, 4 | 5 | 7);
+                let coords = [1u32, 2, 3, 3, 1, 2, 0, 3][dim as usize];
+                let count = coords + u32::from(array) + u32::from(has_lod);
+                let in_a = if count <= 4 { count.div_ceil(2) } else { 4 };
+                let value = |k: u32| -> u8 {
+                    let (base, n) = if k < in_a { (ra, k) } else { (rb, k - in_a) };
+                    if base == RZ {
+                        RZ
+                    } else {
+                        base.wrapping_add(n as u8)
                     }
-                } else {
-                    Op::Texs {
-                        dst0: dst,
-                        dst1,
-                        a,
-                        b,
-                        handle,
-                        comps: mask,
-                        lz: lod == 1,
-                    }
+                };
+                let first = u32::from(array);
+                let mut c = [RZ; 3];
+                for (k, slot) in c.iter_mut().enumerate().take(coords as usize) {
+                    *slot = value(first + k as u32);
+                }
+                one(Op::TexN {
+                    dst0: dst,
+                    dst1,
+                    coords: c,
+                    layer: if array { value(0) } else { RZ },
+                    handle,
+                    comps: mask,
+                    fetch,
                 })
             }
             // S2R / S2UR: the special register at 72..80.
@@ -2053,5 +2088,47 @@ mod more_tests {
         assert_eq!(r[4], 0x4080); // 1.5*0.5+1.5=2.25, 2*-1+2=0
         assert_eq!(r[5], 0x4200 << 16 | 0x3400); // 3.0, 0.25
         assert_eq!(r[8], 0xF3); // P0 and P1 both true
+    }
+
+    #[test]
+    fn texture_operand_lists() {
+        // TEX.ARRAY_2D R0, R4 (layer, x), R6 (y), mask RGBA.
+        let tex = inst(
+            0xB60,
+            0,
+            &[(24, 8, 4), (32, 8, 6), (61, 3, 5), (72, 4, 15), (81, 3, 7)],
+        );
+        let d = decode(tex, 0).unwrap();
+        assert!(matches!(
+            d[0].op,
+            Op::TexN {
+                coords: [5, 6, RZ],
+                layer: 4,
+                fetch: false,
+                ..
+            }
+        ));
+        // TEX.3D.LL: x, y in Ra; z, level in Rb.
+        let tex = inst(
+            0xB60,
+            0,
+            &[
+                (24, 8, 4),
+                (32, 8, 6),
+                (61, 3, 2),
+                (72, 4, 1),
+                (81, 3, 7),
+                (87, 3, 3),
+            ],
+        );
+        let d = decode(tex, 0).unwrap();
+        assert!(matches!(
+            d[0].op,
+            Op::TexN {
+                coords: [4, 5, 6],
+                layer: RZ,
+                ..
+            }
+        ));
     }
 }

@@ -19,6 +19,32 @@ pub fn offset(x: u32, y: u32, width_bytes: u32, block_height_log2: u32) -> usize
     (block * gobs_per_block as usize + gob_in_block) * 512 + in_gob as usize
 }
 
+/// Byte offset of (byte column `x`, row `y`, slice `z`) in a 3D
+/// block-linear surface: blocks are `1 << block_depth_log2` slices deep,
+/// GOBs stacked in y first, then z inside a block.
+pub fn offset3d(
+    x: u32,
+    y: u32,
+    z: u32,
+    width_bytes: u32,
+    height: u32,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+) -> usize {
+    let gobs_h = 1usize << block_height_log2;
+    let depth_b = 1u32 << block_depth_log2;
+    let block_rows = 8u32 << block_height_log2;
+    let per_row = width_bytes.div_ceil(64) as usize;
+    let per_col = height.div_ceil(block_rows) as usize;
+    let block = (z / depth_b) as usize * per_row * per_col
+        + (y / block_rows) as usize * per_row
+        + (x / 64) as usize;
+    let gob = (z % depth_b) as usize * gobs_h + ((y % block_rows) / 8) as usize;
+    let (gx, gy) = (x % 64, y % 8);
+    let in_gob = (gx / 32) * 256 + (gy / 2) * 64 + ((gx / 16) % 2) * 32 + (gy % 2) * 16 + gx % 16;
+    (block * gobs_h * depth_b as usize + gob) * 512 + in_gob as usize
+}
+
 /// Bytes covered by a block-linear surface.
 pub fn size(width_bytes: u32, height: u32, block_height_log2: u32) -> usize {
     let block_rows = 8u32 << block_height_log2;

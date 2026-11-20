@@ -28,6 +28,15 @@ pub trait ShaderIo {
     fn fetch(&self, _handle: u32, _x: i32, _y: i32) -> [f32; 4] {
         [0.0; 4]
     }
+    /// Samples a texture of any type at (u, v, w) (a direction for cubes)
+    /// in array layer `layer`.
+    fn sample_any(&self, handle: u32, c: [f32; 3], _layer: f32) -> [f32; 4] {
+        self.texture(handle, c[0], c[1])
+    }
+    /// Fetches texel (x, y) of layer (or slice) `layer`.
+    fn fetch_layer(&self, handle: u32, x: i32, y: i32, _layer: i32) -> [f32; 4] {
+        self.fetch(handle, x, y)
+    }
     /// Gathers component `comp` of the 2x2 texels sampled at (u, v), in
     /// the order (i0,j1), (i1,j1), (i1,j0), (i0,j0).
     fn gather(&self, _handle: u32, _u: f32, _v: f32, _comp: u8) -> [f32; 4] {
@@ -1092,6 +1101,33 @@ impl Machine<'_> {
                     if mask >> i & 1 != 0 {
                         self.preds[i] = v >> i & 1 != 0;
                     }
+                }
+            }
+            Op::TexN {
+                dst0,
+                dst1,
+                coords,
+                layer,
+                handle,
+                comps,
+                fetch,
+            } => {
+                let t = if fetch {
+                    let c = coords.map(|r| self.regs.get(r) as i32);
+                    // A 3D fetch's z is its slice.
+                    let l = if layer != RZ {
+                        self.regs.get(layer) as i32
+                    } else {
+                        c[2]
+                    };
+                    self.io.fetch_layer(handle, c[0], c[1], l)
+                } else {
+                    let c = coords.map(|r| self.regs.f(r));
+                    let l = self.regs.get(layer) as f32;
+                    self.io.sample_any(handle, c, l)
+                };
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    self.regs.set(texs_dst(dst0, dst1, k), t[c].to_bits());
                 }
             }
             Op::Nop | Op::Bar | Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {

@@ -131,6 +131,7 @@ pub fn texture_handles(program: &[Inst]) -> Vec<u32> {
         | Op::Tex { handle, .. }
         | Op::Tld { handle, .. }
         | Op::Txq { handle, .. }
+        | Op::TexN { handle, .. }
         | Op::Tld4 { handle, .. } = i.op
         {
             if !out.contains(&handle) {
@@ -321,6 +322,12 @@ struct VertexIo<'a, 'g> {
 }
 
 impl ShaderIo for VertexIo<'_, '_> {
+    fn sample_any(&self, handle: u32, c: [f32; 3], layer: f32) -> [f32; 4] {
+        self.tex.sample_any(handle, c, layer)
+    }
+    fn fetch_layer(&self, handle: u32, x: i32, y: i32, layer: i32) -> [f32; 4] {
+        self.tex.fetch_layer(handle, x, y, layer)
+    }
     fn gather(&self, handle: u32, u: f32, v: f32, comp: u8) -> [f32; 4] {
         self.tex.gather(handle, u, v, comp)
     }
@@ -376,6 +383,12 @@ struct PixelIo<'a, 'g> {
 }
 
 impl ShaderIo for PixelIo<'_, '_> {
+    fn sample_any(&self, handle: u32, c: [f32; 3], layer: f32) -> [f32; 4] {
+        self.tex.sample_any(handle, c, layer)
+    }
+    fn fetch_layer(&self, handle: u32, x: i32, y: i32, layer: i32) -> [f32; 4] {
+        self.tex.fetch_layer(handle, x, y, layer)
+    }
     fn gather(&self, handle: u32, u: f32, v: f32, comp: u8) -> [f32; 4] {
         self.tex.gather(handle, u, v, comp)
     }
