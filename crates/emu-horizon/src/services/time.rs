@@ -162,8 +162,119 @@ impl Service for TimeZoneService {
                 name[..3].copy_from_slice(b"UTC");
                 ctx.push_bytes(&name);
             }
+            1 => {}               // SetDeviceLocationName
+            2 => ctx.push_u32(1), // GetTotalLocationNameCount
+            // LoadLocationNameList: "UTC".
+            3 => {
+                if let Some(b) = ctx.out_buffer(0) {
+                    let mut name = vec![0u8; b.size as usize];
+                    let n = name.len().min(3);
+                    name[..n].copy_from_slice(&b"UTC"[..n]);
+                    ctx.write_out_buffer(0, &name)?;
+                }
+                ctx.push_u32(1);
+            }
+            // LoadTimeZoneRule: an empty rule (UTC).
+            4 => {
+                if let Some(b) = ctx.out_buffer(0) {
+                    ctx.write_out_buffer(0, &vec![0; b.size as usize])?;
+                }
+            }
+            // GetTimeZoneRuleVersion: 16 bytes.
+            5 => ctx.push_bytes(b"2024a\0\0\0\0\0\0\0\0\0\0\0"),
+            // GetDeviceLocationNameAndUpdatedTime: the name, then a
+            // steady clock point (0x18 bytes).
+            6 => {
+                let mut name = [0u8; 0x24];
+                name[..3].copy_from_slice(b"UTC");
+                ctx.push_bytes(&name);
+                ctx.push_bytes(&[0; 0x1C]);
+            }
+            // ToCalendarTime(WithMyRule)(posix time): UTC.
+            100 | 101 => {
+                let t = ctx.in_u64(0) as i64;
+                ctx.push_bytes(&calendar(t));
+            }
+            // ToPosixTime(WithMyRule)(calendar time): one time, UTC.
+            201 | 202 => {
+                let c = ctx.in_bytes(0, 8);
+                let year = i64::from(u16::from_le_bytes([c[0], c[1]]) as i16);
+                let days = days_from_civil(year, u32::from(c[2]), u32::from(c[3]));
+                let t =
+                    days * 86_400 + i64::from(c[4]) * 3600 + i64::from(c[5]) * 60 + i64::from(c[6]);
+                if ctx.out_buffer(0).is_some() {
+                    ctx.write_out_buffer(0, &t.to_le_bytes())?;
+                }
+                ctx.push_u32(1);
+            }
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())
+    }
+}
+
+/// Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m = i64::from(m);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// A posix time as a UTC CalendarTime (8 bytes: year, month, day, hour,
+/// minute, second) and CalendarAdditionalInfo (day of week, day of year,
+/// "UTC", not DST, offset 0).
+pub fn calendar(t: i64) -> Vec<u8> {
+    let days = t.div_euclid(86_400);
+    let secs = t.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let mut out = Vec::with_capacity(0x20);
+    out.extend_from_slice(&(y as u16).to_le_bytes());
+    out.extend_from_slice(&[
+        m as u8,
+        d as u8,
+        (secs / 3600) as u8,
+        (secs / 60 % 60) as u8,
+        (secs % 60) as u8,
+        0,
+    ]);
+    let weekday = (days + 4).rem_euclid(7) as u32;
+    let yday = (days - days_from_civil(y, 1, 1)) as u32;
+    out.extend_from_slice(&weekday.to_le_bytes());
+    out.extend_from_slice(&yday.to_le_bytes());
+    let mut name = [0u8; 8];
+    name[..3].copy_from_slice(b"UTC");
+    out.extend_from_slice(&name);
+    out.extend_from_slice(&0u32.to_le_bytes()); // is DST
+    out.extend_from_slice(&0i32.to_le_bytes()); // UTC offset
+    out
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+
+    #[test]
+    fn utc_calendar() {
+        // 2026-11-21 02:28:05 UTC is a Saturday, day 324 of the year.
+        let t = days_from_civil(2026, 11, 21) * 86_400 + 2 * 3600 + 28 * 60 + 5;
+        let c = calendar(t);
+        assert_eq!(u16::from_le_bytes([c[0], c[1]]), 2026);
+        assert_eq!(&c[2..7], &[11, 21, 2, 28, 5]);
+        assert_eq!(u32::from_le_bytes(c[8..12].try_into().unwrap()), 6);
+        assert_eq!(u32::from_le_bytes(c[12..16].try_into().unwrap()), 324);
+        assert_eq!(c.len(), 0x20);
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
     }
 }
