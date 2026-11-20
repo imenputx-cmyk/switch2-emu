@@ -423,6 +423,9 @@ impl Horizon {
         // (9809 MiB, as in Lichii's KSystemControl). nninitStartup sizes
         // its heap as total minus ~6.3 GiB, so 4 GiB left it nothing.
         self.layout.total_memory = 9809 << 20;
+        // ...and ask for nearly all of it as heap, so the heap region is
+        // the 39-bit address space's 16 GiB (Lichii k_address_space_info).
+        self.layout.heap = (0x10_0000_0000, 0x4_0000_0000);
         if let Some(n) = npdm {
             if !n.is_64bit {
                 return Err(LoadError::Unsupported("32-bit programs"));
