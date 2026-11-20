@@ -33,6 +33,15 @@ fn real_main() -> ExitCode {
     if args.iter().any(|a| a == "--cpu=interp") {
         emu_run::USE_JIT.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    // --debug: a debugger prompt in the terminal when the program stops
+    // (errors, breakpoints, Ctrl+C); --debug=start also before it runs.
+    if let Some(a) = args
+        .iter()
+        .find(|a| *a == "--debug" || a.starts_with("--debug="))
+    {
+        let mode = if a == "--debug=start" { 2 } else { 1 };
+        emu_run::DEBUG_CONSOLE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    }
     // --gdb or --gdb=PORT: wait for a debugger (GDB remote protocol).
     if let Some(a) = args
         .iter()
@@ -46,7 +55,7 @@ fn real_main() -> ExitCode {
     }
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
         eprintln!(
-            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] [--keys=prod.keys] [--auto-stub] [--cpu=interp] [--gdb[=PORT]] <program.elf | homebrew.nro | game.nso | exefs-dir | game.nsp | game.xci>\n\
+            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] [--keys=prod.keys] [--auto-stub] [--cpu=interp] [--gdb[=PORT]] [--debug[=start]] <program.elf | homebrew.nro | game.nso | exefs-dir | game.nsp | game.xci>\n\
              (built with --features window, frames are shown in a window unless --frames is given)"
         );
         return ExitCode::from(2);

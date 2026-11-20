@@ -136,6 +136,7 @@ pub struct HomebrewResult {
 #[cfg(feature = "window")]
 pub mod window;
 
+pub mod console;
 pub mod gdb;
 
 pub fn run_nro(nro: &[u8], max_steps: u64, trace_svcs: bool) -> Result<HomebrewResult, RunError> {
@@ -161,6 +162,10 @@ pub fn run_nro_with(
 /// Run guest code with the JIT when this build has one (`--cpu=interp`
 /// turns it off).
 pub static USE_JIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The terminal debugger ([`console`]): 0 off, 1 open it when the
+/// program stops (errors, breakpoints, Ctrl+C), 2 also before it starts.
+pub static DEBUG_CONSOLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Serve a GDB remote stub on this TCP port (0: none); see [`gdb`].
 pub static GDB_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -352,8 +357,11 @@ pub fn run_program_presenting(
     );
     hos.heartbeat = matches!(program, Program::Application(..));
     let port = GDB_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let debug = DEBUG_CONSOLE.load(std::sync::atomic::Ordering::Relaxed);
     let stop = if port != 0 {
         gdb::serve(&mut hos, port as u16, max_steps)
+    } else if debug != 0 {
+        console::run(&mut hos, max_steps, debug == 2)
     } else {
         hos.run(max_steps)
     };

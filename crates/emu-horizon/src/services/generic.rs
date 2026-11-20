@@ -98,12 +98,13 @@ pub fn table_name(name: &str) -> Option<&'static str> {
 }
 
 const NAMES: &[&str] = &[
-    "prepo:u", "prepo:a", "prepo:a2", "prepo:s", "nifm:u", "nifm:a", "nifm:s", "friend:u",
-    "friend:v", "friend:m", "friend:s", "friend:a", "bcat:u", "bcat:s", "bcat:m", "bcat:a",
-    "olsc:u", "npns:u", "npns:s", "ectx:r", "erpt:c", "erpt:r", "psm", "caps:su", "caps:u", "ssl",
-    "bsd:u", "bsd:s", "bsd:a", "ns:am2", "ns:ec", "ns:rid", "ns:rt", "ns:web", "ns:ro", "ns:dev",
-    "ns:su", "ns:vm", "mii:e", "mii:u", "lbl", "spsm", "idle:sys", "omm", "fgm", "fgm:0", "fgm:9",
-    "ntc", "mm:u", "pm:shell", "pm:bm", "pm:info", "pm:dmnt",
+    "nfp:user", "nfp:sys", "nfc:user", "nfc:sys", "prepo:u", "prepo:a", "prepo:a2", "prepo:s",
+    "nifm:u", "nifm:a", "nifm:s", "friend:u", "friend:v", "friend:m", "friend:s", "friend:a",
+    "bcat:u", "bcat:s", "bcat:m", "bcat:a", "olsc:u", "npns:u", "npns:s", "ectx:r", "erpt:c",
+    "erpt:r", "psm", "caps:su", "caps:u", "ssl", "bsd:u", "bsd:s", "bsd:a", "ns:am2", "ns:ec",
+    "ns:rid", "ns:rt", "ns:web", "ns:ro", "ns:dev", "ns:su", "ns:vm", "mii:e", "mii:u", "lbl",
+    "spsm", "idle:sys", "omm", "fgm", "fgm:0", "fgm:9", "ntc", "mm:u", "pm:shell", "pm:bm",
+    "pm:info", "pm:dmnt",
 ];
 
 /// The table for `name`.
@@ -141,6 +142,42 @@ pub fn table(name: &str) -> Option<&'static [(u32, Reply)]> {
             (90102, Ok),
         ],
         // Network: present but never connected.
+        // Amiibo (nfp) and NFC: initialized, no readers, nothing found
+        // (Lichii nfp.cpp / nfc.cpp).
+        "nfp:user" | "nfp:sys" => &[(0, Object("nfp::IUser"))],
+        "nfp::IUser" => &[
+            (0, Ok),        // Initialize
+            (1, Ok),        // Finalize
+            (2, EmptyList), // ListDevices
+            (3, Ok),        // StartDetection
+            (4, Ok),        // StopDetection
+            (17, Event(false)),
+            (18, Event(false)),
+            (19, U32(1)), // GetState: initialized
+            (20, U32(0)), // GetDeviceState: none
+            (21, U32(0)), // GetNpadId
+            (23, Event(false)),
+            (25, Ok), // StartDetectionWithFilter
+        ],
+        "nfc:user" | "nfc:sys" => &[(0, Object("nfc::IUser"))],
+        "nfc::IUser" => &[
+            (0, Ok),             // Initialize (old)
+            (1, Ok),             // Finalize (old)
+            (2, U32(1)),         // GetState (old)
+            (3, U8(0)),          // IsNfcEnabled (old)
+            (400, Ok),           // Initialize
+            (401, Ok),           // Finalize
+            (402, U32(1)),       // GetState
+            (403, U8(0)),        // IsNfcEnabled
+            (404, EmptyList),    // ListDevices
+            (405, U32(0)),       // GetDeviceState
+            (406, U32(0)),       // GetNpadId
+            (407, Event(false)), // AttachAvailabilityChangeEvent
+            (408, Ok),
+            (409, Ok),
+            (411, Event(false)),
+            (412, Event(false)),
+        ],
         "nifm:u" | "nifm:a" | "nifm:s" => &[
             (4, Object("nifm::IGeneralService")),
             (5, Object("nifm::IGeneralService")),

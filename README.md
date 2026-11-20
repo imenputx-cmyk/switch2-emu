@@ -102,6 +102,16 @@ reaches the guest's read-write pages directly through a page table
 
 ## Debugging
 
+`--debug` opens a debugger prompt in the terminal whenever the program
+stops: at an error (an unimplemented service command, a crash), at a
+breakpoint, or on Ctrl+C. `--debug=start` also stops before the first
+instruction. Commands (type `help`): `c` continue, `s [n]` step, `b`/`bd`/`bl`
+breakpoints, `r` registers, `t [N]` threads, `bt` backtrace, `x`/`xs`
+memory and strings, `w4`/`w8`/`set` to change memory and registers, `dis`
+to decode instructions, `mem`, `mods`, `ipc`, `svc`, `stubs`, `trace`,
+`dump`. Addresses can be module-relative (`m2+0x17b128`) or registers
+(`pc`, `lr+8`, `x19`).
+
 `--gdb` (or `--gdb=PORT`, default 6543) waits for a debugger speaking the
 GDB remote protocol before the program starts: GDB
 (`target remote 127.0.0.1:6543`), LLDB (`gdb-remote 6543`), IDA or Ghidra.
