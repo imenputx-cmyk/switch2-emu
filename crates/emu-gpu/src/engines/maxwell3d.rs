@@ -11,7 +11,7 @@ use crate::backend::{Layout, Rect, Surface};
 use crate::draw::{
     ConstBuffer, Draw, IndexBuffer, VertexAttribute, VertexStream, Viewport, CBUF_SLOTS,
 };
-use crate::shader::decode::{decode_program, Inst};
+use crate::shader::decode::{decode_program, is_complete, Inst};
 use crate::shader::{Header, Stage, HEADER_SIZE};
 use crate::surface::ColorFormat;
 
@@ -304,7 +304,7 @@ impl Maxwell3D {
                 .map_err(|f| format!("shader at {addr:#x}: {f:?}"))?;
             let insts = decode_program(&code[HEADER_SIZE..])
                 .map_err(|e| format!("shader at {addr:#x}: {e:x?}"))?;
-            if insts.last() == Some(&Inst::Exit) {
+            if is_complete(&insts) {
                 let p = (Header::parse(&code[..HEADER_SIZE]), insts);
                 self.programs.insert(addr, p.clone());
                 return Ok(p);

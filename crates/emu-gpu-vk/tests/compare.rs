@@ -159,7 +159,6 @@ fn masked_clear_falls_back_in_order() {
 #[test]
 fn draws_with_translated_shaders() {
     use emu_gpu::shader::{asm, attr};
-    let Some(vk) = vulkan() else { return };
     // Shaders at +0x30000 (vertex) and +0x30200 (pixel); vertices at
     // +0x31000: position, then color, 32 bytes each.
     let vs = asm::program(
@@ -184,6 +183,29 @@ fn draws_with_translated_shaders() {
             asm::exit(),
         ],
     );
+    shaded_draw(vs, ps, 8);
+}
+
+#[test]
+fn control_flow_shaders() {
+    use emu_gpu::shader::{asm, attr};
+    let vs = asm::program(
+        &asm::vertex_header(),
+        &[
+            asm::ald(0, attr::generic(0), 4),
+            asm::ald(4, attr::generic(1), 4),
+            asm::ast(0, attr::POSITION, 4),
+            asm::ast(4, attr::generic(0), 4),
+            asm::exit(),
+        ],
+    );
+    shaded_draw(vs, asm::control_flow_sample(), 16);
+}
+
+/// Draws a triangle and a strip with the given shaders in software and
+/// on Vulkan and compares the results.
+fn shaded_draw(vs: Vec<u8>, ps: Vec<u8>, max_differing: usize) {
+    let Some(vk) = vulkan() else { return };
     let verts: Vec<f32> = vec![
         -0.9, -0.8, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, //
         0.8, -0.9, 0.0, 2.0, 0.0, 1.0, 0.0, 1.0, // w = 2: perspective
@@ -261,11 +283,11 @@ fn draws_with_translated_shaders() {
     let differing = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x != y).count();
     eprintln!("software vs Vulkan: {differing} pixels differ, by at most {worst}");
     assert!(
-        worst <= 2 || differing <= 8,
+        worst <= 2 || differing <= max_differing,
         "worst {worst}, {differing} pixels differ"
     );
     assert!(
-        a.chunks(4).filter(|p| p[0] > 100).count() > 500,
+        a.chunks(4).filter(|p| p[..3] != [51, 51, 51]).count() > 500,
         "the draw covered little"
     );
 }

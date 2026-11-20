@@ -1,8 +1,13 @@
 //! Runs decoded shaders on the CPU: the reference that translated
 //! (SPIR-V) shaders are compared against, and the software renderer's
 //! shader core.
+//!
+//! One invocation runs at a time, so divergence never happens: SSY
+//! pushes a reconvergence point and SYNC pops it and jumps there.
 
-use super::decode::{Inst, IpaMode, Mods, Operand, RZ};
+use super::decode::{
+    Bop, FCmp, ICmp, Inst, IpaMode, LopOp, Mods, MufuOp, Op, Operand, Pred, Round, XmadMode, RZ,
+};
 
 /// What a shader reads and writes besides its registers.
 pub trait ShaderIo {
@@ -37,15 +42,13 @@ impl Regs {
     }
 }
 
-fn operand(regs: &Regs, io: &dyn ShaderIo, o: Operand) -> u32 {
-    match o {
-        Operand::Reg(r) => regs.get(r),
-        Operand::Imm(v) => v,
-        Operand::Cbuf { index, offset } => io.cbuf(index, offset),
-    }
-}
+/// Instructions run before a program is considered stuck.
+pub const STEP_LIMIT: usize = 1 << 20;
 
-fn apply(v: f32, m: Mods) -> f32 {
+/// Maximum SSY nesting (deeper pushes overwrite the top entry).
+pub const SSY_DEPTH: usize = 16;
+
+pub fn apply(v: f32, m: Mods) -> f32 {
     let v = if m.abs { v.abs() } else { v };
     if m.neg {
         -v
@@ -67,16 +70,129 @@ fn sat(v: f32, on: bool) -> f32 {
     }
 }
 
-/// Runs a straight-line program to its EXIT; returns the registers.
-pub fn run(program: &[Inst], io: &mut dyn ShaderIo) -> Regs {
-    let mut regs = Regs([0; 256]);
-    for &inst in program {
-        match inst {
-            Inst::Mov { dst, src } => {
-                let v = operand(&regs, io, src);
-                regs.set(dst, v);
+pub fn fcmp(cmp: FCmp, a: f32, b: f32) -> bool {
+    if a.is_nan() || b.is_nan() {
+        return cmp & 8 != 0;
+    }
+    (cmp & 1 != 0 && a < b) || (cmp & 2 != 0 && a == b) || (cmp & 4 != 0 && a > b)
+}
+
+pub fn icmp(cmp: ICmp, a: u32, b: u32, signed: bool) -> bool {
+    let ord = if signed {
+        (a as i32).cmp(&(b as i32))
+    } else {
+        a.cmp(&b)
+    };
+    let bit = match ord {
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => 2,
+        std::cmp::Ordering::Greater => 4,
+    };
+    cmp & bit != 0
+}
+
+pub fn bop(op: Bop, a: bool, b: bool) -> bool {
+    match op {
+        Bop::And => a && b,
+        Bop::Or => a || b,
+        Bop::Xor => a != b,
+    }
+}
+
+fn round(v: f32, r: Round) -> f32 {
+    match r {
+        Round::Nearest => v.round_ties_even(),
+        Round::Floor => v.floor(),
+        Round::Ceil => v.ceil(),
+        Round::Trunc => v.trunc(),
+        Round::Pass => v,
+    }
+}
+
+fn half(v: u32, hi: bool, signed: bool) -> u32 {
+    let h = if hi { v >> 16 } else { v & 0xFFFF };
+    if signed {
+        h as u16 as i16 as i32 as u32
+    } else {
+        h
+    }
+}
+
+/// The result of an XMAD (shared with tests of the translation).
+#[allow(clippy::too_many_arguments)]
+pub fn xmad(
+    a: u32,
+    a_hi: bool,
+    a_signed: bool,
+    b: u32,
+    b_hi: bool,
+    b_signed: bool,
+    c: u32,
+    mode: XmadMode,
+    psl: bool,
+    mrg: bool,
+) -> u32 {
+    let mut p = half(a, a_hi, a_signed).wrapping_mul(half(b, b_hi, b_signed));
+    if psl {
+        p <<= 16;
+    }
+    let c = match mode {
+        XmadMode::C => c,
+        XmadMode::Clo => c & 0xFFFF,
+        XmadMode::Chi => c >> 16,
+        XmadMode::Cbcc => c.wrapping_add(b << 16),
+    };
+    let r = p.wrapping_add(c);
+    if mrg {
+        (r & 0xFFFF) | b << 16
+    } else {
+        r
+    }
+}
+
+struct Machine<'a> {
+    regs: Regs,
+    preds: [bool; 8],
+    io: &'a mut dyn ShaderIo,
+}
+
+impl Machine<'_> {
+    fn operand(&self, o: Operand) -> u32 {
+        match o {
+            Operand::Reg(r) => self.regs.get(r),
+            Operand::Imm(v) => v,
+            Operand::Cbuf { index, offset } => self.io.cbuf(index, offset),
+        }
+    }
+
+    fn float(&self, o: Operand, m: Mods) -> f32 {
+        apply(f32::from_bits(self.operand(o)), m)
+    }
+
+    fn pred(&self, p: Pred) -> bool {
+        (p.index == 7 || self.preds[p.index as usize]) != p.neg
+    }
+
+    fn set_pred(&mut self, index: u8, v: bool) {
+        if index != 7 {
+            self.preds[index as usize] = v;
+        }
+    }
+
+    fn set_f(&mut self, dst: u8, v: f32, s: bool) {
+        self.regs.set(dst, sat(v, s).to_bits());
+    }
+
+    /// Runs a non-control-flow instruction.
+    fn exec(&mut self, op: Op) {
+        let reg_f = |m: &Self, r: u8, mods: Mods| apply(m.regs.f(r), mods);
+        let neg = |v: bool| Mods { neg: v, abs: false };
+        match op {
+            Op::Mov { dst, src } => {
+                let v = self.operand(src);
+                self.regs.set(dst, v);
             }
-            Inst::Fadd {
+            Op::Fadd {
                 dst,
                 a,
                 a_mods,
@@ -84,22 +200,20 @@ pub fn run(program: &[Inst], io: &mut dyn ShaderIo) -> Regs {
                 b_mods,
                 sat: s,
             } => {
-                let x = apply(regs.f(a), a_mods);
-                let y = apply(f32::from_bits(operand(&regs, io, b)), b_mods);
-                regs.set(dst, sat(x + y, s).to_bits());
+                let v = reg_f(self, a, a_mods) + self.float(b, b_mods);
+                self.set_f(dst, v, s);
             }
-            Inst::Fmul {
+            Op::Fmul {
                 dst,
                 a,
                 b,
                 neg_b,
                 sat: s,
             } => {
-                let y = f32::from_bits(operand(&regs, io, b));
-                let y = if neg_b { -y } else { y };
-                regs.set(dst, sat(regs.f(a) * y, s).to_bits());
+                let v = self.regs.f(a) * self.float(b, neg(neg_b));
+                self.set_f(dst, v, s);
             }
-            Inst::Ffma {
+            Op::Ffma {
                 dst,
                 a,
                 b,
@@ -108,46 +222,483 @@ pub fn run(program: &[Inst], io: &mut dyn ShaderIo) -> Regs {
                 neg_c,
                 sat: s,
             } => {
-                let y = f32::from_bits(operand(&regs, io, b));
-                let z = f32::from_bits(operand(&regs, io, c));
-                let (y, z) = (if neg_b { -y } else { y }, if neg_c { -z } else { z });
-                regs.set(dst, sat(regs.f(a).mul_add(y, z), s).to_bits());
+                let v = self
+                    .regs
+                    .f(a)
+                    .mul_add(self.float(b, neg(neg_b)), self.float(c, neg(neg_c)));
+                self.set_f(dst, v, s);
             }
-            Inst::Ald {
+            Op::Fmnmx {
+                dst,
+                a,
+                a_mods,
+                b,
+                b_mods,
+                min,
+            } => {
+                let (x, y) = (reg_f(self, a, a_mods), self.float(b, b_mods));
+                // Like GLSL's NMin/NMax: a NaN input yields the other one.
+                let v = if self.pred(min) { x.min(y) } else { x.max(y) };
+                self.set_f(dst, v, false);
+            }
+            Op::Mufu {
+                dst,
+                func,
+                a,
+                mods,
+                sat: s,
+            } => {
+                let x = reg_f(self, a, mods);
+                let v = match func {
+                    MufuOp::Cos => x.cos(),
+                    MufuOp::Sin => x.sin(),
+                    MufuOp::Ex2 => x.exp2(),
+                    MufuOp::Lg2 => x.log2(),
+                    MufuOp::Rcp => 1.0 / x,
+                    MufuOp::Rsq => 1.0 / x.sqrt(),
+                    MufuOp::Sqrt => x.sqrt(),
+                };
+                self.set_f(dst, v, s);
+            }
+            Op::Rro { dst, src, mods } => {
+                let v = self.float(src, mods);
+                self.set_f(dst, v, false);
+            }
+            Op::Fsetp {
+                dst,
+                dst2,
+                cmp,
+                a,
+                a_mods,
+                b,
+                b_mods,
+                bop: o,
+                c,
+            } => {
+                let r = fcmp(cmp, reg_f(self, a, a_mods), self.float(b, b_mods));
+                let c = self.pred(c);
+                self.set_pred(dst, bop(o, r, c));
+                self.set_pred(dst2, bop(o, !r, c));
+            }
+            Op::Fset {
+                dst,
+                cmp,
+                a,
+                a_mods,
+                b,
+                b_mods,
+                bop: o,
+                c,
+                bf,
+            } => {
+                let r = bop(
+                    o,
+                    fcmp(cmp, reg_f(self, a, a_mods), self.float(b, b_mods)),
+                    self.pred(c),
+                );
+                self.regs.set(dst, set_value(r, bf));
+            }
+            Op::Isetp {
+                dst,
+                dst2,
+                cmp,
+                signed,
+                a,
+                b,
+                bop: o,
+                c,
+            } => {
+                let r = icmp(cmp, self.regs.get(a), self.operand(b), signed);
+                let c = self.pred(c);
+                self.set_pred(dst, bop(o, r, c));
+                self.set_pred(dst2, bop(o, !r, c));
+            }
+            Op::Iset {
+                dst,
+                cmp,
+                signed,
+                a,
+                b,
+                bop: o,
+                c,
+                bf,
+            } => {
+                let r = bop(
+                    o,
+                    icmp(cmp, self.regs.get(a), self.operand(b), signed),
+                    self.pred(c),
+                );
+                self.regs.set(dst, set_value(r, bf));
+            }
+            Op::Psetp {
+                dst,
+                dst2,
+                op1,
+                op2,
+                a,
+                b,
+                c,
+            } => {
+                let r = bop(op1, self.pred(a), self.pred(b));
+                let c = self.pred(c);
+                self.set_pred(dst, bop(op2, r, c));
+                self.set_pred(dst2, bop(op2, !r, c));
+            }
+            Op::Iadd {
+                dst,
+                a,
+                neg_a,
+                b,
+                neg_b,
+            } => {
+                let x = negate(self.regs.get(a), neg_a);
+                let y = negate(self.operand(b), neg_b);
+                self.regs.set(dst, x.wrapping_add(y));
+            }
+            Op::Iscadd {
+                dst,
+                a,
+                neg_a,
+                b,
+                neg_b,
+                shift,
+            } => {
+                let x = negate(self.regs.get(a), neg_a) << shift;
+                let y = negate(self.operand(b), neg_b);
+                self.regs.set(dst, x.wrapping_add(y));
+            }
+            Op::Shl { dst, a, b } => {
+                let s = self.operand(b);
+                let v = if s >= 32 { 0 } else { self.regs.get(a) << s };
+                self.regs.set(dst, v);
+            }
+            Op::Shr { dst, a, b, signed } => {
+                let (x, s) = (self.regs.get(a), self.operand(b));
+                let v = if signed {
+                    ((x as i32) >> s.min(31)) as u32
+                } else if s >= 32 {
+                    0
+                } else {
+                    x >> s
+                };
+                self.regs.set(dst, v);
+            }
+            Op::Lop {
+                dst,
+                op,
+                a,
+                inv_a,
+                b,
+                inv_b,
+            } => {
+                let x = if inv_a {
+                    !self.regs.get(a)
+                } else {
+                    self.regs.get(a)
+                };
+                let y = if inv_b {
+                    !self.operand(b)
+                } else {
+                    self.operand(b)
+                };
+                let v = match op {
+                    LopOp::And => x & y,
+                    LopOp::Or => x | y,
+                    LopOp::Xor => x ^ y,
+                    LopOp::PassB => y,
+                };
+                self.regs.set(dst, v);
+            }
+            Op::Imnmx {
+                dst,
+                a,
+                b,
+                signed,
+                min,
+            } => {
+                let (x, y) = (self.regs.get(a), self.operand(b));
+                let v = match (signed, self.pred(min)) {
+                    (true, true) => (x as i32).min(y as i32) as u32,
+                    (true, false) => (x as i32).max(y as i32) as u32,
+                    (false, true) => x.min(y),
+                    (false, false) => x.max(y),
+                };
+                self.regs.set(dst, v);
+            }
+            Op::Sel { dst, a, b, cond } => {
+                let v = if self.pred(cond) {
+                    self.regs.get(a)
+                } else {
+                    self.operand(b)
+                };
+                self.regs.set(dst, v);
+            }
+            Op::Xmad {
+                dst,
+                a,
+                a_hi,
+                a_signed,
+                b,
+                b_hi,
+                b_signed,
+                c,
+                mode,
+                psl,
+                mrg,
+            } => {
+                let v = xmad(
+                    self.regs.get(a),
+                    a_hi,
+                    a_signed,
+                    self.operand(b),
+                    b_hi,
+                    b_signed,
+                    self.operand(c),
+                    mode,
+                    psl,
+                    mrg,
+                );
+                self.regs.set(dst, v);
+            }
+            Op::F2i {
+                dst,
+                src,
+                mods,
+                signed,
+                round: r,
+            } => {
+                // Rust's float-to-int casts saturate and map NaN to 0.
+                let x = round(self.float(src, mods), r);
+                let v = if signed { x as i32 as u32 } else { x as u32 };
+                self.regs.set(dst, v);
+            }
+            Op::I2f {
+                dst,
+                src,
+                signed,
+                neg,
+                abs,
+            } => {
+                let x = self.operand(src);
+                let v = if signed {
+                    let i = x as i32 as i64;
+                    let i = if abs { i.abs() } else { i };
+                    (if neg { -i } else { i }) as f32
+                } else {
+                    let f = x as f32;
+                    if neg {
+                        -f
+                    } else {
+                        f
+                    }
+                };
+                self.set_f(dst, v, false);
+            }
+            Op::F2f {
+                dst,
+                src,
+                mods,
+                round: r,
+                sat: s,
+            } => {
+                let v = round(self.float(src, mods), r);
+                self.set_f(dst, v, s);
+            }
+            Op::Ald {
                 dst,
                 base,
                 addr,
                 count,
             } => {
-                let addr = addr + regs.get(base);
+                let addr = addr + self.regs.get(base);
                 for i in 0..count {
-                    let v = io.load_attr(addr + 4 * i);
-                    regs.set(dst.wrapping_add(i as u8), v);
+                    let v = self.io.load_attr(addr + 4 * i);
+                    self.regs.set(dst.wrapping_add(i as u8), v);
                 }
             }
-            Inst::Ast {
+            Op::Ast {
                 src,
                 base,
                 addr,
                 count,
             } => {
-                let addr = addr + regs.get(base);
+                let addr = addr + self.regs.get(base);
                 for i in 0..count {
-                    let v = regs.get(src.wrapping_add(i as u8));
-                    io.store_attr(addr + 4 * i, v);
+                    let v = self.regs.get(src.wrapping_add(i as u8));
+                    self.io.store_attr(addr + 4 * i, v);
                 }
             }
-            Inst::Ipa {
+            Op::Ipa {
                 dst,
                 addr,
                 mode,
                 sat: s,
             } => {
-                regs.set(dst, sat(io.interpolate(addr, mode), s).to_bits());
+                let v = self.io.interpolate(addr, mode);
+                self.set_f(dst, v, s);
             }
-            Inst::Nop => {}
-            Inst::Exit => break,
+            Op::Nop | Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {}
         }
     }
-    regs
+}
+
+fn negate(v: u32, on: bool) -> u32 {
+    if on {
+        v.wrapping_neg()
+    } else {
+        v
+    }
+}
+
+fn set_value(r: bool, bf: bool) -> u32 {
+    match (r, bf) {
+        (false, _) => 0,
+        (true, true) => 1.0f32.to_bits(),
+        (true, false) => u32::MAX,
+    }
+}
+
+/// Runs a program to its EXIT (or past its last instruction); returns
+/// the registers, or `None` if the invocation was discarded (KIL).
+pub fn run(program: &[Inst], io: &mut dyn ShaderIo) -> Option<Regs> {
+    let mut m = Machine {
+        regs: Regs([0; 256]),
+        preds: [false; 8],
+        io,
+    };
+    let mut ssy = Vec::with_capacity(SSY_DEPTH);
+    let mut pc = 0;
+    for _ in 0..STEP_LIMIT {
+        let Some(&inst) = program.get(pc) else { break };
+        pc += 1;
+        if !m.pred(inst.pred) {
+            continue;
+        }
+        match inst.op {
+            Op::Exit => break,
+            Op::Kil => return None,
+            Op::Bra { target } => pc = target,
+            Op::Ssy { target } => {
+                if ssy.len() == SSY_DEPTH {
+                    ssy.pop();
+                }
+                ssy.push(target);
+            }
+            Op::Sync => match ssy.pop() {
+                Some(t) => pc = t,
+                None => break,
+            },
+            op => m.exec(op),
+        }
+    }
+    Some(m.regs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{asm, decode::decode_program, HEADER_SIZE};
+    use super::*;
+
+    struct Inputs([f32; 4]);
+
+    impl ShaderIo for Inputs {
+        fn load_attr(&self, _: u32) -> u32 {
+            0
+        }
+        fn store_attr(&mut self, _: u32, _: u32) {}
+        fn interpolate(&self, addr: u32, _: IpaMode) -> f32 {
+            self.0[((addr - 0x80) / 4) as usize]
+        }
+        fn cbuf(&self, _: u8, _: u32) -> u32 {
+            0
+        }
+    }
+
+    fn colors(rgb: [f32; 3]) -> Option<[f32; 4]> {
+        let code = asm::control_flow_sample();
+        let program = decode_program(&code[HEADER_SIZE..]).unwrap();
+        let regs = run(&program, &mut Inputs([rgb[0], rgb[1], rgb[2], 1.0]))?;
+        Some([regs.f(0), regs.f(1), regs.f(2), regs.f(3)])
+    }
+
+    #[test]
+    fn branches_loops_and_discards() {
+        assert_eq!(
+            colors([0.8, 0.6, 0.2]),
+            Some([0.8, 0.6 * 0.25, 48.0 * (1.0 / 255.0), 0.75])
+        );
+        assert_eq!(
+            colors([0.3, 0.5, 0.1]),
+            Some([0.3, 0.5, 144.0 * (1.0 / 255.0), 0.25])
+        );
+        assert_eq!(colors([0.3, 0.1, 0.2]), None);
+    }
+
+    #[test]
+    fn integer_helpers() {
+        assert!(fcmp(7, 1.0, 2.0) && !fcmp(7, f32::NAN, 2.0));
+        assert!(fcmp(9, f32::NAN, 0.0) && fcmp(9, -1.0, 0.0) && !fcmp(1, f32::NAN, 0.0));
+        assert!(icmp(1, u32::MAX, 0, true) && !icmp(1, u32::MAX, 0, false));
+        // (0x1234 * 0x0002) + (0x5678 << 16) with CBCC, then merge.
+        assert_eq!(
+            xmad(
+                0x1234,
+                false,
+                false,
+                2,
+                false,
+                false,
+                0,
+                XmadMode::C,
+                false,
+                false
+            ),
+            0x2468
+        );
+        assert_eq!(
+            xmad(
+                0xABCD_0003,
+                true,
+                false,
+                0x0001_0002,
+                true,
+                false,
+                5,
+                XmadMode::C,
+                true,
+                false
+            ),
+            (0xABCD << 16) + 5
+        );
+        assert_eq!(
+            xmad(
+                0xFFFF,
+                false,
+                true,
+                3,
+                false,
+                false,
+                0,
+                XmadMode::C,
+                false,
+                false
+            ),
+            (-3i32) as u32
+        );
+        assert_eq!(
+            xmad(
+                2,
+                false,
+                false,
+                0x0007_0003,
+                false,
+                false,
+                1,
+                XmadMode::Cbcc,
+                false,
+                true
+            ),
+            (7) | 0x0003_0000
+        );
+    }
 }

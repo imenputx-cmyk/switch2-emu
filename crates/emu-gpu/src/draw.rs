@@ -444,7 +444,9 @@ fn rasterize(
                 persp,
                 frag: [px, py, z, inv_w],
             };
-            let regs = interp::run(&d.ps, &mut io);
+            let Some(regs) = interp::run(&d.ps, &mut io) else {
+                continue; // discarded
+            };
             // Outputs: enabled components of target 0 in r0, r1, ...
             let mut color = [0f32; 4];
             let mut next = 0u8;

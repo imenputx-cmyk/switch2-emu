@@ -549,7 +549,7 @@ fn plan(d: &Draw) -> Result<Plan, String> {
     // Attributes the vertex shader reads: generic i is location i.
     let mut read = [false; 32];
     for i in &d.vs {
-        if let emu_gpu::shader::decode::Inst::Ald { addr, count, .. } = *i {
+        if let emu_gpu::shader::decode::Op::Ald { addr, count, .. } = i.op {
             for k in 0..count {
                 let a = addr + 4 * k;
                 if (0x80..0x280).contains(&a) {
