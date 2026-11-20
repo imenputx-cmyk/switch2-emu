@@ -98,6 +98,8 @@ pub struct System {
     pub hid_sampling: u64,
     pub frames: Vec<Frame>,
     pub frames_presented: u64,
+    /// Switch 2 GPU memory (nx2:gpu and its sub-sessions share it).
+    pub nx2_gpu: nx2::GpuMemory,
 }
 
 impl System {

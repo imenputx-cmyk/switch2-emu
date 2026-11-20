@@ -189,7 +189,19 @@ impl Service for Syncpt {
                 }
                 self.slot_events.insert(slot, e);
             }
-            202 => {} // CancelSlotEvent
+            // CancelSlotEvent(slot): the SDK waits on the slot's event
+            // after a cancel, so it is signalled (Lichii).
+            202 => {
+                let slot = ctx.in_u32(0);
+                let e = self
+                    .slot_events
+                    .get(&slot)
+                    .copied()
+                    .flatten()
+                    .unwrap_or_else(|| ctx.kernel.new_event(false));
+                ctx.kernel.events[e] = true;
+                self.slot_events.insert(slot, Some(e));
+            }
             // QueryCounter(~syncpoint): the value (u64) and a zero word.
             103 => words(ctx, &[0, 0, 0]),
             _ => zeroed("syncpt", command, ctx),
@@ -198,22 +210,65 @@ impl Service for Syncpt {
     }
 }
 
-/// gsv 497: the GPU (nn::gpu::sdk).
+/// Switch 2 GPU memory, shared by the GPU session and its sub-sessions.
+/// The graphics server maps memory for the GPU itself: memory registered
+/// with sub 101 is used at GPU address == CPU address, 211/216 map it
+/// elsewhere, and 214 creates GPU-only regions the server backs (Lichii
+/// NX2_NOTES rows 27, 30, 40, 42).
 #[derive(Default)]
-pub struct Gpu {
-    id_events: HashMap<u32, Option<usize>>,
-    next_device: u32,
+pub struct GpuMemory {
+    /// Registered memory by handle: (address, size).
+    pub memories: HashMap<u32, (u64, u64)>,
+    next_handle: u32,
+    /// Job/id events (ids 0..32).
+    events: [Option<usize>; GPU_IDS as usize],
+    /// GPU-only regions: start -> (backing guest address, size).
+    regions: std::collections::BTreeMap<u64, (u64, u64)>,
+    /// Next free backing address for GPU-only regions.
+    backing_next: u64,
 }
 
-impl Gpu {
-    fn id_event(&mut self, id: u32, ctx: &mut Ctx) -> Option<usize> {
-        let mut e = self.id_events.get(&id).copied().flatten();
-        if e.is_none() {
-            e = Some(ctx.kernel.new_event(false));
-        }
-        self.id_events.insert(id, e);
-        e
+/// Ids (job slots) of the GPU session.
+const GPU_IDS: u32 = 32;
+
+/// Guest addresses past the 39-bit address space where GPU-only regions
+/// get their (lazily allocated) memory; the game never sees them.
+const GPU_ONLY_BACKING: u64 = 0x100_0000_0000;
+
+impl GpuMemory {
+    fn event(&mut self, id: u32, ctx: &mut Ctx) -> usize {
+        let slot = &mut self.events[(id % GPU_IDS) as usize];
+        *slot.get_or_insert_with(|| ctx.kernel.new_event(false))
     }
+
+    /// Completes a job: signals its slot's event.
+    fn complete(&mut self, slot: u32, ctx: &mut Ctx) {
+        let e = self.event(slot, ctx);
+        ctx.kernel.events[e] = true;
+    }
+
+    /// The backing of the GPU-only region containing `[va, va + size)`.
+    fn region_backing(&self, va: u64, size: u64) -> Option<u64> {
+        let (&start, &(backing, len)) = self.regions.range(..=va).next_back()?;
+        (va + size <= start + len).then_some(backing + (va - start))
+    }
+}
+
+/// gsv 497: the GPU (nn::gpu::sdk). Sub-sessions (22) are the same
+/// object; their state lives in [`GpuMemory`].
+#[derive(Default)]
+pub struct Gpu {
+    devices: [bool; 16],
+}
+
+/// A 64-bit value at data word `word` of a TIPC request (word 2 is the
+/// first data word, as Lichii numbers them).
+fn word64(ctx: &Ctx, word: usize) -> u64 {
+    ctx.in_u64((word - 2) * 4)
+}
+
+fn word32(ctx: &Ctx, word: usize) -> u32 {
+    ctx.in_u32((word - 2) * 4)
 }
 
 impl Service for Gpu {
@@ -222,30 +277,47 @@ impl Service for Gpu {
     }
 
     fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        let mut m = std::mem::take(&mut ctx.system.nx2_gpu);
+        let r = self.dispatch(command, ctx, &mut m);
+        ctx.system.nx2_gpu = m;
+        r
+    }
+}
+
+impl Gpu {
+    fn dispatch(
+        &mut self,
+        command: u32,
+        ctx: &mut Ctx,
+        m: &mut GpuMemory,
+    ) -> Result<(), CallError> {
         match command {
             0 => handshake(ctx),
-            11 => words(ctx, &[0, 31]), // GetIdRange (guessed): ids 0..=31
+            11 => words(ctx, &[0, GPU_IDS - 1]), // GetIdRange
             12 => {
                 // GetIdEvent(id)
-                let id = ctx.in_u32(0);
-                let e = self.id_event(id, ctx).expect("created");
+                let e = m.event(word32(ctx, 2), ctx);
                 ctx.push_copy(KObject::Event { id: e });
             }
-            21 => {
-                // Start(id): completes at once.
-                let id = ctx.in_u32(0);
-                let e = self.id_event(id, ctx).expect("created");
-                ctx.kernel.events[e] = true;
-            }
-            // OpenSubSession: memory jobs; a session of its own here.
+            // Start(id): nothing runs here, so it completes at once.
+            21 => m.complete(word32(ctx, 2), ctx),
             22 => ctx.push_session(obj(Gpu::default())),
             33 => words(ctx, &[1]),
             41 => {
-                // CreateGraphicsDevice(name, flags, label): a non-zero id.
-                self.next_device += 1;
-                words(ctx, &[self.next_device]);
+                // CreateGraphicsDevice(name, flags): a free id (1..).
+                let Some(id) = (1..self.devices.len()).find(|&i| !self.devices[i]) else {
+                    return Err(CallError::Result(crate::result::OUT_OF_RESOURCE));
+                };
+                self.devices[id] = true;
+                words(ctx, &[id as u32]);
             }
-            42 => {}
+            42 => {
+                let id = (word32(ctx, 2) & 0xFF) as usize;
+                if !self.devices.get(id).copied().unwrap_or(false) {
+                    return Err(CallError::Result(crate::result::NOT_FOUND));
+                }
+                self.devices[id] = false;
+            }
             // User partition [VA start, end); gsv partition empty (min >
             // max); VA range: kind 1, start, size.
             201 => words(
@@ -262,9 +334,131 @@ impl Service for Gpu {
                 ]
                 .concat(),
             ),
+            // CreateGpuAccessibleMemory(start, last): used at GPU address ==
+            // CPU address; the reply's handle names it in later jobs.
+            101 => {
+                let (start, last) = (word64(ctx, 2), word64(ctx, 4));
+                if last > start {
+                    ctx.system.gpu.map_shared(start, start, last - start + 1);
+                }
+                m.next_handle += 1;
+                let handle = m.next_handle;
+                m.memories
+                    .insert(handle, (start, last.wrapping_sub(start).wrapping_add(1)));
+                words(ctx, &[handle]);
+            }
+            // DestroyGpuAccessibleMemory(handle, slot).
+            102 => {
+                if let Some((addr, size)) = m.memories.remove(&word32(ctx, 2)) {
+                    ctx.system.gpu.unmap_shared(addr, size);
+                }
+                m.complete(word32(ctx, 3), ctx);
+            }
+            // NormalMapGpuMemory4K: words 3-4 first GPU address, 5-6 last,
+            // 7 memory handle, 8-9 offset into it, 17 the job slot.
+            211 => {
+                let (first, last) = (word64(ctx, 3), word64(ctx, 5));
+                let (handle, offset) = (word32(ctx, 7), word64(ctx, 8));
+                if let Some(&(addr, _)) = m.memories.get(&handle) {
+                    if last > first {
+                        ctx.system
+                            .gpu
+                            .map_shared(first, addr + offset, last - first + 1);
+                    }
+                } else if ctx.config.trace_unimplemented {
+                    eprintln!("[nx2] gpu 211: unknown memory handle {handle}");
+                }
+                m.complete(word32(ctx, 17), ctx);
+            }
+            // NormalModifyMemoryKind4K: kinds do not matter here; report
+            // the wanted kind (word 7), complete slot (word 10).
+            212 => {
+                let kind = word32(ctx, 7) & 0xFF;
+                m.complete(word32(ctx, 10), ctx);
+                words(ctx, &[kind]);
+            }
+            // NormalUnmapGpuMemory4K: words 3-6 the range, 8 the slot.
+            213 => {
+                let (first, last) = (word64(ctx, 3), word64(ctx, 5));
+                if last > first {
+                    unmap_or_back(ctx, m, first, last - first + 1);
+                }
+                m.complete(word32(ctx, 8), ctx);
+            }
+            // CreateSparseRegion (GPU-only memory): words 3-6 the range,
+            // 11 the slot. Backed by memory of our own, allocated as used.
+            214 => {
+                let (start, last) = (word64(ctx, 3), word64(ctx, 5));
+                if last > start {
+                    let size = (last - start + 1).next_multiple_of(0x1000);
+                    if m.backing_next == 0 {
+                        m.backing_next = GPU_ONLY_BACKING;
+                    }
+                    let backing = m.backing_next;
+                    m.backing_next += size.next_multiple_of(0x20_0000);
+                    let _ = ctx.mem.map(backing, size, emu_memory::Perm::RW);
+                    if let Some((old, old_size)) = m.regions.insert(start, (backing, size)) {
+                        let _ = ctx.mem.unmap(old, old_size);
+                    }
+                    ctx.system.gpu.map_shared(start, backing, size);
+                }
+                m.complete(word32(ctx, 11), ctx);
+            }
+            // DestroySparseRegion: words 3-6 the range, 8 the slot.
+            215 => {
+                let (first, last) = (word64(ctx, 3), word64(ctx, 5));
+                if let Some((backing, size)) = m.regions.remove(&first) {
+                    let _ = ctx.mem.unmap(backing, size);
+                }
+                if last > first {
+                    ctx.system.gpu.unmap_shared(first, last - first + 1);
+                }
+                m.complete(word32(ctx, 8), ctx);
+            }
+            // ExecuteSparseMapRequests: 40-byte requests in buffer A
+            // {GPU address, size, flags, kind, fallback kind, .., memory
+            // handle (0 unmaps), offset}; kinds back in buffer B; slot in
+            // word 14. Replies the count.
+            216 => {
+                let data = ctx.read_in_buffer(0)?;
+                let mut kinds = Vec::new();
+                for r in data.chunks_exact(40) {
+                    let u64_at = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
+                    let (va, size) = (u64_at(0), u64_at(8));
+                    let kind = r[19];
+                    let handle = u32::from_le_bytes(r[24..28].try_into().unwrap());
+                    let offset = u64_at(32);
+                    kinds.push(kind);
+                    if size == 0 {
+                        continue;
+                    }
+                    if handle == 0 {
+                        unmap_or_back(ctx, m, va, size);
+                    } else if let Some(&(addr, len)) = m.memories.get(&handle) {
+                        if offset <= len && size <= len - offset {
+                            ctx.system.gpu.map_shared(va, addr + offset, size);
+                        }
+                    }
+                }
+                if !kinds.is_empty() && ctx.out_buffer(0).is_some() {
+                    ctx.write_out_buffer(0, &kinds)?;
+                }
+                m.complete(word32(ctx, 14), ctx);
+                let n = kinds.len() as u64;
+                words(ctx, &split(n));
+            }
             _ => zeroed("gpu", command, ctx),
         }
         Ok(())
+    }
+}
+
+/// Unmaps a GPU range; inside a GPU-only region it shows the region's own
+/// memory again.
+fn unmap_or_back(ctx: &mut Ctx, m: &GpuMemory, va: u64, size: u64) {
+    match m.region_backing(va, size) {
+        Some(backing) => ctx.system.gpu.map_shared(va, backing, size),
+        None => ctx.system.gpu.unmap_shared(va, size),
     }
 }
 

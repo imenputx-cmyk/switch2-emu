@@ -147,6 +147,10 @@ pub struct Gpu {
     pub trace: bool,
     /// Carries out rendering work (software by default).
     pub backend: Box<dyn backend::Backend>,
+    /// Switch 2 mappings made through the graphics server, which apply to
+    /// every address space (also ones created later), in order:
+    /// (GPU address, guest address or None to unmap, size).
+    pub shared_maps: Vec<(u64, Option<u64>, u64)>,
 }
 
 impl Default for Gpu {
@@ -159,6 +163,7 @@ impl Default for Gpu {
             faults: Vec::new(),
             trace: false,
             backend: Box::new(backend::SoftwareBackend),
+            shared_maps: Vec::new(),
         }
     }
 }
@@ -173,8 +178,34 @@ pub mod submit_flags {
 
 impl Gpu {
     pub fn new_address_space(&mut self) -> usize {
-        self.address_spaces.push(AddressSpace::new());
+        let mut a = AddressSpace::new();
+        for &(va, cpu, size) in &self.shared_maps {
+            match cpu {
+                Some(cpu) => {
+                    a.map_over(va, cpu, size);
+                }
+                None => a.unmap_range(va, size),
+            }
+        }
+        self.address_spaces.push(a);
         self.address_spaces.len() - 1
+    }
+
+    /// Maps `[va, va + size)` to guest `cpu` in every address space (Switch
+    /// 2: memory the graphics server registered or mapped).
+    pub fn map_shared(&mut self, va: u64, cpu: u64, size: u64) {
+        for a in &mut self.address_spaces {
+            a.map_over(va, cpu, size);
+        }
+        self.shared_maps.push((va, Some(cpu), size));
+    }
+
+    /// Unmaps `[va, va + size)` in every address space.
+    pub fn unmap_shared(&mut self, va: u64, size: u64) {
+        for a in &mut self.address_spaces {
+            a.unmap_range(va, size);
+        }
+        self.shared_maps.push((va, None, size));
     }
 
     pub fn new_channel(&mut self) -> usize {
@@ -410,6 +441,7 @@ impl Gpu {
             faults,
             trace,
             backend,
+            ..
         } = self;
         let mut ctx = EngineCtx {
             guest: backend::GuestMemory {
@@ -726,5 +758,29 @@ mod tests {
         let mut b = [0u8; 4];
         mem.read(0x100_8010, &mut b).unwrap();
         assert_eq!(u32::from_le_bytes(b), 7);
+    }
+
+    #[test]
+    fn shared_mappings_reach_every_address_space() {
+        let mut gpu = Gpu::default();
+        let a = gpu.new_address_space();
+        // Registered memory at GPU == CPU, then part of it mapped elsewhere.
+        gpu.map_shared(0x1000_0000, 0x1000_0000, 0x10_000);
+        gpu.map_shared(0x2000_0000, 0x1000_4000, 0x2000);
+        let b = gpu.new_address_space();
+        for asid in [a, b] {
+            let s = &gpu.address_spaces[asid];
+            assert_eq!(s.translate(0x1000_8000), Some(0x1000_8000));
+            assert_eq!(s.translate(0x2000_1000), Some(0x1000_5000));
+        }
+        // Unmapping the middle splits the first mapping.
+        gpu.unmap_shared(0x1000_4000, 0x4000);
+        let c = gpu.new_address_space();
+        for asid in [a, b, c] {
+            let s = &gpu.address_spaces[asid];
+            assert_eq!(s.translate(0x1000_3FFC), Some(0x1000_3FFC));
+            assert_eq!(s.translate(0x1000_5000), None);
+            assert_eq!(s.translate(0x1000_8000), Some(0x1000_8000));
+        }
     }
 }

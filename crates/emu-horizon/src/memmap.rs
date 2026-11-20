@@ -34,6 +34,8 @@ pub const PERM_X: u32 = 4;
 /// MemoryAttribute bits.
 pub const ATTR_LOCKED: u32 = 1;
 pub const ATTR_UNCACHED: u32 = 8;
+/// Switch 2: memory the GPU may access (svc 0x80).
+pub const ATTR_GPU_ACCESSIBLE: u32 = 0x20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Block {

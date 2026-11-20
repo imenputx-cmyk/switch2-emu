@@ -128,6 +128,52 @@ impl AddressSpace {
     }
 
     /// Removes the mapping that starts at `va`.
+    /// Removes whatever is mapped in `[va, va + size)`, splitting mappings
+    /// that cross its ends.
+    pub fn unmap_range(&mut self, va: u64, size: u64) {
+        let end = va.saturating_add(size);
+        let hit: Vec<(u64, Mapping)> = self
+            .mappings
+            .range(..end)
+            .rev()
+            .take_while(|(&s, m)| s + m.size > va)
+            .map(|(&s, &m)| (s, m))
+            .collect();
+        for (s, m) in hit {
+            self.mappings.remove(&s);
+            if s < va {
+                self.mappings.insert(
+                    s,
+                    Mapping {
+                        size: va - s,
+                        cpu: m.cpu,
+                    },
+                );
+            }
+            let m_end = s + m.size;
+            if m_end > end {
+                self.mappings.insert(
+                    end,
+                    Mapping {
+                        size: m_end - end,
+                        cpu: m.cpu + (end - s),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Maps `[va, va + size)` to guest `cpu`, replacing what was there
+    /// (Switch 2 maps through the graphics server, not reservations).
+    pub fn map_over(&mut self, va: u64, cpu: u64, size: u64) -> bool {
+        if size == 0 || va.saturating_add(size) > VA_LIMIT {
+            return false;
+        }
+        self.unmap_range(va, size);
+        self.mappings.insert(va, Mapping { size, cpu });
+        true
+    }
+
     pub fn unmap(&mut self, va: u64) -> Option<Mapping> {
         self.mappings.remove(&va)
     }

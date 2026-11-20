@@ -24,7 +24,10 @@ use emu_loader::nro::parse_nro;
 use emu_loader::LoadError;
 use emu_memory::{Memory, Perm};
 use handles::{HandleTable, KObject, CURRENT_PROCESS};
-use memmap::{Block, MemState, MemoryMap, ATTR_LOCKED, ATTR_UNCACHED, PERM_R, PERM_W, PERM_X};
+use memmap::{
+    Block, MemState, MemoryMap, ATTR_GPU_ACCESSIBLE, ATTR_LOCKED, ATTR_UNCACHED, PERM_R, PERM_W,
+    PERM_X,
+};
 use result::*;
 
 const PAGE: u64 = 0x1000;
@@ -835,6 +838,7 @@ impl Horizon {
             0x34 => self.svc_wait_for_address(),
             0x35 => self.svc_signal_to_address(),
             0x2A | 0x2B => self.ret(SUCCESS), // Cache flushes: memory is coherent.
+            0x80 => self.svc_set_gpu_memory_attribute(),
             _ => return Err(Stop::UnimplementedSvc { id, pc }),
         }
         Ok(())
@@ -904,12 +908,32 @@ impl Horizon {
         // the SDK makes its relocated read-only data read-only after
         // relocation).
         if !self.map.all(addr, size, |b| {
-            matches!(b.state, MemState::Heap | MemState::CodeMutable) && b.attr == 0
+            matches!(b.state, MemState::Heap | MemState::CodeMutable)
+                && b.attr & !ATTR_GPU_ACCESSIBLE == 0
         }) {
             return self.ret(INVALID_MEMORY_STATE);
         }
         self.map.update(addr, size, |b| b.perm = perm);
         self.set_host_perm(addr, size, perm);
+        self.ret(SUCCESS);
+    }
+
+    /// Switch 2 svc 0x80 (address, size, mask, attr): sets or clears the
+    /// "GPU accessible" attribute (0x20) before memory is registered with
+    /// the GPU (Lichii svc.cpp). Same checks as SetMemoryAttribute.
+    fn svc_set_gpu_memory_attribute(&mut self) {
+        let (addr, size, mask, value) = (self.x(0), self.x(1), self.x(2) as u32, self.x(3) as u32);
+        if let Some(err) = Self::page_range_ok(addr, size) {
+            return self.ret(err);
+        }
+        if (mask | value) & !ATTR_GPU_ACCESSIBLE != 0 || value & !mask != 0 {
+            return self.ret(INVALID_COMBINATION);
+        }
+        if !self.map.all(addr, size, |b| b.state != MemState::Free) {
+            return self.ret(INVALID_MEMORY_STATE);
+        }
+        self.map
+            .update(addr, size, |b| b.attr = (b.attr & !mask) | value);
         self.ret(SUCCESS);
     }
 
