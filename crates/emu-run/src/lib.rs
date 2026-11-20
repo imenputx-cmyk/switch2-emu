@@ -344,6 +344,7 @@ pub fn run_program_presenting(
     ) {
         eprintln!("[emu-run] stopped: {stop:?}");
         eprintln!("[emu-run] at: {}", hos.status());
+        eprintln!("{}", hos.dump());
     }
     Ok(HomebrewResult {
         stop,

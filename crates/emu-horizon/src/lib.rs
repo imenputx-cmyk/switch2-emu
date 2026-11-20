@@ -143,6 +143,8 @@ pub struct Horizon {
     pub modules: Vec<(u64, u64)>,
     /// The last SVCs: (id, pc).
     pub recent_svcs: std::collections::VecDeque<(u16, u64)>,
+    /// The last QueryMemory calls: (address, base, size, state).
+    pub recent_queries: std::collections::VecDeque<(u64, u64, u64, u32)>,
     pub mem: Memory,
     pub cpu: Cpu,
     pub map: MemoryMap,
@@ -189,6 +191,7 @@ impl Horizon {
             heartbeat: false,
             modules: Vec::new(),
             recent_svcs: Default::default(),
+            recent_queries: Default::default(),
             mem: Memory::new(),
             cpu: Cpu::new(),
             map: MemoryMap::new(),
@@ -451,6 +454,36 @@ impl Horizon {
             for (id, pc) in &self.recent_svcs {
                 s += &format!(" {id:#x}@{pc:#x}");
             }
+        }
+        s
+    }
+
+    /// Registers, code around PC and LR, and recent memory queries, for
+    /// reports when a program gets stuck.
+    pub fn dump(&self) -> String {
+        let mut s = String::new();
+        for i in 0..31u8 {
+            s += &format!(
+                "x{i}={:#x}{}",
+                self.cpu.read_xzr(i),
+                if i % 4 == 3 { "\n" } else { " " }
+            );
+        }
+        s += &format!(" sp={:#x}\n", self.cpu.read_sp(31));
+        for (name, at) in [("pc", self.cpu.pc()), ("lr", self.cpu.read_xzr(30))] {
+            s += &format!("code at {name} {}:", self.locate(at));
+            let start = (at & !3).saturating_sub(0x40);
+            for k in 0..32u64 {
+                let a = start + 4 * k;
+                match self.mem.read_uint(a, 4) {
+                    Ok(w) => s += &format!("{}{w:08x}", if k % 8 == 0 { "\n  " } else { " " }),
+                    Err(_) => s += " ????????",
+                }
+            }
+            s += "\n";
+        }
+        for (addr, base, size, state) in &self.recent_queries {
+            s += &format!("query {addr:#x} -> base {base:#x} size {size:#x} state {state:#x}\n");
         }
         s
     }
@@ -869,6 +902,11 @@ impl Horizon {
     fn svc_query_memory(&mut self) {
         let (out, addr) = (self.x(0), self.x(2));
         let info = self.map.query(addr);
+        if self.recent_queries.len() == 8 {
+            self.recent_queries.pop_front();
+        }
+        self.recent_queries
+            .push_back((addr, info.base, info.size, info.state as u32));
         match self.mem.write(out, &info.to_bytes()) {
             Ok(()) => {
                 self.ret(SUCCESS);
