@@ -204,6 +204,25 @@ impl Gpu {
         self.shared_maps.push((va, Some(cpu), size));
     }
 
+    /// Work done so far: (draws, compute grids run, compute grids
+    /// skipped), over every channel.
+    pub fn stats(&self) -> (u64, u64, u64) {
+        let mut out = (0, 0, 0);
+        for ch in &self.channels {
+            for e in ch.subchannels.iter().flatten() {
+                match e {
+                    Engine::ThreeD(e) => out.0 += e.draws,
+                    Engine::Compute(c) => {
+                        out.1 += c.dispatches;
+                        out.2 += c.skipped;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
     /// The CPU address of GPU address `va` under the shared mappings (the
     /// latest mapping covering it wins).
     pub fn shared_translate(&self, va: u64) -> Option<u64> {

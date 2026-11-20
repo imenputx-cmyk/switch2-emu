@@ -103,6 +103,10 @@ pub struct System {
     pub hid_sampling: u64,
     pub frames: Vec<Frame>,
     pub frames_presented: u64,
+    /// GPU errors seen (method faults, untranslatable shaders...), and the
+    /// latest one.
+    pub gpu_faults: u64,
+    pub last_gpu_fault: Option<String>,
     /// Events signalled every emulated vblank (60 Hz of guest time).
     pub vblank_events: Vec<usize>,
     /// Events signalled every audio frame (5 ms of guest time): the audio
@@ -120,6 +124,17 @@ pub struct System {
 }
 
 impl System {
+    /// Counts (and with `print`, prints) the GPU's new faults.
+    pub fn note_gpu_faults(&mut self, print: bool) {
+        for f in self.gpu.faults.drain(..) {
+            if print || self.gpu_faults < 16 {
+                eprintln!("[gpu] {f}");
+            }
+            self.gpu_faults += 1;
+            self.last_gpu_fault = Some(f);
+        }
+    }
+
     pub fn present(&mut self, frame: Frame) {
         self.frames_presented += 1;
         match self.on_present.as_mut() {

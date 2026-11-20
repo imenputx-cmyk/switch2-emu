@@ -841,7 +841,24 @@ impl Service for Vi2 {
                     // (5), flags (6).
                     let (image, shown, flags) = (ctx.in_u32(12), ctx.in_u32(20), ctx.in_u32(24));
                     match composite(ctx, image, shown, flags) {
-                        Some(frame) => ctx.system.present(frame),
+                        Some(frame) => {
+                            if self.presents <= 3 || self.presents.is_multiple_of(600) {
+                                let lit = frame
+                                    .rgba
+                                    .chunks_exact(4)
+                                    .filter(|p| p[0] | p[1] | p[2] != 0)
+                                    .count();
+                                let total = (frame.width * frame.height).max(1) as usize;
+                                eprintln!(
+                                    "[nx2] present #{}: image {image}, {}x{}, {}% of pixels not black",
+                                    self.presents,
+                                    frame.width,
+                                    frame.height,
+                                    lit * 100 / total
+                                );
+                            }
+                            ctx.system.present(frame)
+                        }
                         None if self.presents <= 3 => {
                             eprintln!("[nx2] vi2 present: image {image} not found or unmapped")
                         }

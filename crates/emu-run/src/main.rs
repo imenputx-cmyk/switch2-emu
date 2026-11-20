@@ -55,7 +55,7 @@ fn real_main() -> ExitCode {
     }
     let Some(path) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
         eprintln!(
-            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan] [--keys=prod.keys] [--auto-stub] [--cpu=interp] [--gdb[=PORT]] [--debug[=start]] <program.elf | homebrew.nro | game.nso | exefs-dir | game.nsp | game.xci>\n\
+            "usage: emu-run [--trace-svc] [--sdmc=DIR] [--frames=DIR] [--steps=N] [--gpu=vulkan|software] [--keys=prod.keys] [--auto-stub] [--cpu=interp] [--gdb[=PORT]] [--debug[=start]] <program.elf | homebrew.nro | game.nso | exefs-dir | game.nsp | game.xci>\n\
              (built with --features window, frames are shown in a window unless --frames is given)"
         );
         return ExitCode::from(2);
@@ -84,10 +84,12 @@ fn real_main() -> ExitCode {
             trace_unimplemented: trace,
             auto_stub: args.iter().any(|a| a == "--auto-stub"),
             romfs: None,
-            gpu_backend: if args.iter().any(|a| a == "--gpu=vulkan") {
-                emu_horizon::services::GpuBackend::Vulkan
-            } else {
+            // Vulkan by default (falling back to software rendering when
+            // no device is found); --gpu=software forces the latter.
+            gpu_backend: if args.iter().any(|a| a == "--gpu=software") {
                 emu_horizon::services::GpuBackend::Software
+            } else {
+                emu_horizon::services::GpuBackend::Vulkan
             },
         };
         let dump_frames = args.iter().any(|a| a.starts_with("--frames="));

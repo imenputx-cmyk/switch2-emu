@@ -581,6 +581,11 @@ impl Horizon {
                 s += &format!(" {id:#x}@{pc:#x}");
             }
         }
+        let (draws, grids, skipped) = self.system.gpu.stats();
+        s += &format!(
+            "; frames {}, draws {draws}, compute {grids} (skipped {skipped}), GPU errors {}",
+            self.system.frames_presented, self.system.gpu_faults
+        );
         if let Some((objects, timeout)) = &self.last_wait {
             s += &format!("; last wait: [{}] timeout {timeout}", objects.join(", "));
         }
@@ -700,6 +705,10 @@ impl Horizon {
                     // GPU channels waiting on a semaphore the CPU releases.
                     if self.system.gpu.has_stalled() {
                         self.system.gpu.poll(&mut self.mem);
+                    }
+                    if !self.system.gpu.faults.is_empty() {
+                        let print = self.config.trace_unimplemented;
+                        self.system.note_gpu_faults(print);
                     }
                     let pc = self.cpu.pc();
                     if self.mem.read_uint(pc, 4) == Ok(0x1400_0000) && self.threads.len() == 1 {

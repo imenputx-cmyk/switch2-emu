@@ -321,9 +321,13 @@ pub fn run_program_presenting(
     let mut hos = emu_horizon::Horizon::new();
     hos.system.on_present = on_present;
     if config.gpu_backend == emu_horizon::services::GpuBackend::Vulkan {
-        let vk = emu_gpu_vk::VulkanBackend::new().map_err(RunError::Gpu)?;
-        eprintln!("[emu-run] Vulkan device: {}", vk.device_name);
-        hos.system.gpu.backend = Box::new(vk);
+        match emu_gpu_vk::VulkanBackend::new() {
+            Ok(vk) => {
+                eprintln!("[emu-run] Vulkan device: {}", vk.device_name);
+                hos.system.gpu.backend = Box::new(vk);
+            }
+            Err(e) => eprintln!("[emu-run] no Vulkan ({e}); rendering in software"),
+        }
     }
     hos.trace_svcs = trace_svcs;
     hos.config = config;

@@ -351,11 +351,7 @@ pub fn channel(ch: usize, kind: u32, nr: u32, data: &mut [u8], extra: &[u8], ctx
                 .system
                 .gpu
                 .submit_with_increment(ch, &entries, flags, increment, ctx.mem);
-            for f in ctx.system.gpu.faults.drain(..) {
-                if ctx.config.trace_unimplemented {
-                    eprintln!("[gpu] fault: {f}");
-                }
-            }
+            ctx.system.note_gpu_faults(ctx.config.trace_unimplemented);
             put(data, 16, &id.to_le_bytes());
             put(data, 20, &value.to_le_bytes());
             NV_SUCCESS
