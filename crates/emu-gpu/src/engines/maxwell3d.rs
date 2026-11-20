@@ -6,6 +6,7 @@
 
 use super::inline::InlineToMemory;
 use super::mme::{self, MacroTarget};
+use super::mme64::{self, Mme64Target};
 use super::{bits, EngineCtx};
 use crate::backend::{Layout, Rect, Surface};
 use crate::draw::{
@@ -41,6 +42,14 @@ mod reg {
     pub const REPORT_SEMAPHORE_C: u32 = 0x1B08;
     pub const REPORT_SEMAPHORE_D: u32 = 0x1B0C;
     pub const MACRO_CALLS: u32 = 0x3800;
+    /// Ampere (Turing+) macro memory access: a GPU address (A: high bits,
+    /// B: low), a data RAM word index, and DMA reads of N words into the
+    /// data RAM or into the running macro's load FIFO.
+    pub const MME_MEM_ADDRESS_A: u32 = 0x550;
+    pub const MME_MEM_ADDRESS_B: u32 = 0x554;
+    pub const MME_DATA_RAM_ADDRESS: u32 = 0x558;
+    pub const MME_DMA_READ: u32 = 0x55C;
+    pub const MME_DMA_READ_FIFOED: u32 = 0x560;
     pub const VIEWPORT_SCALE_X: u32 = 0xA00; // scale x, y, z, offset x, y, z
     pub const VERTEX_ARRAY_START: u32 = 0xD74;
     pub const DRAW_VERTEX_ARRAY: u32 = 0xD78;
@@ -110,6 +119,46 @@ pub struct Maxwell3D {
     programs: std::collections::HashMap<u64, (Header, Vec<Inst>)>,
     /// Draws executed (for diagnostics and tests).
     pub draws: u64,
+    /// Bound as the Ampere 3D class: macros are MME64 code.
+    ampere: bool,
+    /// MME64 code (three words per instruction) and the upload position.
+    pub mme64_code: Vec<u32>,
+    mme64_write: usize,
+    /// MME64 data RAM.
+    pub data_ram: Vec<u32>,
+}
+
+/// Words a single MME DMA read may fetch.
+const MME_DMA_MAX: u32 = 0x1000;
+
+/// Lets a running MME64 macro write methods into the engine.
+struct Target64<'e, 'c, 'm> {
+    engine: &'e mut Maxwell3D,
+    ctx: &'c mut EngineCtx<'m>,
+    unhandled: Vec<(u32, u32)>,
+}
+
+impl Mme64Target for Target64<'_, '_, '_> {
+    fn read(&mut self, method: u32) -> u32 {
+        self.engine.regs.get(method as usize).copied().unwrap_or(0)
+    }
+
+    fn emit(&mut self, method: u32, value: u32, fifo: &mut Vec<u32>) -> bool {
+        if method * 4 >= reg::MACRO_CALLS {
+            return false;
+        }
+        if method * 4 == reg::MME_DMA_READ_FIFOED {
+            self.engine.regs[method as usize] = value;
+            fifo.extend(self.engine.dma_read(value, self.ctx));
+        } else if !self.engine.write_method(method, value, self.ctx) {
+            self.unhandled.push((method * 4, value));
+        }
+        true
+    }
+
+    fn data_ram(&mut self) -> &mut [u32] {
+        &mut self.engine.data_ram
+    }
 }
 
 /// Lets a running macro write methods into the engine.
@@ -148,11 +197,47 @@ impl Default for Maxwell3D {
             cbufs: [[None; CBUF_SLOTS]; 5],
             programs: Default::default(),
             draws: 0,
+            ampere: false,
+            mme64_code: Vec::new(),
+            mme64_write: 0,
+            data_ram: Vec::new(),
         }
     }
 }
 
 impl Maxwell3D {
+    /// The engine bound as the Switch 2 (Ampere) 3D class.
+    pub fn ampere() -> Self {
+        Maxwell3D {
+            ampere: true,
+            mme64_code: vec![0; 0x8000],
+            data_ram: vec![0; 0xC00],
+            ..Self::default()
+        }
+    }
+
+    /// The class this engine was bound as.
+    pub fn class(&self) -> u32 {
+        if self.ampere {
+            crate::class::AMPERE_THREED
+        } else {
+            crate::class::THREED
+        }
+    }
+
+    /// Reads `count` words for an MME DMA read from the address in
+    /// MME_MEM_ADDRESS_A/B.
+    fn dma_read(&mut self, count: u32, ctx: &mut EngineCtx) -> Vec<u32> {
+        let va = (u64::from(self.reg(reg::MME_MEM_ADDRESS_A) & 0x1FF_FFFF) << 32)
+            | u64::from(self.reg(reg::MME_MEM_ADDRESS_B));
+        let mut bytes = vec![0u8; count.min(MME_DMA_MAX) as usize * 4];
+        ctx.read(va, &mut bytes);
+        bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect()
+    }
+
     /// A register by byte offset.
     pub fn reg(&self, offset: u32) -> u32 {
         self.regs.get(offset as usize / 4).copied().unwrap_or(0)
@@ -183,10 +268,46 @@ impl Maxwell3D {
         }
         if last {
             if let Some((index, params)) = self.pending_call.take() {
-                self.call_macro(index, &params, ctx, unhandled);
+                if self.ampere {
+                    self.call_macro64(index, params, ctx, unhandled);
+                } else {
+                    self.call_macro(index, &params, ctx, unhandled);
+                }
             }
         }
         true
+    }
+
+    fn call_macro64(
+        &mut self,
+        index: usize,
+        mut params: Vec<u32>,
+        ctx: &mut EngineCtx,
+        unhandled: &mut Vec<(u32, u32)>,
+    ) {
+        let Some(&start) = self.mme_starts.get(index) else {
+            ctx.faults.push(format!("macro {index} out of range"));
+            return;
+        };
+        let code = std::mem::take(&mut self.mme64_code);
+        let mut target = Target64 {
+            engine: self,
+            ctx,
+            unhandled: Vec::new(),
+        };
+        let result = mme64::execute(&code, start, &mut params, &mut target);
+        let Target64 {
+            unhandled: u, ctx, ..
+        } = target;
+        unhandled.extend(u);
+        if let Err(e) = result {
+            ctx.faults.push(format!(
+                "MME64 macro {index} at {start:#x}: {} (pc {:#x})",
+                e.message, e.pc
+            ));
+        }
+        self.mme64_code = code;
+        self.macro_calls += 1;
     }
 
     fn call_macro(
@@ -229,6 +350,35 @@ impl Maxwell3D {
             return self.inline.write(method, value, ctx);
         }
         self.regs[method as usize] = value;
+        if self.ampere {
+            match offset {
+                reg::MME_INSTRUCTION_RAM_POINTER => {
+                    self.mme64_write = (value as usize * 3).min(self.mme64_code.len());
+                    return true;
+                }
+                reg::MME_INSTRUCTION_RAM => {
+                    if let Some(slot) = self.mme64_code.get_mut(self.mme64_write) {
+                        *slot = value;
+                        self.mme64_write += 1;
+                    }
+                    return true;
+                }
+                reg::MME_MEM_ADDRESS_A | reg::MME_MEM_ADDRESS_B | reg::MME_DATA_RAM_ADDRESS => {
+                    return true;
+                }
+                reg::MME_DMA_READ => {
+                    let words = self.dma_read(value, ctx);
+                    let base = self.reg(reg::MME_DATA_RAM_ADDRESS) as usize;
+                    for (i, w) in words.into_iter().enumerate() {
+                        if let Some(slot) = self.data_ram.get_mut(base + i) {
+                            *slot = w;
+                        }
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match offset {
             reg::MME_INSTRUCTION_RAM => {
                 let p = self.reg(reg::MME_INSTRUCTION_RAM_POINTER);

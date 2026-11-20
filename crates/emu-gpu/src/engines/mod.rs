@@ -4,6 +4,7 @@ pub mod copy;
 pub mod inline;
 pub mod maxwell3d;
 pub mod mme;
+pub mod mme64;
 
 use crate::backend::{Backend, GuestMemory};
 

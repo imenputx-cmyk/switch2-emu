@@ -37,12 +37,20 @@ pub mod class {
     pub const GPFIFO: u32 = 0xB06F;
     pub const INLINE_TO_MEMORY: u32 = 0xA140;
     pub const DMA_COPY: u32 = 0xB0B5;
+    /// Switch 2 (Ampere, GA10B-class) equivalents. Their method layouts
+    /// extend the Maxwell ones, so they run on the same engines (as in
+    /// Lichii); the 3D class uses the Turing+ macro ISA (MME64).
+    pub const AMPERE_THREED: u32 = 0xC797;
+    pub const AMPERE_COMPUTE: u32 = 0xC7C0;
+    pub const AMPERE_DMA_COPY: u32 = 0xC7B5;
+    pub const AMPERE_GPFIFO: u32 = 0xC76F;
 }
 
 /// An engine bound to a subchannel.
 pub enum Engine {
     ThreeD(Box<Maxwell3D>),
-    Copy(Box<CopyEngine>),
+    /// A copy engine and the class it was bound as.
+    Copy(Box<CopyEngine>, u32),
     Inline(InlineToMemory),
     /// A class that is bound but not emulated yet; methods are recorded
     /// as unimplemented.
@@ -53,7 +61,8 @@ impl Engine {
     fn new(class: u32) -> Engine {
         match class {
             class::THREED => Engine::ThreeD(Box::default()),
-            class::DMA_COPY => Engine::Copy(Box::default()),
+            class::AMPERE_THREED => Engine::ThreeD(Box::new(Maxwell3D::ampere())),
+            class::DMA_COPY | class::AMPERE_DMA_COPY => Engine::Copy(Box::default(), class),
             class::INLINE_TO_MEMORY => Engine::Inline(InlineToMemory::default()),
             c => Engine::Other(c),
         }
@@ -61,8 +70,8 @@ impl Engine {
 
     pub fn class(&self) -> u32 {
         match self {
-            Engine::ThreeD(_) => class::THREED,
-            Engine::Copy(_) => class::DMA_COPY,
+            Engine::ThreeD(e) => e.class(),
+            Engine::Copy(_, c) => *c,
             Engine::Inline(_) => class::INLINE_TO_MEMORY,
             Engine::Other(c) => *c,
         }
@@ -284,9 +293,15 @@ impl Gpu {
             backend: backend.as_mut(),
         };
         let mut from_macros = Vec::new();
-        let handled = match channels[channel].subchannels[subchannel].as_mut() {
+        // NVN2 writes inline-to-memory methods on subchannel 2 without
+        // binding a class first (Lichii NX2_NOTES row 49).
+        let slot = &mut channels[channel].subchannels[subchannel];
+        if slot.is_none() && subchannel == 2 {
+            *slot = Some(Engine::Inline(InlineToMemory::default()));
+        }
+        let handled = match slot.as_mut() {
             Some(Engine::ThreeD(e)) => e.write(method, value, last, &mut ctx, &mut from_macros),
-            Some(Engine::Copy(e)) => e.write(method, value, &mut ctx),
+            Some(Engine::Copy(e, _)) => e.write(method, value, &mut ctx),
             Some(Engine::Inline(e)) => e.write(method, value, &mut ctx),
             Some(Engine::Other(_)) | None => false,
         };
@@ -446,5 +461,54 @@ mod tests {
         assert_eq!(e.reg(0x0d80), 2);
         assert_eq!(e.reg(0x0d84), 3);
         assert_eq!(e.reg(0x0d88), 5);
+    }
+
+    #[test]
+    fn ampere_3d_runs_mme64_macros() {
+        use engines::mme64::asm::{inst, Lane, LOAD0, NOP, ZERO};
+        let (mut gpu, mut mem) = setup();
+        // Macro: r0 = load + 1; write it to 3D method 0xd80/4 (lane 1 imm),
+        // then also DMA-read a word into the data RAM via MME_DMA_READ.
+        let mut first = inst(
+            false,
+            0,
+            0,
+            [
+                Lane {
+                    op: 0,
+                    dst: 0,
+                    src_a: LOAD0,
+                    src_b: 25,
+                    imm: 1,
+                    out_method: 6,
+                    out_emit: 1,
+                },
+                Lane {
+                    imm: 0x0d80 / 4,
+                    ..NOP
+                },
+            ],
+        );
+        first[2] |= 1; // end
+        let second = inst(false, 0, 0, [NOP, Lane { dst: ZERO, ..NOP }]);
+        let mut words = vec![incr(0, 0, 1), class::AMPERE_THREED];
+        // Upload: instruction pointer 0, six code words; start 0 at index 0.
+        words.extend([incr(0, 0x114, 1), 0, (3 << 29) | (6 << 16) | (0x118 / 4)]);
+        words.extend(first);
+        words.extend(second);
+        words.extend([incr(0, 0x11C, 2), 0, 0]);
+        // Data for the DMA read, at GPU 0x1000_9000.
+        mem.write(0x100_9000, &0xABCD_u32.to_le_bytes()).unwrap();
+        words.extend([incr(0, 0x550, 4), 0, 0x1000_9000, 3, 1]);
+        // Call macro 0 with parameter 41, then write subchannel 2 unbound.
+        words.extend([incr(0, 0x3800, 1), 41, incr(2, 0x180, 1), 4]);
+        run(&mut gpu, &mut mem, &words);
+        let Some(Engine::ThreeD(e)) = &gpu.channels[0].subchannels[0] else {
+            panic!()
+        };
+        assert_eq!(e.class(), class::AMPERE_THREED);
+        assert_eq!(e.reg(0x0d80), 42);
+        assert_eq!(e.data_ram[3], 0xABCD);
+        assert_eq!(e.macro_calls, 1);
     }
 }
