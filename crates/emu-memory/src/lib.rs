@@ -82,7 +82,9 @@ pub enum MapError {
 }
 
 struct Page {
-    data: Box<[u8; PAGE_SIZE as usize]>,
+    /// Allocated on the first write: untouched pages read as zero. Switch 2
+    /// games map gigabytes of heap and use a fraction of it.
+    data: Option<Box<[u8; PAGE_SIZE as usize]>>,
     perm: Perm,
 }
 
@@ -117,13 +119,7 @@ impl Memory {
         }
         let first = addr >> PAGE_BITS;
         for i in 0..(size >> PAGE_BITS) {
-            self.pages.insert(
-                first + i,
-                Page {
-                    data: Box::new([0; PAGE_SIZE as usize]),
-                    perm,
-                },
-            );
+            self.pages.insert(first + i, Page { data: None, perm });
         }
         Ok(())
     }
@@ -232,7 +228,10 @@ impl Memory {
             let off = (a & PAGE_MASK) as usize;
             let n = (PAGE_SIZE as usize - off).min(buf.len() - done);
             let page = &self.pages[&(a >> PAGE_BITS)];
-            buf[done..done + n].copy_from_slice(&page.data[off..off + n]);
+            match &page.data {
+                Some(d) => buf[done..done + n].copy_from_slice(&d[off..off + n]),
+                None => buf[done..done + n].fill(0),
+            }
             done += n;
         }
     }
@@ -263,7 +262,10 @@ impl Memory {
             let off = (a & PAGE_MASK) as usize;
             let n = (PAGE_SIZE as usize - off).min(data.len() - done);
             let page = self.pages.get_mut(&(a >> PAGE_BITS)).expect("checked");
-            page.data[off..off + n].copy_from_slice(&data[done..done + n]);
+            let d = page
+                .data
+                .get_or_insert_with(|| Box::new([0; PAGE_SIZE as usize]));
+            d[off..off + n].copy_from_slice(&data[done..done + n]);
             done += n;
         }
     }

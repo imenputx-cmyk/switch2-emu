@@ -150,6 +150,8 @@ pub struct Horizon {
     pub recent_svcs: std::collections::VecDeque<(u16, u64)>,
     /// The last QueryMemory calls: (address, base, size, state).
     pub recent_queries: std::collections::VecDeque<(u64, u64, u64, u32)>,
+    /// Memory SVCs that failed: (id, x0-x3, result).
+    pub failed_svcs: std::collections::VecDeque<(u16, [u64; 4], u32)>,
     /// The last service requests: (service, command, result).
     pub recent_ipc: std::collections::VecDeque<(String, u32, u32)>,
     pub mem: Memory,
@@ -203,6 +205,7 @@ impl Horizon {
             recent_svcs: Default::default(),
             recent_queries: Default::default(),
             recent_ipc: Default::default(),
+            failed_svcs: Default::default(),
             mem: Memory::new(),
             cpu: Cpu::new(),
             map: MemoryMap::new(),
@@ -416,6 +419,10 @@ impl Horizon {
             return Err(LoadError::Unsupported("no modules"));
         }
         let mut priority = 0x2C;
+        // Switch 2 applications get the 12 GB console's application pool
+        // (9809 MiB, as in Lichii's KSystemControl). nninitStartup sizes
+        // its heap as total minus ~6.3 GiB, so 4 GiB left it nothing.
+        self.layout.total_memory = 9809 << 20;
         if let Some(n) = npdm {
             if !n.is_64bit {
                 return Err(LoadError::Unsupported("32-bit programs"));
@@ -561,6 +568,12 @@ impl Horizon {
             }
             s += "\n";
         }
+        for (id, a, result) in &self.failed_svcs {
+            s += &format!(
+                "failed svc 0x{id:02X}({:#x}, {:#x}, {:#x}, {:#x}) -> {result:#x}\n",
+                a[0], a[1], a[2], a[3]
+            );
+        }
         for (service, command, result) in &self.recent_ipc {
             s += &format!("ipc {service} command {command} -> result {result:#x}\n");
         }
@@ -666,6 +679,23 @@ impl Horizon {
     /// Dispatches one SVC. Arguments and results follow
     /// https://switchbrew.org/wiki/SVC (W0 holds the result code).
     fn svc(&mut self, id: u16) -> Result<(), Stop> {
+        let args = [self.x(0), self.x(1), self.x(2), self.x(3)];
+        let r = self.svc_dispatch(id);
+        // Memory SVCs that failed, for the stop dump.
+        let result = self.x(0) as u32;
+        if r.is_ok()
+            && result != 0
+            && matches!(id, 0x01..=0x06 | 0x13 | 0x14 | 0x2C | 0x2D | 0x73..=0x78 | 0x80..)
+        {
+            if self.failed_svcs.len() == 4 {
+                self.failed_svcs.pop_front();
+            }
+            self.failed_svcs.push_back((id, args, result));
+        }
+        r
+    }
+
+    fn svc_dispatch(&mut self, id: u16) -> Result<(), Stop> {
         if self.recent_svcs.len() == 8 {
             self.recent_svcs.pop_front();
         }
