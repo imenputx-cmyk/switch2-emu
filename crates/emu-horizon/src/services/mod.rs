@@ -17,6 +17,7 @@ pub mod nx2;
 pub mod pl;
 pub mod set;
 pub mod sm;
+pub mod stubs;
 pub mod time;
 pub mod vi;
 

@@ -1315,6 +1315,21 @@ impl Horizon {
             Err(services::CallError::Result(code)) => reply.result = code,
             Err(services::CallError::Unimplemented) => {
                 let service = object.borrow().name().to_string();
+                // Commands Lichii answers with generic stubs.
+                if let Some(stub) = services::stubs::lichii(&service, req.command) {
+                    if let Some(last) = self.recent_ipc.back_mut() {
+                        last.2 = 0;
+                    }
+                    reply.data = vec![0; services::stubs::ZEROED_WORDS * 4];
+                    if stub == services::stubs::Stub::Event {
+                        let event = self.kobjects.new_event(false);
+                        match self.handles.insert(KObject::Event { id: event }) {
+                            Some(h) => reply.copy_handles.push(h),
+                            None => reply.result = OUT_OF_HANDLES,
+                        }
+                    }
+                    return Ok(reply);
+                }
                 if !self.config.auto_stub {
                     return Err(Stop::UnimplementedIpc {
                         service,
