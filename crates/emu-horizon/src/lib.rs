@@ -174,6 +174,8 @@ pub struct Horizon {
     yield_requested: bool,
     /// Guest-time period index of the last controller sample.
     last_input_sample: u64,
+    /// Guest-time period index of the last vblank.
+    last_vblank: u64,
     /// MapMemory aliases: destination -> (source, size).
     aliases: Vec<(u64, u64, u64)>,
     /// Text written with svcOutputDebugString.
@@ -223,6 +225,7 @@ impl Horizon {
             wait_counter: 0,
             yield_requested: false,
             last_input_sample: 0,
+            last_vblank: 0,
             aliases: Vec::new(),
             debug_output: Vec::new(),
             sessions: Vec::new(),

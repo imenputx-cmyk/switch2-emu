@@ -48,7 +48,77 @@ impl Service for FileSystemProxy {
                 Some(r) => ctx.push_object(obj(RomFsStorage(r.clone()))),
                 None => return Err(CallError::Result(RESULT_TARGET_NOT_FOUND)),
             },
-            1003 => {} // DisableAutoSaveDataCreation
+            // OpenDataStorageByProgramId / ByDataId: not available.
+            202 | 204 => return Err(CallError::Result(RESULT_TARGET_NOT_FOUND)),
+            // OpenDataStorageByCurrentProcess (older id).
+            200 => match &ctx.config.romfs {
+                Some(r) => ctx.push_object(obj(RomFsStorage(r.clone()))),
+                None => return Err(CallError::Result(RESULT_TARGET_NOT_FOUND)),
+            },
+            // CreateSaveDataFileSystem(BySystemSaveDataId): the directory
+            // is made when opened.
+            22 | 23 | 24 | 25 | 35 | 36 | 37 => {}
+            // OpenSaveDataFileSystem(space, SaveDataAttribute{program id,
+            // user id, system save id, type, ...}) and the read-only and
+            // system variants: a host directory per program, type and user.
+            51..=53 => {
+                let program = ctx.in_u64(8);
+                let user = u128::from_le_bytes(ctx.in_bytes(16, 16).try_into().unwrap());
+                let system_id = ctx.in_u64(32);
+                let kind = ctx.in_bytes(40, 1)[0];
+                let root = save_root().join(format!(
+                    "{program:016X}/{kind}/{user:032X}{}",
+                    if system_id != 0 {
+                        format!("_{system_id:016X}")
+                    } else {
+                        String::new()
+                    }
+                ));
+                fs::create_dir_all(&root).map_err(host_error)?;
+                ctx.push_object(obj(HostFileSystem { root }));
+            }
+            // OpenSaveDataInfoReader(BySaveDataSpaceId...): no entries.
+            60 | 61 | 62 | 64 | 65 => ctx.push_object(obj(EmptyInfoReader)),
+            // OpenSaveDataTransferManager etc. are not needed.
+            // QuerySaveDataTotalSize, GetCacheStorageSize...
+            85 | 810 => ctx.push_u64(0),
+            // GetRightsIdByPath(2), GetGlobalAccessLogMode / program index.
+            1005 => ctx.push_u32(0),
+            1011 => {
+                ctx.push_u32(0);
+                ctx.push_u32(1);
+            }
+            // SetGlobalAccessLogMode, OutputAccessLogToSdCard(2),
+            // FlushAccessLogOnSdCard, SetSdCardEncryptionSeed,
+            // RegisterUpdatePartition, NotifySystemDataUpdateEvent...
+            1003 | 1004 | 1006 | 1008 | 1009 | 1016 | 620 | 1013 | 1014 => {}
+            _ => return Err(CallError::Unimplemented),
+        }
+        Ok(())
+    }
+}
+
+/// Where save data directories live: `user/save` next to the emulator.
+fn save_root() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_default()
+        .join("user")
+        .join("save")
+}
+
+/// An ISaveDataInfoReader with nothing to list.
+pub struct EmptyInfoReader;
+
+impl Service for EmptyInfoReader {
+    fn name(&self) -> &str {
+        "fs::ISaveDataInfoReader"
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            0 => ctx.push_u64(0), // Read: 0 entries
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())
@@ -163,6 +233,27 @@ impl Service for HostFileSystem {
             }
             10 => {}                           // Commit
             11 | 12 => ctx.push_u64(32 << 30), // Free / total space: 32 GiB.
+            // CleanDirectoryRecursively: empty the directory.
+            13 => {
+                let dir = self.path(ctx, 0)?;
+                for e in fs::read_dir(&dir).map_err(host_error)?.flatten() {
+                    let p = e.path();
+                    let _ = if p.is_dir() {
+                        fs::remove_dir_all(p)
+                    } else {
+                        fs::remove_file(p)
+                    };
+                }
+            }
+            // GetFileTimeStampRaw: created, accessed, modified, valid.
+            14 => {
+                self.path(ctx, 0)?;
+                let mut t = [0u8; 0x20];
+                t[0x18] = 1;
+                ctx.push_bytes(&t);
+            }
+            // QueryEntry: nothing to report.
+            15 => {}
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())

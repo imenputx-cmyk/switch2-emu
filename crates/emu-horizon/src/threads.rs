@@ -534,6 +534,7 @@ impl Horizon {
         self.sample_input();
         loop {
             self.expire_timeouts();
+            self.vblank();
             let n = self.threads.len();
             let next = (1..=n)
                 .map(|k| (self.current + k) % n)
@@ -557,11 +558,28 @@ impl Horizon {
                     _ => None,
                 })
                 .min();
-            match earliest {
+            // With vblank events, the next vblank can wake someone.
+            let next_vblank = (!self.system.vblank_events.is_empty())
+                .then(|| (self.cpu.counter / VBLANK_PERIOD + 1) * VBLANK_PERIOD);
+            match earliest.into_iter().chain(next_vblank).min() {
                 Some(d) => self.cpu.counter = self.cpu.counter.max(d),
                 None => return Err(Stop::Deadlock { pc }),
             }
         }
+    }
+
+    /// Signals the vblank events once per 1/60 s of guest time and wakes
+    /// the threads waiting on them.
+    fn vblank(&mut self) {
+        let due = self.cpu.counter / VBLANK_PERIOD;
+        if due <= self.last_vblank || self.system.vblank_events.is_empty() {
+            return;
+        }
+        self.last_vblank = due;
+        for &e in &self.system.vblank_events {
+            self.kobjects.events[e] = true;
+        }
+        self.recheck_sync_waiters();
     }
 
     /// Writes a new controller sample to hid shared memory every 4 ms of
@@ -604,3 +622,6 @@ impl Horizon {
         self.threads[i].tid
     }
 }
+
+/// Guest ticks (19.2 MHz) per vblank at 60 Hz.
+pub const VBLANK_PERIOD: u64 = 19_200_000 / 60;

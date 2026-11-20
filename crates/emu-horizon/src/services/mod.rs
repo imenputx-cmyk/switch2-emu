@@ -4,13 +4,17 @@
 //! (the run stops) instead of being answered with a made-up success, so
 //! missing functionality is found early.
 
+pub mod account;
 pub mod am;
 pub mod apm;
+pub mod audio;
 pub mod fs;
+pub mod generic;
 pub mod hid;
 pub mod nv;
 pub mod nvgpu;
 pub mod nx2;
+pub mod pl;
 pub mod set;
 pub mod sm;
 pub mod time;
@@ -98,6 +102,8 @@ pub struct System {
     pub hid_sampling: u64,
     pub frames: Vec<Frame>,
     pub frames_presented: u64,
+    /// Events signalled every emulated vblank (60 Hz of guest time).
+    pub vblank_events: Vec<usize>,
     /// Switch 2 GPU memory (nx2:gpu and its sub-sessions share it).
     pub nx2_gpu: nx2::GpuMemory,
 }
@@ -159,6 +165,13 @@ impl Ctx<'_> {
 
     pub fn in_u32(&self, offset: usize) -> u32 {
         self.in_u64(offset) as u32
+    }
+
+    /// `len` bytes of input data at `offset` (zero past the end).
+    pub fn in_bytes(&self, offset: usize, len: usize) -> Vec<u8> {
+        (offset..offset + len)
+            .map(|i| self.req.data.get(i).copied().unwrap_or(0))
+            .collect()
     }
 
     pub fn push_u32(&mut self, v: u32) {
@@ -437,6 +450,14 @@ fn create_known(name: &str, config: &Config) -> Option<ServiceRef> {
     Some(match name {
         "sm:" => Rc::new(RefCell::new(sm::ServiceManager)),
         "set:sys" => Rc::new(RefCell::new(set::SystemSettings)),
+        "set" => Rc::new(RefCell::new(set::Settings)),
+        "aud:u" => Rc::new(RefCell::new(audio::AudioUserClient)),
+        "pl:u" | "pl:s" => Rc::new(RefCell::new(pl::PlatformServiceManager::default())),
+        "audren:u" => Rc::new(RefCell::new(audio::AudioRendererManager)),
+        "audout:u" => Rc::new(RefCell::new(audio::AudioOutManager)),
+        "acc:u0" | "acc:u1" | "acc:su" => {
+            Rc::new(RefCell::new(account::AccountService(name.to_string())))
+        }
         "lm" => Rc::new(RefCell::new(LogManager)),
         "pctl" | "pctl:s" | "pctl:a" | "pctl:r" => {
             Rc::new(RefCell::new(ParentalControl(name.to_string())))
@@ -455,6 +476,9 @@ fn create_known(name: &str, config: &Config) -> Option<ServiceRef> {
         "fsp-srv" => Rc::new(RefCell::new(fs::FileSystemProxy {
             sdmc_root: config.sdmc_root.clone(),
         })),
-        _ => return None,
+        // Services answered from tables (generic.rs).
+        other => Rc::new(RefCell::new(generic::TableService::new(
+            generic::table_name(other)?,
+        )?)),
     })
 }

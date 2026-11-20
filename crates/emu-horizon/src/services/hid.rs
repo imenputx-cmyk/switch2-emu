@@ -34,6 +34,42 @@ impl Service for Hid {
             // DeactivateNpad, SetNpadJoyHoldType, ActivateNpadWithRevision:
             // accepted (the input state is not emulated yet).
             1 | 11 | 21 | 31 | 100 | 102 | 103 | 104 | 120 | 109 => {}
+            // More of what games call at start (Eden hid_server.cpp):
+            // six-axis and gesture activation, joy-con assignment modes,
+            // handheld activation, vibration sends, communication mode...
+            40 | 41 | 51 | 55 | 66 | 67 | 68 | 69 | 70 | 71 | 72 | 73 | 74 | 75 | 76 | 77 | 78
+            | 79 | 80 | 81 | 91 | 105 | 107 | 122 | 123 | 124 | 125 | 126 | 127 | 128 | 130
+            | 131 | 133 | 134 | 136 | 201 | 206 | 207 | 208 | 209 | 210 | 211 | 212 | 213 | 214
+            | 220 | 300 | 301 | 302 | 303 | 304 | 305 | 306 | 307 | 308 | 309 | 310 | 311 | 400
+            | 401 | 402 | 403 | 404 | 405 | 406 | 407 | 408 | 409 | 500 | 501 | 502 | 503 | 504
+            | 505 | 510 | 511 | 512 | 513 | 520 | 521 | 522 | 523 | 524 | 525 | 1000 | 1002
+            | 1003 | 1004 | 1005 => {}
+            // IsSixAxisSensorAtRest, IsFirmwareUpdateAvailableForSixAxisSensor,
+            // IsSixAxisSensorFusionEnabled, IsVibrationPermitted,
+            // IsVibrationDeviceMounted, IsUsbFullKeyControllerEnabled...
+            82 | 83 | 65 | 215 | 216 | 219 => ctx.push_u8(1),
+            // GetSupportedNpadStyleSet: full key, handheld, joy-con pair.
+            101 => ctx.push_u32(0b111),
+            // AcquireNpadStyleSetUpdateEventHandle: signalled once.
+            106 => {
+                let mut e = None;
+                ctx.push_event(&mut e, true);
+            }
+            // GetPlayerLedPattern(npad): player 1.
+            108 => ctx.push_u64(1),
+            // GetNpadJoyHoldType: horizontal; GetNpadHandheldActivationMode.
+            121 | 129 => ctx.push_u64(0),
+            // GetVibrationDeviceInfo(handle): linear resonant, left.
+            200 => {
+                ctx.push_u32(1);
+                ctx.push_u32(1);
+            }
+            // GetActualVibrationValue: no vibration.
+            202 => ctx.push_bytes(&[0; 0x10]),
+            // CreateActiveVibrationDeviceList.
+            203 => ctx.push_object(obj(ActiveVibrationDeviceList)),
+            // GetNpadCommunicationMode.
+            1001 => ctx.push_u64(0),
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())
@@ -152,4 +188,20 @@ pub fn sample_writes(sampling: u64, input: &InputState) -> Vec<(usize, Vec<u8>)>
         out.push((lifo, header));
     }
     out
+}
+
+/// `IActiveVibrationDeviceList`.
+pub struct ActiveVibrationDeviceList;
+
+impl Service for ActiveVibrationDeviceList {
+    fn name(&self) -> &str {
+        "hid::IActiveVibrationDeviceList"
+    }
+
+    fn call(&mut self, command: u32, _ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            0 => Ok(()), // ActivateVibrationDevice
+            _ => Err(CallError::Unimplemented),
+        }
+    }
 }

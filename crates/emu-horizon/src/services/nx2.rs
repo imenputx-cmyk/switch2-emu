@@ -86,6 +86,53 @@ impl Service for Nx2Stub {
 #[derive(Default)]
 pub struct Gsv {
     syncpt_events: [Option<usize>; 2],
+    /// Native memory by id: (size, bound address).
+    memories: HashMap<u32, (u64, u64)>,
+    next_memory: u32,
+    /// Native images (pools) by first handle.
+    images: std::collections::BTreeMap<u32, NativeImage>,
+    next_image: u32,
+    client_registered: bool,
+}
+
+/// A native image pool (gsv 429): `count` images of `size` bytes each in
+/// `memory`, described by 16 preference words.
+#[derive(Clone, Copy)]
+struct NativeImage {
+    preference: [u32; 16],
+    count: u32,
+    memory: u32,
+    size: u64,
+}
+
+/// Layout of a native image from its preference words (Lichii
+/// nx2_image_layout.h): width/height in word 2, block height (log2) in
+/// word 4, pitch in GOBs in word 5, format in word 6 (5 = RGBA16F, 8 bytes
+/// a pixel; others 4). Returns (width, height, pitch, block height log2,
+/// size).
+pub fn native_image_layout(p: &[u32]) -> (u32, u32, u64, u32, u64) {
+    let width = (p[2] & 0xFFFF) + 1;
+    let height = (p[2] >> 16) + 1;
+    let bpp = if p[6] == 5 { 8 } else { 4 };
+    let (pitch, bh) =
+        if p[4] <= 8 && u64::from(p[5]) >= (u64::from(width) * bpp).div_ceil(64) && p[5] <= 4096 {
+            (u64::from(p[5]) * 64, p[4])
+        } else {
+            ((u64::from(width) * bpp).next_multiple_of(64), 7)
+        };
+    let rows = 1u64 << bh;
+    (
+        width,
+        height,
+        pitch,
+        bh,
+        pitch * u64::from(height).next_multiple_of(rows),
+    )
+}
+
+/// 16 preference words from TIPC data words 2..18.
+fn preference(ctx: &Ctx) -> [u32; 16] {
+    std::array::from_fn(|i| ctx.in_u32(4 * i))
 }
 
 impl Service for Gsv {
@@ -141,6 +188,127 @@ impl Service for Gsv {
             902 | 905 | 906 | 1002 => ctx.push_session(obj(Nx2Stub::new("nx2:video"))),
             602 => ctx.push_session(obj(Nx2Stub::new("nx2:camera"))),
             1202 => ctx.push_session(obj(Nx2Stub::new("nx2:chat"))),
+            // RegisterClientHandle: once.
+            11 => {
+                if std::mem::replace(&mut self.client_registered, true) {
+                    return Err(CallError::Result(crate::result::INVALID_STATE));
+                }
+            }
+            // CreateNativeMemory(.., size at words 3-4): an id.
+            111 => {
+                self.next_memory += 1;
+                let id = self.next_memory;
+                self.memories.insert(id, (ctx.in_u64(4), 0));
+                words(ctx, &[id]);
+            }
+            112 => {
+                self.memories.remove(&ctx.in_u32(0));
+            }
+            // BindNativeMemory / BindNativeGpuMemory(id, address, size, ..).
+            114 | 423 => {
+                let (id, addr, size) = (ctx.in_u32(0), ctx.in_u64(4), ctx.in_u64(12));
+                let m = self.memories.entry(id).or_insert((size, 0));
+                m.1 = addr;
+                if m.0 == 0 {
+                    m.0 = size;
+                }
+            }
+            // QueryGrantedFeatures: what was asked; GetSessionFlag: 0.
+            115 => words(ctx, &[ctx.in_u32(0), ctx.in_u32(4)]),
+            126 => words(ctx, &[0]),
+            // Permission checks and attaching address spaces: granted.
+            201 | 301 | 401 | 402 | 403 | 434 | 494 | 801 => {}
+            // CreateNativeImage (and the feature/chat pools): 16 preference
+            // words, count (word 18), memory (word 19); handles are the pool
+            // id + index.
+            429 | 311 | 321 | 615 | 811 | 1211 => {
+                let p = preference(ctx);
+                let count = ctx.in_u32(64).max(1);
+                let memory = ctx.in_u32(68);
+                if self.next_image == 0 {
+                    self.next_image = 1;
+                }
+                let id = self.next_image;
+                self.next_image += count;
+                let size = native_image_layout(&p).4;
+                self.images.insert(
+                    id,
+                    NativeImage {
+                        preference: p,
+                        count,
+                        memory,
+                        size,
+                    },
+                );
+                words(ctx, &[id]);
+            }
+            430 | 312 | 612 | 912 => {
+                self.images.remove(&ctx.in_u32(0));
+            }
+            // Destroy/CreateNativeWindowAliasImagePool, UnmapNativeImage.
+            314 | 315 | 427 => {}
+            // MapNativeImage (426) / QueryNativeImage (428)(handle): GPU
+            // address (426 only), offset in the memory, then a 33-word
+            // descriptor (kind 1, preference words 1-2, block height, pitch
+            // in GOBs, depth/levels 1, size).
+            426 | 428 => {
+                let handle = ctx.in_u32(0);
+                let found = self
+                    .images
+                    .range(..=handle)
+                    .next_back()
+                    .filter(|(&first, img)| handle - first < img.count)
+                    .map(|(&first, img)| (first, *img));
+                let (p, offset, base) = match found {
+                    Some((first, img)) => (
+                        img.preference,
+                        u64::from(handle - first) * img.size,
+                        self.memories.get(&img.memory).map_or(0, |m| m.1),
+                    ),
+                    None => ([0; 16], 0, 0),
+                };
+                let (_, _, pitch, bh, size) = native_image_layout(&p);
+                let gpu = if command == 426 { base + offset } else { 0 };
+                let mut w = [0u32; 37];
+                w[..2].copy_from_slice(&split(gpu));
+                w[2..4].copy_from_slice(&split(offset));
+                let desc = &mut w[4..];
+                desc[0] = 1;
+                desc[1] = p[1];
+                desc[2] = p[2];
+                desc[4] = bh;
+                desc[5] = (pitch / 64) as u32;
+                desc[8] = 1;
+                desc[9] = 1;
+                desc[11] = size as u32;
+                words(ctx, &w);
+            }
+            // CalculateNativeImageSize(preference, count).
+            435 => {
+                let size =
+                    native_image_layout(&preference(ctx)).4 * u64::from(ctx.in_u32(64).max(1));
+                words(ctx, &split(size));
+            }
+            // Zeroed replies Lichii gives these (no known meaning).
+            113
+            | 120..=125
+            | 131
+            | 133
+            | 187
+            | 211..=215
+            | 303
+            | 424
+            | 425
+            | 436
+            | 461..=468
+            | 493
+            | 603
+            | 613
+            | 614
+            | 802
+            | 803 => {
+                words(ctx, &[0; 8]);
+            }
             // OpenNvsrvSession: NVIDIA's driver server, which speaks the
             // nvdrv protocol (Lichii).
             1402 => ctx.push_session(obj(super::nv::NvDrv::nvsrv())),
@@ -462,10 +630,30 @@ fn unmap_or_back(ctx: &mut Ctx, m: &GpuMemory, va: u64, size: u64) {
     }
 }
 
-/// gsv 305: the display (nn::vi2).
+/// gsv 305: the display (nn::vi2), from Lichii's INx2Vi2Session.
 #[derive(Default)]
 pub struct Vi2 {
     native_events: [Option<usize>; 8],
+    presents: u64,
+}
+
+/// Buffer slots a client may acquire (Lichii: 0x7fff).
+const VI2_SLOTS: u64 = 0x7FFF;
+
+impl Vi2 {
+    /// The event of native slot `index`, made once and registered as a
+    /// vblank event (signalled every frame until bound to something else).
+    fn native_event(&mut self, index: usize, ctx: &mut Ctx) -> Result<usize, CallError> {
+        let slot = self
+            .native_events
+            .get_mut(index)
+            .ok_or(CallError::Result(crate::result::INVALID_ENUM_VALUE))?;
+        Ok(*slot.get_or_insert_with(|| {
+            let e = ctx.kernel.new_event(true);
+            ctx.system.vblank_events.push(e);
+            e
+        }))
+    }
 }
 
 impl Service for Vi2 {
@@ -477,23 +665,49 @@ impl Service for Vi2 {
         match command {
             0 => handshake(ctx),
             1 | 3 => words(ctx, &[1]), // GetDisplayCount (guessed)
-            5 => words(ctx, &[7]),     // GetTimestampRecorderCount (guessed)
-            // GetBufferMaxResolution: 2 = 1920x1080 (handheld).
-            106 => words(ctx, &[2]),
+            // GetTimestampRecorderCount: < 8; LayerHistory makes 7.
+            5 => words(ctx, &[7]),
+            // GetBufferMaxResolution(display name): handheld 1080p (mode 2),
+            // as a u64.
+            106 => words(ctx, &split(2)),
             11 => {
                 let mut e = None;
                 event(ctx, &mut e);
             }
             // Acquire/DuplicateNativeEvent(index < 8).
             31 | 32 => {
-                let index = ctx.in_u32(0) as usize;
-                let Some(slot) = self.native_events.get_mut(index) else {
-                    return Err(CallError::Result(crate::result::INVALID_ENUM_VALUE));
-                };
-                let mut e = *slot;
-                ctx.push_event(&mut e, false);
-                self.native_events[index] = e;
+                let e = self.native_event(ctx.in_u32(0) as usize, ctx)?;
+                ctx.push_copy(KObject::Event { id: e });
             }
+            // GetRecordedTimestamps: nothing recorded yet, pending.
+            53 => words(ctx, &[0, 0, 1]),
+            // QueryDisplayRefreshRate: 60 Hz (and a bool).
+            103 => words(ctx, &[60, 0]),
+            // QueryDisplayHdrStatus: SDR (1), peak luminance 0.
+            104 => words(ctx, &[1, 0, 0]),
+            // QueryDisplayHdrPaperWhite (nits).
+            105 => words(ctx, &[203]),
+            // GetLayerBufferBits(layer): every slot ready.
+            212 => words(ctx, &split(VI2_SLOTS)),
+            // CancelClientBuffer / PresentClientBuffer(token, slot, image,
+            // fences): every slot back; four zero words.
+            228 | 229 => {
+                if command == 229 {
+                    self.presents += 1;
+                    for e in ctx.system.vblank_events.clone() {
+                        ctx.kernel.events[e] = true;
+                    }
+                }
+                let [lo, hi] = split(VI2_SLOTS);
+                words(ctx, &[lo, hi, 0, 0, 0, 0]);
+            }
+            // Bind a native slot (u64 display, u32 index) to vsync or a
+            // change source: fire once so the game reads the state.
+            261 | 263 | 265 | 267 | 269 | 271 => {
+                let e = self.native_event(ctx.in_u32(8) as usize, ctx)?;
+                ctx.kernel.events[e] = true;
+            }
+            262 | 264 | 266 | 268 | 270 | 272 => {}
             _ => zeroed("vi2", command, ctx),
         }
         Ok(())

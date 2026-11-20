@@ -220,6 +220,8 @@ pub struct ApplicationFunctions {
     notification_event: Option<usize>,
     health_warning_event: Option<usize>,
     operation_mode_refresh_event: Option<usize>,
+    /// The preselected user was handed out (once, as on hardware).
+    user_popped: bool,
 }
 
 impl Service for ApplicationFunctions {
@@ -231,8 +233,19 @@ impl Service for ApplicationFunctions {
         match command {
             // GetDesiredLanguage: a language code as 8 NUL-padded bytes.
             21 => ctx.push_u64(u64::from_le_bytes(*b"en-US\0\0\0")),
-            // PopLaunchParameter: none (AM ResultNoDataInChannel).
-            1 => return Err(CallError::Result(128 | (2 << 9))),
+            // PopLaunchParameter(kind): kind 2 is the preselected user
+            // (magic 0xC79497CA, "account selected", the uid), once; the
+            // rest has none (AM ResultNoDataInChannel). As in Eden.
+            1 => {
+                if ctx.in_u32(0) != 2 || std::mem::replace(&mut self.user_popped, true) {
+                    return Err(CallError::Result(128 | (2 << 9)));
+                }
+                let mut data = vec![0u8; 0x88];
+                data[..4].copy_from_slice(&0xC794_97CAu32.to_le_bytes());
+                data[4] = 1;
+                data[8..24].copy_from_slice(&super::account::USER_ID.to_le_bytes());
+                ctx.push_object(obj(Storage(data)));
+            }
             20 => ctx.push_u64(0), // EnsureSaveData: nothing to extend
             22 => {}               // SetTerminateResult
             40 => ctx.push_u8(0),  // NotifyRunning: no exit requested
@@ -291,6 +304,56 @@ impl Service for GraphicsScaleController {
                 ctx.push_u32(0);
             }
             1050 => {} // SetGraphicsScaleChangedNotificationEnabled
+            _ => return Err(CallError::Unimplemented),
+        }
+        Ok(())
+    }
+}
+
+/// `IStorage`: a block of data passed between applets.
+pub struct Storage(pub Vec<u8>);
+
+impl Service for Storage {
+    fn name(&self) -> &str {
+        "am::IStorage"
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            // Open / OpenTransferStorage: an accessor over a copy.
+            0 | 1 => ctx.push_object(obj(StorageAccessor(self.0.clone()))),
+            _ => return Err(CallError::Unimplemented),
+        }
+        Ok(())
+    }
+}
+
+/// `IStorageAccessor`.
+pub struct StorageAccessor(pub Vec<u8>);
+
+impl Service for StorageAccessor {
+    fn name(&self) -> &str {
+        "am::IStorageAccessor"
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            0 => ctx.push_u64(self.0.len() as u64), // GetSize
+            // Write(offset, buffer).
+            10 => {
+                let offset = ctx.in_u64(0) as usize;
+                let data = ctx.read_in_buffer(0)?;
+                if offset + data.len() > self.0.len() {
+                    return Err(CallError::Result(128 | (503 << 9)));
+                }
+                self.0[offset..offset + data.len()].copy_from_slice(&data);
+            }
+            // Read(offset) into the buffer.
+            11 => {
+                let offset = (ctx.in_u64(0) as usize).min(self.0.len());
+                let data = self.0[offset..].to_vec();
+                ctx.write_out_buffer(0, &data)?;
+            }
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())
