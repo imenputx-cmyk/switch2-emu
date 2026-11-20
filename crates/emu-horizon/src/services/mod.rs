@@ -336,6 +336,43 @@ impl Service for AddOnContent {
     }
 }
 
+/// `ectx:aw` / `ectx:w`: error contexts (nn::err). A registrar is handed
+/// out and completes with success; nothing is recorded (as in Lichii's
+/// glue/ectx.cpp).
+pub struct ErrorContext(pub String);
+
+impl Service for ErrorContext {
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            0 => ctx.push_object(Rc::new(RefCell::new(ContextRegistrar))), // CreateContextRegistrar
+            1 | 2 => {} // CommitContext, RemoveContext
+            _ => return Err(CallError::Unimplemented),
+        }
+        Ok(())
+    }
+}
+
+/// `nn::err::context::IContextRegistrar`.
+pub struct ContextRegistrar;
+
+impl Service for ContextRegistrar {
+    fn name(&self) -> &str {
+        "ectx::IContextRegistrar"
+    }
+
+    fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
+        match command {
+            0 => ctx.push_u32(0), // Complete
+            _ => return Err(CallError::Unimplemented),
+        }
+        Ok(())
+    }
+}
+
 /// `lm`: the log manager. Log messages are dropped.
 pub struct LogManager;
 
@@ -403,6 +440,7 @@ fn create_known(name: &str, config: &Config) -> Option<ServiceRef> {
             Rc::new(RefCell::new(ParentalControl(name.to_string())))
         }
         "aoc:u" => Rc::new(RefCell::new(AddOnContent::default())),
+        "ectx:aw" | "ectx:w" => Rc::new(RefCell::new(ErrorContext(name.to_string()))),
         "apm" | "apm:p" => Rc::new(RefCell::new(apm::Manager)),
         "appletOE" => Rc::new(RefCell::new(am::AppletOE)),
         "vi:u" => Rc::new(RefCell::new(vi::RootService)),
