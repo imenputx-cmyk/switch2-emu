@@ -376,19 +376,38 @@ impl Service for Syncpt {
         match command {
             0 => handshake(ctx),
             1 => words(ctx, &[32]), // GetCount (guessed)
-            // GetSlotEvent(slot), RequestSlotEvent(slot, ~syncpoint,
-            // value, mode): the slot's event. Waits are answered at once
-            // (signalled) until syncpoints are emulated for Switch 2.
-            22 | 201 => {
+            // GetSlotEvent(slot): the slot's event.
+            22 => {
                 let slot = ctx.in_u32(0);
                 let mut e = self.slot_events.get(&slot).copied().flatten();
                 ctx.push_event(&mut e, false);
-                if let Some(id) = e {
-                    if command == 201 {
-                        ctx.kernel.events[id] = true;
-                    }
-                }
                 self.slot_events.insert(slot, e);
+            }
+            // RequestSlotEvent(slot, ~syncpoint, value (u64), mode): the
+            // slot's event is cleared and signalled once the GPU syncpoint
+            // reaches the value (Lichii INx2SyncptSession).
+            201 => {
+                let slot = ctx.in_u32(0);
+                let syncpoint = !ctx.in_u32(4);
+                let value = ctx.in_u32(8);
+                let e = self
+                    .slot_events
+                    .get(&slot)
+                    .copied()
+                    .flatten()
+                    .unwrap_or_else(|| ctx.kernel.new_event(false));
+                self.slot_events.insert(slot, Some(e));
+                ctx.system.syncpt_waits.retain(|w| w.2 != e);
+                match ctx.system.gpu.syncpoints.get(syncpoint as usize) {
+                    Some(&now) if now.wrapping_sub(value) as i32 >= 0 => {
+                        ctx.kernel.events[e] = true
+                    }
+                    Some(_) => {
+                        ctx.kernel.events[e] = false;
+                        ctx.system.syncpt_waits.push((syncpoint, value, e));
+                    }
+                    None => ctx.kernel.events[e] = true,
+                }
             }
             // CancelSlotEvent(slot): the SDK waits on the slot's event
             // after a cancel, so it is signalled (Lichii).
@@ -404,7 +423,17 @@ impl Service for Syncpt {
                 self.slot_events.insert(slot, Some(e));
             }
             // QueryCounter(~syncpoint): the value (u64) and a zero word.
-            103 => words(ctx, &[0, 0, 0]),
+            103 => {
+                let syncpoint = !ctx.in_u32(0);
+                let v = ctx
+                    .system
+                    .gpu
+                    .syncpoints
+                    .get(syncpoint as usize)
+                    .copied()
+                    .unwrap_or(0);
+                words(ctx, &[v, 0, 0]);
+            }
             _ => zeroed("syncpt", command, ctx),
         }
         Ok(())

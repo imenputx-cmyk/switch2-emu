@@ -271,6 +271,21 @@ impl Horizon {
                 _ => return self.ret(INVALID_HANDLE),
             }
         }
+        self.last_wait = Some((
+            handles
+                .iter()
+                .map(|&h| match self.handles.get(h) {
+                    Some(&KObject::Event { id }) => self
+                        .system
+                        .event_names
+                        .get(&id)
+                        .map_or(format!("event {id}"), |n| format!("event {id} ({n})")),
+                    Some(&KObject::Thread { id }) => format!("thread {id}"),
+                    _ => format!("handle {h:#x}"),
+                })
+                .collect(),
+            timeout,
+        ));
         if let Some(i) = handles.iter().position(|&h| self.is_signaled(h)) {
             self.ret(SUCCESS);
             self.set_x(1, i as u64);
@@ -535,6 +550,7 @@ impl Horizon {
         loop {
             self.expire_timeouts();
             self.vblank();
+            self.check_syncpoint_waits();
             let n = self.threads.len();
             let next = (1..=n)
                 .map(|k| (self.current + k) % n)
@@ -580,6 +596,29 @@ impl Horizon {
             self.kobjects.events[e] = true;
         }
         self.recheck_sync_waiters();
+    }
+
+    /// Signals nx2:syncpt slot events whose GPU syncpoint was reached.
+    pub(crate) fn check_syncpoint_waits(&mut self) {
+        if self.system.syncpt_waits.is_empty() {
+            return;
+        }
+        let points = &self.system.gpu.syncpoints;
+        let mut fired = false;
+        let events = &mut self.kobjects.events;
+        self.system.syncpt_waits.retain(|&(sp, value, e)| {
+            let reached = points
+                .get(sp as usize)
+                .is_some_and(|&now| now.wrapping_sub(value) as i32 >= 0);
+            if reached {
+                events[e] = true;
+                fired = true;
+            }
+            !reached
+        });
+        if fired {
+            self.recheck_sync_waiters();
+        }
     }
 
     /// Writes a new controller sample to hid shared memory every 4 ms of

@@ -166,6 +166,8 @@ pub struct Horizon {
     pub modules: Vec<(u64, u64)>,
     /// The last SVCs: (id, pc).
     pub recent_svcs: std::collections::VecDeque<(u16, u64)>,
+    /// The last WaitSynchronization: what it waited on and its timeout.
+    pub last_wait: Option<(Vec<String>, i64)>,
     /// The last QueryMemory calls: (address, base, size, state).
     pub recent_queries: std::collections::VecDeque<(u64, u64, u64, u32)>,
     /// Memory SVCs that failed: (id, x0-x3, result).
@@ -226,6 +228,7 @@ impl Horizon {
             skip_breakpoint_once: false,
             modules: Vec::new(),
             recent_svcs: Default::default(),
+            last_wait: None,
             recent_queries: Default::default(),
             recent_ipc: Default::default(),
             failed_svcs: Default::default(),
@@ -575,6 +578,9 @@ impl Horizon {
             for (id, pc) in &self.recent_svcs {
                 s += &format!(" {id:#x}@{pc:#x}");
             }
+        }
+        if let Some((objects, timeout)) = &self.last_wait {
+            s += &format!("; last wait: [{}] timeout {timeout}", objects.join(", "));
         }
         s
     }
@@ -1346,10 +1352,18 @@ impl Horizon {
             Err(_) => u32::MAX,
         };
         self.recent_ipc
-            .push_back((service_name, req.command, result_code));
+            .push_back((service_name.clone(), req.command, result_code));
         match outcome {
             Ok(()) => {
                 reply.data = out;
+                for kobj in &out_copy {
+                    if let KObject::Event { id } = *kobj {
+                        self.system
+                            .event_names
+                            .entry(id)
+                            .or_insert_with(|| format!("{service_name} cmd {}", req.command));
+                    }
+                }
                 for kobj in out_copy {
                     match self.handles.insert(kobj) {
                         Some(h) => reply.copy_handles.push(h),

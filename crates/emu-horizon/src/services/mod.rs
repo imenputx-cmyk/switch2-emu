@@ -107,6 +107,11 @@ pub struct System {
     pub vblank_events: Vec<usize>,
     /// Switch 2 GPU memory (nx2:gpu and its sub-sessions share it).
     pub nx2_gpu: nx2::GpuMemory,
+    /// nx2:syncpt slot requests: (syncpoint, value, event) signalled
+    /// once the GPU syncpoint reaches the value.
+    pub syncpt_waits: Vec<(u32, u32, usize)>,
+    /// Who made each event (for diagnostics): event id -> "service cmd".
+    pub event_names: std::collections::HashMap<usize, String>,
     /// Switch 2 native memory and images (gsv), shown by vi2 presents.
     pub nx2_native: nx2::NativeObjects,
 }
