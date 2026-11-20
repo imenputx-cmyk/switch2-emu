@@ -7,3 +7,4 @@ description = "The NVIDIA GPU: address spaces, GPFIFO command processing and eng
 
 [dependencies]
 emu-memory = { path = "../emu-memory" }
+texture2ddecoder = "0.1.2"

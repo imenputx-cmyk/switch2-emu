@@ -9,8 +9,10 @@
 //! (zlib; derived from envytools' rnndb).
 //!
 //! Supported for now: 2D (and 2D-no-mipmap) textures, level 0 only, the
-//! common uncompressed formats, nearest and linear filtering, all
-//! address modes (mirror-clamp ones treated as mirror then clamp).
+//! common uncompressed formats, BC1-BC7 and ASTC (decoded with the
+//! texture2ddecoder crate, MIT/Apache-2.0), nearest and linear
+//! filtering, all address modes (mirror-clamp ones treated as mirror
+//! then clamp).
 
 use crate::backend::GuestMemory;
 use crate::blocklinear;
@@ -77,6 +79,46 @@ fn layout(format: u32) -> Option<&'static [u32]> {
     })
 }
 
+/// Block-compressed formats: (block width, height, bytes per block).
+fn compressed(format: u32) -> Option<(u32, u32, u32)> {
+    Some(match format {
+        0x24 | 0x27 => (4, 4, 8),         // DXT1 (BC1), DXN1 (BC4)
+        0x25 | 0x26 | 0x28 => (4, 4, 16), // DXT23, DXT45, DXN2 (BC2, BC3, BC5)
+        0x10 | 0x11 | 0x17 => (4, 4, 16), // BC6H signed/unsigned, BC7
+        0x40 => (4, 4, 16),
+        0x41 => (5, 5, 16),
+        0x42 => (6, 6, 16),
+        0x44 => (8, 8, 16),
+        0x45 => (10, 10, 16),
+        0x46 => (12, 12, 16),
+        0x50 => (5, 4, 16),
+        0x51 => (6, 5, 16),
+        0x52 => (8, 6, 16),
+        0x53 => (10, 8, 16),
+        0x54 => (12, 10, 16),
+        0x55 => (8, 5, 16),
+        0x56 => (10, 5, 16),
+        0x57 => (10, 6, 16),
+        _ => return None,
+    })
+}
+
+/// Decodes one compressed block to BGRA8 pixels (`bw * bh` of them).
+fn decode_block(format: u32, bw: u32, bh: u32, data: &[u8], out: &mut [u32]) {
+    use texture2ddecoder as t;
+    match format {
+        0x24 => t::decode_bc1a_block(data, out),
+        0x25 => t::decode_bc2_block(data, out),
+        0x26 => t::decode_bc3_block(data, out),
+        0x27 => t::decode_bc4_block(data, out),
+        0x28 => t::decode_bc5_block(data, out),
+        0x10 => t::decode_bc6_block(data, out, true),
+        0x11 => t::decode_bc6_block(data, out, false),
+        0x17 => t::decode_bc7_block(data, out),
+        _ => t::decode_astc_block(data, bw as usize, bh as usize, out),
+    }
+}
+
 fn bits(v: u32, lo: u32, len: u32) -> u32 {
     (v >> lo) & ((1u64 << len) - 1) as u32
 }
@@ -85,7 +127,9 @@ impl Tic {
     pub fn parse(e: &[u8; 32]) -> Result<Tic, String> {
         let w = |i: usize| u32::from_le_bytes(e[4 * i..4 * i + 4].try_into().unwrap());
         let format = bits(w(0), 0, 7);
-        layout(format).ok_or_else(|| format!("texture format {format:#x}"))?;
+        if layout(format).is_none() && compressed(format).is_none() {
+            return Err(format!("texture format {format:#x}"));
+        }
         let kind = |k| match k {
             1 => Ok(Kind::Snorm),
             2 => Ok(Kind::Unorm),
@@ -126,8 +170,22 @@ impl Tic {
         })
     }
 
-    pub fn bytes_per_texel(&self) -> u32 {
-        layout(self.format).unwrap().iter().sum::<u32>() / 8
+    /// The storage element: (block width, block height, bytes); 1x1
+    /// texels for uncompressed formats.
+    pub fn element(&self) -> (u32, u32, u32) {
+        compressed(self.format)
+            .unwrap_or_else(|| (1, 1, layout(self.format).unwrap().iter().sum::<u32>() / 8))
+    }
+
+    /// Bytes of level 0 (an upper bound for block-linear layouts).
+    pub fn size_bytes(&self) -> u64 {
+        let (bw, bh, bytes) = self.element();
+        let row = u64::from(self.width.div_ceil(bw) * bytes);
+        let rows = u64::from(self.height.div_ceil(bh));
+        match self.pitch {
+            Some(p) => u64::from(p) * rows,
+            None => blocklinear::size(row as u32, rows as u32, self.block_height_log2) as u64,
+        }
     }
 }
 
@@ -235,15 +293,17 @@ fn swizzle(tic: &Tic, c: [f32; 4]) -> [f32; 4] {
 
 impl Texture {
     pub fn decode(g: &GuestMemory, tic: &Tic) -> Result<Texture, String> {
-        let bpp = tic.bytes_per_texel();
-        let row = tic.width * bpp;
+        // Rows of storage elements (texels, or compressed blocks).
+        let (bw, bh, bpp) = tic.element();
+        let (cols, rows) = (tic.width.div_ceil(bw), tic.height.div_ceil(bh));
+        let row = cols * bpp;
         let linear = match tic.pitch {
             Some(pitch) => {
-                let mut raw = vec![0u8; (pitch * (tic.height - 1) + row) as usize];
+                let mut raw = vec![0u8; (pitch * (rows - 1) + row) as usize];
                 g.read(tic.addr, &mut raw)
                     .map_err(|f| format!("texture: {f:?}"))?;
-                let mut out = Vec::with_capacity((row * tic.height) as usize);
-                for y in 0..tic.height {
+                let mut out = Vec::with_capacity((row * rows) as usize);
+                for y in 0..rows {
                     let s = (y * pitch) as usize;
                     out.extend_from_slice(&raw[s..s + row as usize]);
                 }
@@ -252,7 +312,7 @@ impl Texture {
             None => {
                 // Small textures use smaller blocks than the header says
                 // only for mip levels; level 0 uses the header's value.
-                let size = blocklinear::size(row, tic.height, tic.block_height_log2);
+                let size = blocklinear::size(row, rows, tic.block_height_log2);
                 let mut raw = vec![0u8; size];
                 g.read(tic.addr, &mut raw)
                     .map_err(|f| format!("texture: {f:?}"))?;
@@ -260,15 +320,42 @@ impl Texture {
                     &raw,
                     row,
                     row.next_multiple_of(16),
-                    tic.height,
+                    rows,
                     tic.block_height_log2,
                 )
             }
         };
-        let texels = linear
-            .chunks_exact(bpp as usize)
-            .map(|t| swizzle(tic, components(tic, t)))
-            .collect();
+        let texels = if (bw, bh) == (1, 1) {
+            linear
+                .chunks_exact(bpp as usize)
+                .map(|t| swizzle(tic, components(tic, t)))
+                .collect()
+        } else {
+            let (w, h) = (tic.width as usize, tic.height as usize);
+            let mut texels = vec![[0f32; 4]; w * h];
+            let mut block = vec![0u32; (bw * bh) as usize];
+            for (i, data) in linear.chunks_exact(bpp as usize).enumerate() {
+                let (bx, by) = (i as u32 % cols, i as u32 / cols);
+                decode_block(tic.format, bw, bh, data, &mut block);
+                for (k, &p) in block.iter().enumerate() {
+                    let (x, y) = (
+                        (bx * bw) as usize + k % bw as usize,
+                        (by * bh) as usize + k / bw as usize,
+                    );
+                    if x < w && y < h {
+                        let [b, gr, r, a] = p.to_le_bytes();
+                        let mut c = [r, gr, b, a].map(|v| f32::from(v) / 255.0);
+                        if tic.srgb {
+                            for v in &mut c[..3] {
+                                *v = srgb_to_linear(*v);
+                            }
+                        }
+                        texels[y * w + x] = swizzle(tic, c);
+                    }
+                }
+            }
+            texels
+        };
         Ok(Texture {
             width: tic.width,
             height: tic.height,
@@ -420,7 +507,7 @@ mod tests {
             (0x12_3456_7800, 4, 2, Some(64))
         );
         assert_eq!(t.swizzle, [2, 3, 4, 5]);
-        assert_eq!(t.bytes_per_texel(), 4);
+        assert_eq!(t.element(), (1, 1, 4));
         assert_eq!(components(&t, &[255, 0, 51, 255]), [1.0, 0.0, 0.2, 1.0]);
     }
 
@@ -436,6 +523,20 @@ mod tests {
         assert_eq!(s.border, [0.0, 0.0, 0.0, 1.0]);
         let t = Tic::parse(&build::rgba8_tic(0x1000, 16, 16, None, 2)).unwrap();
         assert_eq!((t.pitch, t.block_height_log2), (None, 2));
+    }
+
+    #[test]
+    fn bc1_block() {
+        // Color 0 red (565 0xF800), color 1 blue (0x001F); indices: row 0
+        // all 0 (red), row 1 all 1 (blue), rows 2-3 color 2 (2/3 red).
+        let block = [0x00, 0xF8, 0x1F, 0x00, 0x00, 0x55, 0xAA, 0xAA];
+        let mut out = [0u32; 16];
+        decode_block(0x24, 4, 4, &block, &mut out);
+        assert_eq!(out[0].to_le_bytes(), [0, 0, 255, 255]); // B, G, R, A
+        assert_eq!(out[4].to_le_bytes(), [255, 0, 0, 255]);
+        let mut tic = Tic::parse(&build::rgba8_tic(0, 8, 8, Some(64), 0)).unwrap();
+        tic.format = 0x24;
+        assert_eq!(tic.element(), (4, 4, 8));
     }
 
     #[test]

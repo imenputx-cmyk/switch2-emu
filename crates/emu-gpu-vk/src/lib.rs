@@ -1369,7 +1369,7 @@ impl VulkanBackend {
         }
         // Render-to-texture: write rendered images back first.
         let overlaps = resolved.iter().any(|(_, tic, _)| {
-            let size = u64::from(tic.width * tic.bytes_per_texel()) * u64::from(tic.height) * 2;
+            let size = tic.size_bytes();
             self.images.keys().any(|(asid, s)| {
                 *asid == g.asid
                     && s.addr < tic.addr + size
