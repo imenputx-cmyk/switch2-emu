@@ -231,6 +231,7 @@ impl Service for AudioRenderer {
             8 | 11 | 12 => {} // SetRenderingTimeLimit, ExecuteAudioRendererRendering, SetVoiceDropParameter
             9 => ctx.push_u32(100),
             13 => ctx.push_u32(0), // GetVoiceDropParameter
+            14 => {}               // SetAsyncMemoryPoolControlEnabled
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())
@@ -272,6 +273,17 @@ impl Service for AudioDevice {
             5 => ctx.push_u32(2),                       // GetActiveChannelCount
             11 => ctx.push_event(&mut self.input_event, false),
             12 => ctx.push_event(&mut self.output_event, false),
+            // ListAudioOutputDeviceName: one output device.
+            14 => {
+                device_name_buffer(ctx)?;
+                ctx.push_u32(1);
+            }
+            // Acquire(Input|Output)DeviceNotification (17.0+): an event.
+            15 | 17 => ctx.push_event(&mut self.output_event, false),
+            // Release...Notification, SetAudioDeviceOutputVolumeAutoTuneEnabled.
+            16 | 18 | 19 => {}
+            // IsAudioDeviceOutputVolumeAutoTuneEnabled, IsActiveOutputDeviceEstimatedLowLatency.
+            20 | 21 => ctx.push_u32(0),
             _ => return Err(CallError::Unimplemented),
         }
         Ok(())
