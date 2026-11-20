@@ -136,6 +136,8 @@ pub struct HomebrewResult {
 #[cfg(feature = "window")]
 pub mod window;
 
+pub mod gdb;
+
 pub fn run_nro(nro: &[u8], max_steps: u64, trace_svcs: bool) -> Result<HomebrewResult, RunError> {
     run_nro_with(
         nro,
@@ -159,6 +161,9 @@ pub fn run_nro_with(
 /// Run guest code with the JIT when this build has one (`--cpu=interp`
 /// turns it off).
 pub static USE_JIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Serve a GDB remote stub on this TCP port (0: none); see [`gdb`].
+pub static GDB_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub static INTERRUPT: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
@@ -346,7 +351,12 @@ pub fn run_program_presenting(
         if jit { "dynarmic JIT" } else { "interpreter" }
     );
     hos.heartbeat = matches!(program, Program::Application(..));
-    let stop = hos.run(max_steps);
+    let port = GDB_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let stop = if port != 0 {
+        gdb::serve(&mut hos, port as u16, max_steps)
+    } else {
+        hos.run(max_steps)
+    };
     if !matches!(
         stop,
         emu_horizon::Stop::ReturnedToLoader(_) | emu_horizon::Stop::ExitProcess

@@ -520,3 +520,82 @@ fn homebrew_booted_as_an_application_nso() {
     assert!(out.starts_with("hosversion = 0x0\n"), "{out}");
     assert_eq!(r.stop, emu_horizon::Stop::ReturnedToLoader(0), "{out}");
 }
+
+#[test]
+fn gdb_stub_breakpoints_and_steps() {
+    use std::io::{Read, Write};
+    let mut hos = emu_horizon::Horizon::new();
+    hos.boot_homebrew(&program("hb_hello.nro")).expect("boots");
+    let entry = hos.cpu.pc();
+    // The NRO starts with a branch to its crt0; stop 4 bytes into it.
+    let first = hos.mem.read_uint(entry, 4).unwrap() as u32;
+    assert_eq!(first >> 26, 0b000101, "starts with B");
+    let crt0 = entry.wrapping_add((((first << 6) as i32) >> 4) as i64 as u64);
+    let bp = crt0 + 4;
+    let port = 40000 + (std::process::id() % 20000) as u16;
+    let client = std::thread::spawn(move || {
+        let mut s = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
+        let mut talk = |cmd: &str| -> String {
+            let sum = cmd.bytes().fold(0u8, |a, b| a.wrapping_add(b));
+            write!(s, "${cmd}#{sum:02x}").unwrap();
+            let mut reply = Vec::new();
+            let mut b = [0u8; 1];
+            // Skip the ack, read to '#', then the checksum.
+            loop {
+                s.read_exact(&mut b).unwrap();
+                if b[0] == b'$' {
+                    break;
+                }
+            }
+            loop {
+                s.read_exact(&mut b).unwrap();
+                if b[0] == b'#' {
+                    break;
+                }
+                reply.push(b[0]);
+            }
+            let mut sum = [0u8; 2];
+            s.read_exact(&mut sum).unwrap();
+            s.write_all(b"+").unwrap();
+            String::from_utf8(reply).unwrap()
+        };
+        let mut out = Vec::new();
+        out.push(talk("?"));
+        out.push(talk("p20")); // pc
+        out.push(talk(&format!("Z0,{bp:x},4")));
+        out.push(talk("c"));
+        out.push(talk("p20"));
+        out.push(talk("s"));
+        out.push(talk("p20"));
+        out.push(talk(&format!("m{entry:x},4")));
+        talk("D");
+        out
+    });
+    let stop = emu_run::gdb::serve(&mut hos, port, 10_000_000);
+    let out = client.join().unwrap();
+    let le = |v: u64| {
+        v.to_le_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    assert!(out[0].starts_with("T05"), "{out:?}");
+    assert_eq!(out[1], le(entry));
+    assert!(
+        out[3].starts_with("T05") && out[3].contains("swbreak"),
+        "{out:?}"
+    );
+    assert_eq!(out[4], le(bp));
+    assert_eq!(out[6], le(bp + 4));
+    assert_eq!(out[7].len(), 8);
+    // Detached: the program ran to its end.
+    assert!(
+        matches!(stop, emu_horizon::Stop::ReturnedToLoader(_)),
+        "{stop:?}"
+    );
+}

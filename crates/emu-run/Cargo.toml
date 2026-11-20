@@ -15,9 +15,13 @@ png = "0.17"
 minifb = { version = "0.28", optional = true }
 ctrlc = "3"
 
+# XInput controllers in the window front end (Windows).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_XboxController"], optional = true }
+
 [features]
 # Show presented frames in a window (minifb). Off by default so headless
 # builds (CI, servers) need no windowing libraries.
-window = ["dep:minifb"]
+window = ["dep:minifb", "dep:windows-sys"]
 # Use the dynarmic JIT by default (see emu-jit).
 jit = ["emu-horizon/jit"]

@@ -98,6 +98,8 @@ fn read_keys(win: &Window) -> InputState {
         (Key::V, button::Y),
         (Key::Q, button::L),
         (Key::E, button::R),
+        (Key::R, button::ZL),
+        (Key::F, button::ZR),
         (Key::Enter, button::PLUS),
         (Key::Space, button::PLUS),
         (Key::Backspace, button::MINUS),
@@ -111,9 +113,77 @@ fn read_keys(win: &Window) -> InputState {
         (false, true) => 32767,
         _ => 0,
     };
-    InputState {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut state = InputState {
         buttons,
         stick_l: (axis(Key::A, Key::D), axis(Key::S, Key::W)),
-        stick_r: (0, 0),
+        stick_r: (axis(Key::J, Key::L), axis(Key::K, Key::I)),
+    };
+    #[cfg(windows)]
+    xinput::merge(&mut state);
+    state
+}
+
+/// The first connected XInput (Xbox-style) controller, mapped by
+/// position to the Switch layout: the bottom face button is B, the right
+/// one A, and so on.
+#[cfg(windows)]
+mod xinput {
+    use super::button;
+    use emu_horizon::services::hid::InputState;
+    use windows_sys::Win32::UI::Input::XboxController::*;
+
+    pub fn merge(state: &mut InputState) {
+        for user in 0..4 {
+            // SAFETY: XInputGetState writes a XINPUT_STATE.
+            let mut s: XINPUT_STATE = unsafe { std::mem::zeroed() };
+            if unsafe { XInputGetState(user, &mut s) } != 0 {
+                continue;
+            }
+            let pad = s.Gamepad;
+            let b = u32::from(pad.wButtons);
+            for (mask, bit) in [
+                (XINPUT_GAMEPAD_A, button::B),
+                (XINPUT_GAMEPAD_B, button::A),
+                (XINPUT_GAMEPAD_X, button::Y),
+                (XINPUT_GAMEPAD_Y, button::X),
+                (XINPUT_GAMEPAD_LEFT_SHOULDER, button::L),
+                (XINPUT_GAMEPAD_RIGHT_SHOULDER, button::R),
+                (XINPUT_GAMEPAD_START, button::PLUS),
+                (XINPUT_GAMEPAD_BACK, button::MINUS),
+                (XINPUT_GAMEPAD_DPAD_LEFT, button::LEFT),
+                (XINPUT_GAMEPAD_DPAD_RIGHT, button::RIGHT),
+                (XINPUT_GAMEPAD_DPAD_UP, button::UP),
+                (XINPUT_GAMEPAD_DPAD_DOWN, button::DOWN),
+                (XINPUT_GAMEPAD_LEFT_THUMB, button::STICK_L),
+                (XINPUT_GAMEPAD_RIGHT_THUMB, button::STICK_R),
+            ] {
+                if b & u32::from(mask) != 0 {
+                    state.buttons |= bit;
+                }
+            }
+            if pad.bLeftTrigger > 64 {
+                state.buttons |= button::ZL;
+            }
+            if pad.bRightTrigger > 64 {
+                state.buttons |= button::ZR;
+            }
+            // Sticks, with a dead zone; keyboard input wins when held.
+            let axis = |v: i16| {
+                let v = i32::from(v).clamp(-32767, 32767);
+                if v.abs() < 7849 {
+                    0
+                } else {
+                    v
+                }
+            };
+            if state.stick_l == (0, 0) {
+                state.stick_l = (axis(pad.sThumbLX), axis(pad.sThumbLY));
+            }
+            if state.stick_r == (0, 0) {
+                state.stick_r = (axis(pad.sThumbRX), axis(pad.sThumbRY));
+            }
+            return;
+        }
     }
 }

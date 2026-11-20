@@ -106,6 +106,14 @@ pub enum Stop {
     /// The CPU stopped (fault, undefined instruction, BRK, ...).
     Cpu(Exit),
     StepLimit,
+    /// Debugger: a breakpoint at `pc` was reached (not executed yet).
+    Breakpoint {
+        pc: u64,
+    },
+    /// Debugger: one instruction was executed.
+    Stepped {
+        pc: u64,
+    },
     /// The host interrupted the emulation (Ctrl+C).
     Interrupted,
     /// The program spins on a branch to itself (`b .`), how SDK code
@@ -147,6 +155,13 @@ pub struct Horizon {
     pub interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Print a status line every few seconds.
     pub heartbeat: bool,
+    /// Debugger: stop before executing these addresses.
+    pub breakpoints: std::collections::BTreeSet<u64>,
+    /// Debugger: stop after one instruction.
+    pub single_step: bool,
+    /// Debugger: the next instruction runs even if it has a breakpoint
+    /// (resuming from one).
+    pub skip_breakpoint_once: bool,
     /// Loaded modules: (base, size).
     pub modules: Vec<(u64, u64)>,
     /// The last SVCs: (id, pc).
@@ -206,6 +221,9 @@ impl Horizon {
             stubbed: Default::default(),
             interrupt: None,
             heartbeat: false,
+            breakpoints: Default::default(),
+            single_step: false,
+            skip_breakpoint_once: false,
             modules: Vec::new(),
             recent_svcs: Default::default(),
             recent_queries: Default::default(),
@@ -264,6 +282,41 @@ impl Horizon {
             return jit.run(&mut self.cpu, &mut self.mem, steps);
         }
         self.cpu.run(&mut self.mem, steps)
+    }
+
+    /// Runs up to `steps` instructions one at a time on the interpreter,
+    /// stopping at breakpoints and after a single step.
+    fn debug_run(&mut self, steps: u64) -> Result<Option<Exit>, Stop> {
+        for _ in 0..steps {
+            let pc = self.cpu.pc();
+            if self.breakpoints.contains(&pc) && !std::mem::take(&mut self.skip_breakpoint_once) {
+                return Err(Stop::Breakpoint { pc });
+            }
+            self.skip_breakpoint_once = false;
+            if let Some(exit) = self.cpu.run(&mut self.mem, 1) {
+                if self.single_step {
+                    self.single_step = false;
+                    if let Exit::Svc(id) = exit {
+                        // Finish the SVC, then report the step.
+                        self.svc(id)?;
+                    } else {
+                        return Ok(Some(exit));
+                    }
+                    return Err(Stop::Stepped { pc: self.cpu.pc() });
+                }
+                return Ok(Some(exit));
+            }
+            if self.single_step {
+                self.single_step = false;
+                return Err(Stop::Stepped { pc: self.cpu.pc() });
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drops all recompiled code (after a debugger wrote guest memory).
+    pub fn invalidate_all_code(&mut self) {
+        self.invalidate_code();
     }
 
     /// Drops recompiled code after the guest's memory layout changed.
@@ -617,7 +670,16 @@ impl Horizon {
             if budget == 0 {
                 return Stop::StepLimit;
             }
-            match self.run_cpu(budget.min(threads::TIME_SLICE)) {
+            let slice = budget.min(threads::TIME_SLICE);
+            let exit = if self.single_step || !self.breakpoints.is_empty() {
+                match self.debug_run(slice) {
+                    Ok(exit) => exit,
+                    Err(stop) => return stop,
+                }
+            } else {
+                self.run_cpu(slice)
+            };
+            match exit {
                 None => {
                     // GPU channels waiting on a semaphore the CPU releases.
                     if self.system.gpu.has_stalled() {

@@ -96,7 +96,29 @@ cargo run --release -p emu-run -- --keys=prod.keys game.nsp  # an application (N
 [dynarmic](https://github.com/azahar-emu/dynarmic) (the JIT yuzu, Eden and
 Lichii use), vendored in `third_party/` (see `third_party/README.md`). It
 needs CMake and a C++20 compiler. `--cpu=interp` switches back to the
-interpreter, which also handles anything dynarmic does not.
+interpreter, which also handles anything dynarmic does not. The JIT
+reaches the guest's read-write pages directly through a page table
+(fast memory); other accesses go through callbacks.
+
+## Debugging
+
+`--gdb` (or `--gdb=PORT`, default 6543) waits for a debugger speaking the
+GDB remote protocol before the program starts: GDB
+(`target remote 127.0.0.1:6543`), LLDB (`gdb-remote 6543`), IDA or Ghidra.
+Registers (X0-X30, SP, PC, CPSR, V0-V31, FPSR, FPCR), memory reads and
+writes, software breakpoints, single steps, continue, Ctrl+C and the
+guest's threads work. With breakpoints set, the guest runs on the
+interpreter one instruction at a time.
+
+## Controls (window front end)
+
+| Switch | Keyboard | Xbox-style controller (XInput) |
+|---|---|---|
+| A / B / X / Y | X / Z / C / V | B / A / Y / X (by position) |
+| L / R / ZL / ZR | Q / E / R / F | LB / RB / LT / RT |
+| + / - | Enter or Space / Backspace | Start / Back |
+| D-pad | arrow keys | D-pad |
+| Left / right stick | WASD / IJKL | sticks (and stick clicks) |
 
 ## License
 

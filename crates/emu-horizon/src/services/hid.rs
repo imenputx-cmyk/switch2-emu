@@ -111,8 +111,12 @@ pub mod button {
     pub const B: u64 = 1 << 1;
     pub const X: u64 = 1 << 2;
     pub const Y: u64 = 1 << 3;
+    pub const STICK_L: u64 = 1 << 4;
+    pub const STICK_R: u64 = 1 << 5;
     pub const L: u64 = 1 << 6;
     pub const R: u64 = 1 << 7;
+    pub const ZL: u64 = 1 << 8;
+    pub const ZR: u64 = 1 << 9;
     pub const PLUS: u64 = 1 << 10;
     pub const MINUS: u64 = 1 << 11;
     pub const LEFT: u64 = 1 << 12;
