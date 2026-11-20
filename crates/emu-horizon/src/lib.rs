@@ -490,6 +490,34 @@ impl Horizon {
             }
             s += "\n";
         }
+        for (i, t) in self.threads.iter().enumerate() {
+            s += &format!("thread {i}: {:?}", t.state);
+            if let threads::ThreadState::Waiting {
+                on: threads::WaitOn::Sync(handles),
+                ..
+            } = &t.state
+            {
+                for h in handles {
+                    match self.handles.get(*h) {
+                        Some(KObject::Event { id }) => {
+                            s += &format!(
+                                " [{h:#x}: event {id}, signalled {}]",
+                                self.kobjects.events[*id]
+                            )
+                        }
+                        Some(KObject::Session { id }) => {
+                            s += &format!(
+                                " [{h:#x}: session {}]",
+                                self.sessions[*id].object.borrow().name()
+                            )
+                        }
+                        Some(o) => s += &format!(" [{h:#x}: {o:?}]"),
+                        None => s += &format!(" [{h:#x}: invalid]"),
+                    }
+                }
+            }
+            s += "\n";
+        }
         for (addr, base, size, state) in &self.recent_queries {
             s += &format!("query {addr:#x} -> base {base:#x} size {size:#x} state {state:#x}\n");
         }

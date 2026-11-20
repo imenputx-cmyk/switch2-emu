@@ -69,9 +69,27 @@ impl Service for Empty {
     }
 }
 
-#[derive(Default)]
+/// Applet messages (`ReceiveMessage`).
+pub mod message {
+    pub const FOCUS_STATE_CHANGED: u32 = 15;
+}
+
+/// `ICommonStateGetter`. An application starts with one message,
+/// FocusStateChanged (now in focus), and its message event signalled,
+/// as Horizon's lifecycle manager does (Lichii/Eden
+/// `am/lifecycle_manager.cpp`); SDK start-up waits for it.
 pub struct CommonStateGetter {
     message_event: Option<usize>,
+    messages: std::collections::VecDeque<u32>,
+}
+
+impl Default for CommonStateGetter {
+    fn default() -> Self {
+        CommonStateGetter {
+            message_event: None,
+            messages: [message::FOCUS_STATE_CHANGED].into(),
+        }
+    }
 }
 
 impl Service for CommonStateGetter {
@@ -81,11 +99,26 @@ impl Service for CommonStateGetter {
 
     fn call(&mut self, command: u32, ctx: &mut Ctx) -> Result<(), CallError> {
         match command {
-            0 => ctx.push_event(&mut self.message_event, false), // GetEventHandle
-            1 => return Err(CallError::Result(RESULT_NO_MESSAGE)), // ReceiveMessage
-            5 => ctx.push_u8(0),                                 // GetOperationMode: handheld
-            6 => ctx.push_u32(0),                                // GetPerformanceMode: normal
-            9 => ctx.push_u8(1),                                 // GetCurrentFocusState: in focus
+            0 => {
+                // GetEventHandle: signalled while messages are queued.
+                let pending = !self.messages.is_empty();
+                ctx.push_event(&mut self.message_event, pending);
+            }
+            1 => {
+                // ReceiveMessage
+                let Some(m) = self.messages.pop_front() else {
+                    return Err(CallError::Result(RESULT_NO_MESSAGE));
+                };
+                if self.messages.is_empty() {
+                    if let Some(e) = self.message_event {
+                        ctx.kernel.events[e] = false;
+                    }
+                }
+                ctx.push_u32(m);
+            }
+            5 => ctx.push_u8(0),  // GetOperationMode: handheld
+            6 => ctx.push_u32(0), // GetPerformanceMode: normal
+            9 => ctx.push_u8(1),  // GetCurrentFocusState: in focus
             // GetDefaultDisplayResolution: handheld 1280x720.
             60 => {
                 ctx.push_u32(1280);
