@@ -155,6 +155,14 @@ pub fn present(width: u32, height: u32, rgba: &[u8]) {
     }
 }
 
+/// Whether the next draw is one to report (the backend must then write
+/// its images back first, or the report reads stale guest memory).
+pub fn active() -> bool {
+    let Some(cfg) = config() else { return false };
+    let n = DRAWS.load(Ordering::Relaxed);
+    n >= cfg.skip && n < cfg.skip + cfg.count
+}
+
 /// Reports one draw (after the backend ran it).
 pub fn draw(g: &GuestMemory, d: &Draw, shader_words: &[(String, Vec<u8>)]) {
     let Some(cfg) = config() else { return };

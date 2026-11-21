@@ -937,6 +937,9 @@ impl Maxwell3D {
                 .map(|i| f32::from_bits(self.reg(reg::BLEND_CONSTANT + 4 * i))),
         };
         ctx.backend.draw(&mut ctx.guest, &d)?;
+        if crate::framedebug::active() {
+            let _ = ctx.backend.flush(&mut ctx.guest);
+        }
         crate::framedebug::draw(&ctx.guest, &d, &[]);
         self.draws += 1;
         Ok(())
