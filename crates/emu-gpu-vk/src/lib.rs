@@ -1997,7 +1997,12 @@ impl VulkanBackend {
             for (i, (&handle, &kind)) in t.textures.iter().zip(&t.texture_kinds).enumerate() {
                 let word = emu_gpu::draw::texture_handle_word(g, &d.textures, cbufs, handle)?;
                 let (tic, tsc) = texture::resolve(g, &d.textures, word)?;
-                if spirv::TexKind::for_tic_type(tic.ty) != kind {
+                // A plain 2D texture sampled by an array instruction is an
+                // array of one layer.
+                let tic_kind = spirv::TexKind::for_tic_type(tic.ty);
+                if tic_kind != kind
+                    && !(kind == spirv::TexKind::D2Array && tic_kind == spirv::TexKind::D2)
+                {
                     return Err(format!("texture type {} sampled as {kind:?}", tic.ty));
                 }
                 if tsc.wrap.iter().take(2).any(|&m| address_mode(m).is_none()) {

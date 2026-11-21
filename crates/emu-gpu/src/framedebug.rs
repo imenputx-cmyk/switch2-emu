@@ -252,6 +252,7 @@ pub fn draw(g: &GuestMemory, d: &Draw, shader_words: &[(String, Vec<u8>)]) {
         let _ = writeln!(s, "\n-- NVN2 root tables ({} bytes, first 512) --", t.len());
         s += &bit_dump(0, &t[..t.len().min(512)]);
     }
+    s += &crate::draw::describe_textures(g, d);
     // First vertices of every enabled stream, and the first indices.
     let first = d.ranges.first().copied().unwrap_or((0, 0));
     if let Some(ix) = &d.index {

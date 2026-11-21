@@ -912,3 +912,83 @@ mod raster_tests {
         }
     }
 }
+
+/// A text description of the textures a draw's shaders use: header,
+/// where the texels are, and whether they hold anything (frame debugger).
+pub(crate) fn describe_textures(g: &GuestMemory, d: &Draw) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for (name, prog, cbufs) in [
+        ("vertex", &d.vs, &d.vs_cbufs),
+        ("pixel", &d.ps, &d.ps_cbufs),
+    ] {
+        for handle in texture_handles(prog) {
+            let _ = writeln!(s, "\n-- {name} texture, handle offset {handle:#x} --");
+            let word = match texture_handle_word(g, &d.textures, cbufs, handle) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = writeln!(s, "  handle word unreadable: {e}");
+                    continue;
+                }
+            };
+            let _ = writeln!(
+                s,
+                "  handle word {word:#010x} (tic index {}, tsc index {}); pools {:?}",
+                word & 0xF_FFFF,
+                word >> 20,
+                d.textures
+            );
+            let (tic, tsc) = match texture::resolve(g, &d.textures, word) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = writeln!(s, "  not resolved: {e}");
+                    continue;
+                }
+            };
+            let _ = writeln!(s, "  {tic:?}\n  {tsc:?}");
+            let mut raw = [0u8; 32];
+            let _ = g.read(d.textures.tic + 32 * u64::from(word & 0xF_FFFF), &mut raw);
+            s += &crate::framedebug::bit_dump(
+                d.textures.tic + 32 * u64::from(word & 0xF_FFFF),
+                &raw,
+            );
+            // The texel memory: how much of its first megabyte is nonzero.
+            let mut buf = vec![0u8; 1 << 20];
+            let got = g.read(tic.addr, &mut buf).is_ok();
+            if got {
+                let nz = buf.iter().filter(|&&b| b != 0).count();
+                let _ = writeln!(
+                    s,
+                    "  texel memory at {:#x}: {nz} of {} bytes nonzero in the first MiB",
+                    tic.addr,
+                    buf.len()
+                );
+                s += &crate::framedebug::bit_dump(tic.addr, &buf[..64]);
+            } else {
+                let _ = writeln!(s, "  texel memory at {:#x}: unreadable", tic.addr);
+            }
+            match texture::Texture::decode(g, &tic) {
+                Ok(t) => {
+                    let lit = t
+                        .texels
+                        .iter()
+                        .filter(|c| c.iter().any(|&v| v != 0.0))
+                        .count();
+                    let _ = writeln!(
+                        s,
+                        "  decoded {}x{} ({} layers): {lit} of {} texels nonzero; first texel {:?}",
+                        t.width,
+                        t.height,
+                        t.layers,
+                        t.texels.len(),
+                        t.texels.first()
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(s, "  decode failed: {e}");
+                }
+            }
+        }
+    }
+    s
+}
