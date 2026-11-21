@@ -753,6 +753,50 @@ mod tests {
     }
 
     #[test]
+    fn macro_parameters_run_across_macro_registers() {
+        use engines::mme64::asm::{inst, Lane, LOAD0, NOP, ZERO};
+        let (mut gpu, mut mem) = setup();
+        // Macro: method 0xd80 = load0 + load1.
+        let mut first = inst(
+            false,
+            0,
+            0,
+            [
+                Lane {
+                    op: 0,
+                    dst: 0,
+                    src_a: LOAD0,
+                    src_b: LOAD0 + 1,
+                    imm: 0,
+                    out_method: 6,
+                    out_emit: 1,
+                },
+                Lane {
+                    imm: 0x0d80 / 4,
+                    ..NOP
+                },
+            ],
+        );
+        first[2] |= 1; // end
+        let second = inst(false, 0, 0, [NOP, Lane { dst: ZERO, ..NOP }]);
+        let mut words = vec![incr(0, 0, 1), class::AMPERE_THREED];
+        words.extend([incr(0, 0x114, 1), 0, (3 << 29) | (6 << 16) | (0x118 / 4)]);
+        words.extend(first);
+        words.extend(second);
+        words.extend([incr(0, 0x11C, 2), 0, 0]);
+        // One incrementing run over macro 0's registers and into macro
+        // 1's: all three words are macro 0's parameters.
+        words.extend([incr(0, 0x3800, 3), 40, 2, 99]);
+        run(&mut gpu, &mut mem, &words);
+        let Some(Engine::ThreeD(e)) = &gpu.channels[0].subchannels[0] else {
+            panic!()
+        };
+        assert_eq!(e.reg(0x0d80), 42);
+        assert_eq!(e.macro_calls, 1);
+        assert!(gpu.faults.is_empty(), "{:?}", gpu.faults);
+    }
+
+    #[test]
     fn switch2_acquire_waits_for_the_cpu() {
         let (mut gpu, mut mem) = setup();
         // Bind Ampere 3D; acquire (GEQ 1) on 0x1000_8000, which holds 0;

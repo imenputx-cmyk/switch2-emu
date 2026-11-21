@@ -283,10 +283,13 @@ impl Maxwell3D {
         // CALL_MME_MACRO(j) (even words) starts a call with its first
         // parameter; CALL_MME_DATA(j) (odd) adds parameters.
         let index = ((method - reg::MACRO_CALLS / 4) / 2) as usize;
-        if method.is_multiple_of(2) {
-            self.pending_call = Some((index, vec![value]));
-        } else if let Some((_, params)) = self.pending_call.as_mut() {
+        // Every word of a macro register run is a parameter of the macro
+        // its first word started, whichever macro register it lands on
+        // (NVN2 calls with incrementing headers; Lichii CallMethodSlow).
+        if let Some((_, params)) = self.pending_call.as_mut() {
             params.push(value);
+        } else if method.is_multiple_of(2) {
+            self.pending_call = Some((index, vec![value]));
         }
         if last {
             if let Some((index, params)) = self.pending_call.take() {
