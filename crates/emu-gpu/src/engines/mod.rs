@@ -18,6 +18,9 @@ pub struct EngineCtx<'a> {
     pub backend: &'a mut dyn Backend,
     /// MME64 macros (Ampere classes), shared by every channel.
     pub mme: &'a mut super::engines::mme64::Shared,
+    /// The channel's MME data RAM, shared by its 3D and compute engines
+    /// (Lichii channel_state.cpp: compute uses the 3D engine's).
+    pub data_ram: &'a mut Vec<u32>,
 }
 
 impl EngineCtx<'_> {

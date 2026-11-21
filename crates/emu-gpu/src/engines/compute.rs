@@ -37,7 +37,6 @@ pub const MAX_INVOCATIONS: u64 = 1 << 21;
 pub struct Compute {
     regs: Vec<u32>,
     inline: InlineToMemory,
-    data_ram: Vec<u32>,
     pending_call: Option<(usize, Vec<u32>)>,
     scheduler: Scheduler,
     programs: HashMap<u64, Vec<Inst>>,
@@ -57,7 +56,6 @@ impl Default for Compute {
         Compute {
             regs: vec![0; REGS],
             inline: InlineToMemory::default(),
-            data_ram: vec![0; 0xC00],
             pending_call: None,
             scheduler: Scheduler::default(),
             programs: HashMap::new(),
@@ -89,7 +87,7 @@ impl Mme64Target for Target<'_, '_, '_> {
     }
 
     fn data_ram(&mut self) -> &mut [u32] {
-        &mut self.engine.data_ram
+        self.ctx.data_ram
     }
 }
 

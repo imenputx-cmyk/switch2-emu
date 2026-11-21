@@ -137,7 +137,6 @@ pub struct Maxwell3D {
     /// Bound as the Ampere 3D class: macros are MME64 code.
     ampere: bool,
     /// MME64 data RAM.
-    pub data_ram: Vec<u32>,
     /// NVN2 root tables (8 x 64 words), loaded through methods 0x504
     /// (select table and byte offset) and 0x508 (data), as in Lichii.
     pub root_tables: [[u32; 64]; 8],
@@ -177,7 +176,7 @@ impl Mme64Target for Target64<'_, '_, '_> {
     }
 
     fn data_ram(&mut self) -> &mut [u32] {
-        &mut self.engine.data_ram
+        self.ctx.data_ram
     }
 }
 
@@ -219,7 +218,6 @@ impl Default for Maxwell3D {
             failed_programs: Default::default(),
             draws: 0,
             ampere: false,
-            data_ram: Vec::new(),
             root_tables: [[0; 64]; 8],
             root_select: (0, 0),
             failed_macros: Default::default(),
@@ -233,7 +231,6 @@ impl Maxwell3D {
     pub fn ampere() -> Self {
         Maxwell3D {
             ampere: true,
-            data_ram: vec![0; 0xC00],
             ..Self::default()
         }
     }
@@ -428,7 +425,7 @@ impl Maxwell3D {
                     let words = self.dma_read(value, ctx);
                     let base = self.reg(reg::MME_DATA_RAM_ADDRESS) as usize;
                     for (i, w) in words.into_iter().enumerate() {
-                        if let Some(slot) = self.data_ram.get_mut(base + i) {
+                        if let Some(slot) = ctx.data_ram.get_mut(base + i) {
                             *slot = w;
                         }
                     }

@@ -167,6 +167,48 @@ fn decode(bits: [u32; 3]) -> Decoded {
     d
 }
 
+/// Steps kept for failure details.
+const RING: usize = 32;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Step {
+    valid: bool,
+    pc: u32,
+    ops: [u32; 2],
+    xs: [u32; 2],
+    ys: [u32; 2],
+    alu: [u32; 2],
+    next: u32,
+    loop_count: u32,
+    read: Option<(u32, u32)>,
+    consumed: u32,
+}
+
+/// A failure's details: the parameters and the last steps.
+fn describe(ring: &[Step; RING], step: usize, params: &[u32], consumed: usize) -> String {
+    let mut s = format!(
+        "  {} parameters, {consumed} consumed: {:x?}{}\n  last steps:\n",
+        params.len(),
+        &params[..params.len().min(24)],
+        if params.len() > 24 { " ..." } else { "" }
+    );
+    for k in 0..RING {
+        let st = &ring[(step + k) % RING];
+        if !st.valid {
+            continue;
+        }
+        s += &format!(
+            "    pc {:#x}: ops {:?} x {:x?} y {:x?} -> {:x?}, next {:#x}, loop {}, used {}",
+            st.pc, st.ops, st.xs, st.ys, st.alu, st.next, st.loop_count, st.consumed
+        );
+        if let Some((r, v)) = st.read {
+            s += &format!(", read reg {r:#x} = {v:#x}");
+        }
+        s.push('\n');
+    }
+    s
+}
+
 /// Runs the macro at instruction `start` of `code` (three words per
 /// instruction) with `params` as its load FIFO.
 pub fn execute(
@@ -182,8 +224,9 @@ pub fn execute(
     let (mut loop_count, mut loop_start, mut loop_end) = (0u32, 0u32, 0u32);
     let mut consumed = 0usize;
     let mut end_next = false;
-    // The last steps (pc, ALU results, register reads), for a runaway macro.
-    let mut trail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // The last steps, for the details of a failure.
+    let mut ring = [Step::default(); RING];
+    let mut read_note: Option<(u32, u32)> = None;
 
     for step in 0..STEP_LIMIT {
         let err = |message| Mme64Error {
@@ -201,7 +244,11 @@ pub fn execute(
         for (slot, &wanted) in load.iter_mut().zip(&d.load) {
             if wanted {
                 let Some(&v) = params.get(consumed) else {
-                    return Err(err("parameter FIFO underflow"));
+                    return Err(Mme64Error {
+                        pc,
+                        message: "parameter FIFO underflow",
+                        detail: describe(&ring, step as usize, params, consumed),
+                    });
                 };
                 *slot = v;
                 consumed += 1;
@@ -306,12 +353,7 @@ pub fn execute(
                 17..=21 => value = if condition(d.op[lane]) { u32::MAX } else { 0 },
                 22 => {
                     value = target.read(x.wrapping_add(y) & 0xFFFF);
-                    if step + 64 >= STEP_LIMIT {
-                        trail.push_back(format!(
-                            "  read reg {:#x} = {value:#x}",
-                            x.wrapping_add(y) & 0xFFFF
-                        ));
-                    }
+                    read_note = Some((x.wrapping_add(y) & 0xFFFF, value));
                 }
                 23 => {
                     if loop_count != 0 || imm < 2 {
@@ -394,15 +436,18 @@ pub fn execute(
             }
         }
 
-        if step + 32 >= STEP_LIMIT {
-            trail.push_back(format!(
-                "  pc {pc:#x}: ops {:?} x {xs:x?} y {ys:x?} -> {alu:x?}, next {next_pc:#x}, loop {loop_count}",
-                d.op
-            ));
-            while trail.len() > 48 {
-                trail.pop_front();
-            }
-        }
+        ring[step as usize % RING] = Step {
+            valid: true,
+            pc,
+            ops: d.op,
+            xs,
+            ys,
+            alu,
+            next: next_pc,
+            loop_count,
+            read: read_note.take(),
+            consumed: consumed as u32,
+        };
         if end_next || stopped {
             return Ok(());
         }
@@ -413,27 +458,10 @@ pub fn execute(
         }
         pc = next_pc;
     }
-    let mut detail = String::from("last steps:\n");
-    for line in trail {
-        detail += &line;
-        detail.push('\n');
-    }
-    detail += &format!("  registers {regs:x?}\n  code from {start:#x}:");
-    let from = start as usize * 3;
-    let to = (pc as usize * 3 + 24).min(code.len());
-    for (i, w) in code.get(from..to).unwrap_or(&[]).chunks(3).enumerate() {
-        detail += &format!(
-            "\n    {:#x}: {:08x} {:08x} {:08x}",
-            start as usize + i,
-            w[0],
-            w.get(1).unwrap_or(&0),
-            w.get(2).unwrap_or(&0)
-        );
-    }
     Err(Mme64Error {
         pc,
-        message: "instruction limit exceeded",
-        detail,
+        message: "instruction limit reached (runaway macro)",
+        detail: describe(&ring, STEP_LIMIT as usize, params, consumed),
     })
 }
 

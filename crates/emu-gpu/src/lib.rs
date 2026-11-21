@@ -137,6 +137,8 @@ pub struct Channel {
     ampere: bool,
     /// Host (GPFIFO class) method values, by method index.
     host_regs: [u32; 0x40],
+    /// MME data RAM, shared by the channel's 3D and compute engines.
+    pub data_ram: Vec<u32>,
 }
 
 pub struct Gpu {
@@ -258,6 +260,7 @@ impl Gpu {
             stalled: None,
             ampere: false,
             host_regs: [0; 0x40],
+            data_ram: vec![0; 0xC00],
         });
         id
     }
@@ -481,6 +484,11 @@ impl Gpu {
             mme,
             ..
         } = self;
+        let Channel {
+            subchannels,
+            data_ram,
+            ..
+        } = &mut channels[channel];
         let mut ctx = EngineCtx {
             guest: backend::GuestMemory {
                 mem,
@@ -491,11 +499,12 @@ impl Gpu {
             faults,
             backend: backend.as_mut(),
             mme,
+            data_ram,
         };
         let mut from_macros = Vec::new();
         // NVN2 writes inline-to-memory methods on subchannel 2 without
         // binding a class first (Lichii NX2_NOTES row 49).
-        let slot = &mut channels[channel].subchannels[subchannel];
+        let slot = &mut subchannels[subchannel];
         if slot.is_none() && subchannel == 2 {
             *slot = Some(Engine::Inline(InlineToMemory::default()));
         }
@@ -748,7 +757,7 @@ mod tests {
         };
         assert_eq!(e.class(), class::AMPERE_THREED);
         assert_eq!(e.reg(0x0d80), 42);
-        assert_eq!(e.data_ram[3], 0xABCD);
+        assert_eq!(gpu.channels[0].data_ram[3], 0xABCD);
         assert_eq!(e.macro_calls, 1);
     }
 
