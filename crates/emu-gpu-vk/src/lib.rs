@@ -22,7 +22,7 @@ use emu_gpu::draw::{topology, Draw};
 use emu_gpu::pipeline::{Blend, BlendFactor, BlendOp, Compare, DepthFormat, DepthSurface};
 use emu_gpu::shader::spirv;
 use emu_gpu::surface::ColorFormat;
-use emu_gpu::texture::{self, Texture, Tsc};
+use emu_gpu::texture::{self, Texture, Tic, Tsc};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -267,6 +267,9 @@ struct BoundTexture {
     cached: bool,
     binding: u32,
     kind: spirv::TexKind,
+    /// The texture is a surface the GPU rendered: sampled in place, no
+    /// guest-memory round trip.
+    direct: Option<(usize, Surface)>,
     texture: Texture,
     /// Mip levels 1.. (when the sampler uses mipmaps).
     mips: Vec<Texture>,
@@ -315,6 +318,8 @@ pub struct VulkanBackend {
     /// Storage buffers shaders wrote this batch: (guest address, index
     /// in `transient`, bytes), copied back at the flush.
     writebacks: Vec<(u64, usize, usize)>,
+    /// Rendered images in the sampled layout until the draw ends.
+    sampled: Vec<vk::Image>,
     /// Textures of the current batch, freed at flush.
     textures: Vec<TexImage>,
     /// Can RGBA32F textures be filtered linearly?
@@ -476,6 +481,7 @@ impl VulkanBackend {
             software: SoftwareBackend,
             layouts: HashMap::new(),
             writebacks: Vec::new(),
+            sampled: Vec::new(),
             textures: Vec::new(),
             linear_f32,
             limits,
@@ -679,6 +685,7 @@ impl VulkanBackend {
                     .tiling(vk::ImageTiling::OPTIMAL)
                     .usage(
                         vk::ImageUsageFlags::COLOR_ATTACHMENT
+                            | vk::ImageUsageFlags::SAMPLED
                             | vk::ImageUsageFlags::TRANSFER_SRC
                             | vk::ImageUsageFlags::TRANSFER_DST,
                     ),
@@ -915,6 +922,13 @@ impl VulkanBackend {
     unsafe fn flush_images(&mut self, g: &mut GuestMemory) -> Result<(), String> {
         if !self.recording {
             return Ok(());
+        }
+        for image in std::mem::take(&mut self.sampled) {
+            self.barrier(
+                image,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
         }
         let keys: Vec<(usize, Surface)> = self.images.keys().copied().collect();
         for key in &keys {
@@ -1927,6 +1941,13 @@ impl VulkanBackend {
             }
         }
         self.device.cmd_end_rendering(self.cmd);
+        for image in std::mem::take(&mut self.sampled) {
+            self.barrier(
+                image,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+        }
         Ok(())
     }
 }
@@ -2020,7 +2041,15 @@ impl VulkanBackend {
             }
         }
         // Render-to-texture: write rendered images back first.
-        let overlaps = resolved.iter().any(|(_, _, tic, _)| {
+        let own: Vec<Surface> = d.color_targets().into_iter().map(|(_, t)| t).collect();
+        let mut directs: Vec<Option<(usize, Surface)>> = Vec::new();
+        for (_, kind, tic, tsc) in &resolved {
+            directs.push(self.direct_surface(g, tic, tsc, *kind, &own));
+        }
+        let overlaps = resolved.iter().zip(&directs).any(|((_, _, tic, _), dr)| {
+            if dr.is_some() {
+                return false;
+            }
             let size = tic.size_bytes();
             self.images.keys().any(|(asid, s)| {
                 *asid == g.asid
@@ -2033,7 +2062,27 @@ impl VulkanBackend {
         }
         resolved
             .into_iter()
-            .map(|(binding, kind, tic, tsc)| {
+            .zip(directs)
+            .map(|((binding, kind, tic, tsc), direct)| {
+                if direct.is_some() {
+                    return Ok(BoundTexture {
+                        key: (g.asid, tic, kind, 1),
+                        hash: 0,
+                        cached: false,
+                        binding,
+                        kind,
+                        direct,
+                        texture: Texture {
+                            width: tic.width,
+                            height: tic.height,
+                            layers: 1,
+                            ty: tic.ty,
+                            texels: Vec::new(),
+                        },
+                        mips: Vec::new(),
+                        sampler: tsc,
+                    });
+                }
                 let levels = if tsc.mip_filter >= 2 {
                     tic.mip_levels()
                 } else {
@@ -2051,6 +2100,7 @@ impl VulkanBackend {
                         cached: true,
                         binding,
                         kind,
+                        direct: None,
                         texture: Texture {
                             width: tic.width,
                             height: tic.height,
@@ -2075,6 +2125,7 @@ impl VulkanBackend {
                     cached: false,
                     binding,
                     kind,
+                    direct: None,
                     texture: Texture::decode(g, &tic)?,
                     mips,
                     sampler: tsc,
@@ -2083,12 +2134,67 @@ impl VulkanBackend {
             .collect()
     }
 
+    /// A rendered surface this texture reads back unchanged (same
+    /// address, size and format), if any: it can be sampled in place.
+    fn direct_surface(
+        &self,
+        g: &GuestMemory,
+        tic: &Tic,
+        tsc: &Tsc,
+        kind: spirv::TexKind,
+        own: &[Surface],
+    ) -> Option<(usize, Surface)> {
+        if kind != spirv::TexKind::D2
+            || tic.ty != texture::ty::D2 && tic.ty != texture::ty::D2_NO_MIPMAP
+        {
+            return None;
+        }
+        if tsc.mip_filter >= 2 {
+            return None;
+        }
+        let key = self.images.keys().find(|(asid, s)| {
+            *asid == g.asid && s.addr == tic.addr && s.width == tic.width && s.height == tic.height
+        })?;
+        let s = key.1;
+        if own.iter().any(|o| o.addr == s.addr) {
+            return None;
+        }
+        let rgb1 = matches!(tic.swizzle, [2, 3, 4, 6 | 7]);
+        let rgba = tic.swizzle == [2, 3, 4, 5];
+        let ok = match s.format {
+            ColorFormat::R11G11B10Float => tic.format == 0x21 && rgb1,
+            ColorFormat::Rgba8Unorm => tic.format == 0x08 && !tic.srgb && rgba,
+            ColorFormat::Rgba8Srgb => tic.format == 0x08 && tic.srgb && rgba,
+            _ => false,
+        };
+        let layout_ok = match (tic.pitch, s.layout) {
+            (None, emu_gpu::backend::Layout::BlockLinear { block_height_log2 }) => {
+                block_height_log2 == tic.block_height_log2
+            }
+            _ => false,
+        };
+        (ok && layout_ok).then_some(*key)
+    }
+
     /// Uploads a texture (as RGBA32F) and creates its sampler, both
     /// freed at the next flush.
     unsafe fn upload_texture(
         &mut self,
         t: &BoundTexture,
     ) -> Result<(vk::ImageView, vk::Sampler), String> {
+        if let Some(key) = t.direct {
+            let img = &self.images[&key];
+            let (image, view) = (img.image, img.view);
+            if !self.sampled.contains(&image) {
+                self.barrier(
+                    image,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+                self.sampled.push(image);
+            }
+            return Ok((view, self.sampler(t)?));
+        }
         let view = match self.tex_cache.get(&t.key) {
             Some((img, hash)) if t.cached && *hash == t.hash => img.view,
             _ => self.upload_texture_image(t)?,
