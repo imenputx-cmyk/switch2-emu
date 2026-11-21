@@ -656,11 +656,23 @@ pub enum Op {
     TexN {
         dst0: u8,
         dst1: u8,
+        /// TEX dimension: 0 1D, 1 2D, 2 3D, 3 cube, 4 1D array, 5 2D
+        /// array, 7 cube array.
+        dim: u8,
         coords: [u8; 3],
         layer: u8,
         handle: u32,
         comps: u8,
         fetch: bool,
+        /// Sampling picks the level from derivatives (no LZ/LOD operand).
+        auto_lod: bool,
+    },
+    /// Computed branch (SM86 BRX): to the native byte offset `reg +
+    /// bias`. Lowered by the SM86 decoder into compares and branches
+    /// before any consumer sees it.
+    Brx {
+        reg: u8,
+        bias: u32,
     },
     Bra {
         target: usize,
@@ -832,7 +844,11 @@ impl Inst {
 
     /// Does execution never continue to the next instruction?
     pub fn is_terminal(&self) -> bool {
-        self.pred == PT && matches!(self.op, Op::Exit | Op::Bra { .. } | Op::Sync)
+        self.pred == PT
+            && matches!(
+                self.op,
+                Op::Exit | Op::Bra { .. } | Op::Sync | Op::Brx { .. }
+            )
     }
 }
 

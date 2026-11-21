@@ -192,10 +192,11 @@ impl Compute {
             let got = g
                 .read_prefix(address, &mut code)
                 .map_err(|f| format!("compute program at {address:#x}: {f:?}"))?;
-            let insts = match crate::shader::sm86::decode_program(&code) {
-                Err(crate::shader::decode::DecodeError::Truncated) if got == len => Vec::new(),
-                r => r.map_err(|e| format!("compute program at {address:#x}: {e:x?}"))?,
-            };
+            let insts =
+                match crate::shader::sm86::decode_program_ext(&code, got < len || len >= 1 << 20) {
+                    Err(crate::shader::decode::DecodeError::Truncated) if got == len => Vec::new(),
+                    r => r.map_err(|e| format!("compute program at {address:#x}: {e:x?}"))?,
+                };
             if is_complete(&insts) {
                 self.programs.insert(address, insts.clone());
                 return Ok(insts);

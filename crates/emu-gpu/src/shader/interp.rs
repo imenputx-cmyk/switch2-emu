@@ -1152,6 +1152,8 @@ impl Machine<'_> {
                 dst0,
                 dst1,
                 coords,
+                dim: _,
+                auto_lod: _,
                 layer,
                 handle,
                 comps,
@@ -1175,8 +1177,14 @@ impl Machine<'_> {
                     self.regs.set(texs_dst(dst0, dst1, k), t[c].to_bits());
                 }
             }
-            Op::Nop | Op::Bar | Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {
-            }
+            Op::Nop
+            | Op::Bar
+            | Op::Bra { .. }
+            | Op::Brx { .. }
+            | Op::Ssy { .. }
+            | Op::Sync
+            | Op::Kil
+            | Op::Exit => {}
         }
     }
 }

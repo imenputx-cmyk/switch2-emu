@@ -61,6 +61,9 @@ pub struct Tic {
     pub block_depth_log2: u32,
     /// Mip levels the view covers (for the layer stride).
     pub levels: u32,
+    /// Layer stride of the whole texture, for a single mip level's
+    /// header (see [`Tic::level`]).
+    pub stride_override: Option<u64>,
 }
 
 /// Texture types (TIC word 4).
@@ -194,6 +197,7 @@ impl Tic {
             depth: bits(w(5), 16, 14) + 1,
             block_depth_log2: bits(w(3), 6, 3),
             levels: bits(w(7), 4, 4) + 1,
+            stride_override: None,
         })
     }
 
@@ -214,27 +218,86 @@ impl Tic {
         }
     }
 
+    /// Block height (log2 GOBs) and byte size of mip `level` of one
+    /// layer (block-linear).
+    fn level_layout(&self, level: u32) -> (u32, u64) {
+        let (bw, bh, bytes) = self.element();
+        let w = (self.width >> level).max(1);
+        let h = (self.height >> level).max(1);
+        let rows = h.div_ceil(bh);
+        // Small levels use smaller blocks.
+        let mut gobs = self.block_height_log2;
+        while gobs > 0 && rows <= (4 << gobs) {
+            gobs -= 1;
+        }
+        (
+            gobs,
+            blocklinear::size(w.div_ceil(bw) * bytes, rows, gobs) as u64,
+        )
+    }
+
     /// Bytes between array layers (cube faces): all mip levels of one
     /// layer, aligned to a level-0 block.
     pub fn layer_stride(&self) -> u64 {
-        let (bw, bh, bytes) = self.element();
+        if let Some(s) = self.stride_override {
+            return s;
+        }
+        let (_, bh, _) = self.element();
         if let Some(p) = self.pitch {
             return u64::from(p) * u64::from(self.height.div_ceil(bh));
         }
-        let mut total = 0u64;
-        for level in 0..self.levels {
-            let w = (self.width >> level).max(1);
-            let h = (self.height >> level).max(1);
-            let rows = h.div_ceil(bh);
-            // Small levels use smaller blocks.
-            let mut gobs = self.block_height_log2;
-            while gobs > 0 && rows <= (4 << gobs) {
-                gobs -= 1;
-            }
-            total += blocklinear::size(w.div_ceil(bw) * bytes, rows, gobs) as u64;
-        }
+        let total: u64 = (0..self.levels).map(|l| self.level_layout(l).1).sum();
         let align = 512u64 << self.block_height_log2;
         total.next_multiple_of(align)
+    }
+
+    /// Mip levels that can be decoded: block-linear 2D, array and cube
+    /// textures; down to 1x1 at most.
+    pub fn mip_levels(&self) -> u32 {
+        if self.pitch.is_some() || self.ty == ty::D3 || self.stride_override.is_some() {
+            return 1;
+        }
+        let full = 32 - self.width.max(self.height).max(1).leading_zeros();
+        self.levels.clamp(1, full)
+    }
+
+    /// The header of mip `level` alone (same layers and layer stride),
+    /// with the block height the level really uses (small levels,
+    /// level 0 included, use smaller blocks; yuzu AdjustMipBlockSize).
+    pub fn level(&self, level: u32) -> Tic {
+        if self.pitch.is_some() || self.ty == ty::D3 {
+            return *self;
+        }
+        let offset: u64 = (0..level).map(|l| self.level_layout(l).1).sum();
+        let (gobs, _) = self.level_layout(level);
+        Tic {
+            addr: self.addr + offset,
+            width: (self.width >> level).max(1),
+            height: (self.height >> level).max(1),
+            block_height_log2: gobs,
+            levels: 1,
+            stride_override: Some(self.layer_stride()),
+            ..*self
+        }
+    }
+
+    /// Bytes of guest memory the whole texture (all layers and levels)
+    /// spans, for detecting changes.
+    pub fn byte_span(&self) -> u64 {
+        let (bw, bh, bytes) = self.element();
+        let rows = self.height.div_ceil(bh);
+        let row = self.width.div_ceil(bw) * bytes;
+        let layers = u64::from(self.layers().clamp(1, 2048));
+        if self.ty == ty::D3 && self.pitch.is_none() {
+            let block_rows = 8u32 << self.block_height_log2;
+            return u64::from(row.div_ceil(64) * 64)
+                * u64::from(rows.next_multiple_of(block_rows))
+                * layers.next_multiple_of(1 << self.block_depth_log2);
+        }
+        if self.ty == ty::D3 {
+            return u64::from(self.pitch.unwrap_or(row)) * u64::from(rows) * layers;
+        }
+        self.layer_stride() * layers
     }
 
     /// Bytes of level 0 (an upper bound for block-linear layouts).
@@ -259,13 +322,20 @@ pub mod wrap {
 }
 
 /// A decoded sampler.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Tsc {
     pub wrap: [u8; 3],
-    /// Linear (true) or nearest magnification; minification uses the
-    /// same filter since only level 0 is sampled.
+    /// Linear (true) or nearest magnification; the software renderer
+    /// samples level 0 with it for minification too.
     pub linear: bool,
     pub border: [f32; 4],
+    /// Linear minification.
+    pub min_linear: bool,
+    /// Mip filter: 1 none, 2 nearest, 3 linear.
+    pub mip_filter: u8,
+    pub lod_bias: f32,
+    pub min_lod: f32,
+    pub max_lod: f32,
 }
 
 impl Tsc {
@@ -275,6 +345,11 @@ impl Tsc {
             wrap: [0, 1, 2].map(|i| bits(w(0), 3 * i, 3) as u8),
             linear: bits(w(1), 0, 2) == 2,
             border: [4, 5, 6, 7].map(|i| f32::from_bits(w(i))),
+            min_linear: bits(w(1), 4, 2) == 2,
+            mip_filter: bits(w(1), 6, 2) as u8,
+            lod_bias: ((bits(w(1), 12, 13) << 19) as i32 >> 19) as f32 / 256.0,
+            min_lod: bits(w(2), 0, 12) as f32 / 256.0,
+            max_lod: bits(w(2), 12, 12) as f32 / 256.0,
         }
     }
 }
@@ -409,6 +484,7 @@ fn swizzle(tic: &Tic, c: [f32; 4]) -> [f32; 4] {
 
 impl Texture {
     pub fn decode(g: &GuestMemory, tic: &Tic) -> Result<Texture, String> {
+        let tic = &tic.level(0);
         // Rows of storage elements (texels, or compressed blocks).
         let (bw, bh, bpp) = tic.element();
         let (cols, rows) = (tic.width.div_ceil(bw), tic.height.div_ceil(bh));
@@ -854,6 +930,21 @@ mod tests {
     }
 
     #[test]
+    fn mip_level_headers() {
+        let mut t = Tic::parse(&build::rgba8_tic(0x10000, 64, 64, None, 4)).unwrap();
+        t.levels = 7;
+        assert_eq!(t.mip_levels(), 7);
+        // Level 0: 256-byte rows, 64 rows: the 16-GOB block shrinks to
+        // 8 GOBs, 16 KiB.
+        assert_eq!(t.level(0).block_height_log2, 3);
+        let l1 = t.level(1);
+        assert_eq!((l1.addr, l1.width, l1.height), (0x10000 + 0x4000, 32, 32));
+        assert_eq!(l1.block_height_log2, 2);
+        assert_eq!(l1.layer_stride(), t.layer_stride());
+        assert_eq!(l1.mip_levels(), 1);
+    }
+
+    #[test]
     fn packed_float_formats() {
         let mut t = Tic::parse(&build::rgba8_tic(0, 4, 4, Some(64), 0)).unwrap();
         t.format = 0x21;
@@ -895,6 +986,7 @@ mod tests {
             wrap: [wrap::REPEAT; 3],
             linear: false,
             border: [0.5; 4],
+            ..Default::default()
         };
         assert_eq!(tex.sample(&s, 0.25, 0.5)[0], 0.0);
         assert_eq!(tex.sample(&s, 0.75, 0.5)[0], 1.0);
@@ -916,6 +1008,7 @@ mod tests {
             wrap: [wrap::CLAMP_TO_EDGE; 3],
             linear: false,
             border: [0.0; 4],
+            ..Default::default()
         };
         // Six 1x1 faces (or layers, or slices) holding their index.
         let texels: Vec<[f32; 4]> = (0..6).map(|i| [i as f32; 4]).collect();

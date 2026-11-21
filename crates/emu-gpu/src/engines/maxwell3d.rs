@@ -550,7 +550,10 @@ impl Maxwell3D {
                 .map_err(|f| format!("shader at {addr:#x}: {f:?}"))?;
             // Switch 2 programs are SM86 code after a 0x80-byte header.
             let insts = if self.ampere {
-                crate::shader::sm86::decode_program(&code[crate::shader::sm86::HEADER_SIZE..])
+                crate::shader::sm86::decode_program_ext(
+                    &code[crate::shader::sm86::HEADER_SIZE..],
+                    got < len || len >= 1 << 20,
+                )
             } else {
                 decode_program(&code[HEADER_SIZE..])
             };

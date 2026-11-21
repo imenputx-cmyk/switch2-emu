@@ -185,6 +185,12 @@ fn native(index: usize, i: &Instruction, what: &'static str) -> DecodeError {
 /// Decodes 128-bit instructions (after the header) until the program's
 /// end. Branch targets in the result are IR indices.
 pub fn decode_program(code: &[u8]) -> Result<Vec<Inst>, DecodeError> {
+    decode_program_ext(code, false)
+}
+
+/// As `decode_program`; `at_end` says no more code can be read after
+/// `code` (a program with a computed branch may then end with it).
+pub fn decode_program_ext(code: &[u8], at_end: bool) -> Result<Vec<Inst>, DecodeError> {
     // Each native instruction becomes one or more IR instructions; targets
     // are native indices until all are decoded.
     let mut lowered: Vec<Vec<Inst>> = Vec::new();
@@ -198,23 +204,53 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Inst>, DecodeError> {
         })
         .collect();
     let mut ended = false;
+    // After a computed branch the end is not known from the branches:
+    // its cases follow, and may end in EXIT. Decode on until the
+    // padding (a branch to itself), an undecodable word or the end.
+    let mut computed = false;
+    let ends_here = |l: &[Vec<Inst>]| {
+        l.last()
+            .and_then(|i| i.last())
+            .is_some_and(Inst::is_terminal)
+    };
     for (index, &inst) in all.iter().enumerate() {
-        let insts = decode(inst, index)?;
+        let insts = match decode(inst, index) {
+            Ok(i) => i,
+            Err(_) if computed && index > furthest && ends_here(&lowered) => {
+                ended = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        if computed
+            && index > furthest
+            && ends_here(&lowered)
+            && matches!(insts.as_slice(), [Inst { pred: PT, op: Op::Bra { target } }] if *target == index)
+        {
+            ended = true;
+            break;
+        }
         for inst in &insts {
-            if let Op::Bra { target } | Op::Ssy { target } = inst.op {
-                furthest = furthest.max(target);
+            match inst.op {
+                Op::Bra { target } | Op::Ssy { target } => furthest = furthest.max(target),
+                Op::Brx { .. } => computed = true,
+                _ => {}
             }
         }
         let terminal = insts.last().is_some_and(Inst::is_terminal);
         lowered.push(insts);
-        if terminal && index >= furthest {
+        if terminal && index >= furthest && !computed {
             ended = true;
             break;
         }
     }
+    if !ended && computed && at_end && ends_here(&lowered) {
+        ended = true;
+    }
     if !ended {
         return Err(DecodeError::Truncated);
     }
+    lower_computed_branches(&mut lowered);
     // Registers past the program's own hold the uniforms.
     let program = &all[..lowered.len()];
     if highest_register(program) >= UNIFORM_BASE {
@@ -252,9 +288,96 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Inst>, DecodeError> {
     Ok(out)
 }
 
+/// The predicate BRX lowering compares into (not a guest predicate).
+const BRX_PRED: u8 = 15;
+
+/// Lowers each BRX into `reg == target` compares and branches over the
+/// likely jump-table targets: the existing branch targets and every
+/// instruction after an unconditional transfer (switch cases end with
+/// one). An unmatched value exits.
+fn lower_computed_branches(lowered: &mut [Vec<Inst>]) {
+    if !lowered
+        .iter()
+        .flatten()
+        .any(|i| matches!(i.op, Op::Brx { .. }))
+    {
+        return;
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    for (n, insts) in lowered.iter().enumerate() {
+        for i in insts {
+            if let Op::Bra { target } | Op::Ssy { target } = i.op {
+                targets.insert(target);
+            }
+        }
+        if insts.last().is_some_and(Inst::is_terminal) {
+            targets.insert(n + 1);
+        }
+    }
+    targets.retain(|&t| t < lowered.len());
+    for insts in lowered.iter_mut() {
+        let Some(k) = insts.iter().position(|i| matches!(i.op, Op::Brx { .. })) else {
+            continue;
+        };
+        let Inst {
+            pred,
+            op: Op::Brx { reg, bias },
+        } = insts[k]
+        else {
+            unreachable!()
+        };
+        let compare = |cmp, value: u32| Op::Isetp {
+            dst: BRX_PRED,
+            dst2: 7,
+            cmp,
+            signed: false,
+            a: reg,
+            b: Operand::Imm(value),
+            bop: Bop::And,
+            c: PT,
+        };
+        let mut chain = Vec::with_capacity(2 * targets.len() + 2);
+        if pred != PT {
+            chain.push(Inst::always(compare(0, 0))); // false
+        }
+        let on = Pred {
+            index: BRX_PRED,
+            neg: false,
+        };
+        for &t in &targets {
+            chain.push(Inst {
+                pred,
+                op: compare(2, (t as u32 * 16).wrapping_sub(bias)),
+            });
+            chain.push(Inst {
+                pred: on,
+                op: Op::Bra { target: t },
+            });
+        }
+        chain.push(Inst { pred, op: Op::Exit });
+        insts.splice(k..=k, chain);
+    }
+}
+
 /// Decodes one instruction (at native index `index`).
 pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
     let op = i.opcode();
+    // BRX / BRXU: to (next PC + relative + source); the source holds a
+    // native code offset (Lichii lower_to_maxwell.h).
+    if op == 0x949 || op == 0x958 {
+        let raw = u64::from(i.0[1]) | u64::from(i.0[2] & 0x3FFFF) << 32;
+        let relative = ((raw << 14) as i64 >> 14) as i32;
+        let reg = if op == 0x958 {
+            ureg(i.bits(24, 8))
+        } else {
+            i.reg(24)
+        };
+        let bias = ((index as i64 + 1) * 16 + i64::from(relative)) as u32;
+        return Ok(vec![Inst {
+            pred: i.pred_at(12),
+            op: Op::Brx { reg, bias },
+        }]);
+    }
     if is_uniform_op(op) {
         return decode_uniform(i, index);
     }
@@ -924,11 +1047,13 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 one(Op::TexN {
                     dst0: dst,
                     dst1,
+                    dim: dim as u8,
                     coords: c,
                     layer: if array { value(0) } else { RZ },
                     handle,
                     comps: mask,
                     fetch,
+                    auto_lod: !fetch && lod == 0,
                 })
             }
             // S2R / S2UR: the special register at 72..80.
@@ -1600,7 +1725,7 @@ mod tests {
     /// Runs the program with registers preset by MOVs put in front.
     fn exec(insts: &[Instruction], init: &[(u8, u32)]) -> Out {
         let code = program(insts);
-        let decoded = decode_program(&code[HEADER_SIZE..]).expect("decodes");
+        let decoded = decode_program_ext(&code[HEADER_SIZE..], true).expect("decodes");
         let k = init.len();
         let mut program: Vec<Inst> = init
             .iter()
@@ -1953,7 +2078,7 @@ mod more_tests {
 
     fn exec(insts: &[Instruction], init: &[(u8, u32)], io: &mut Io) -> [u32; 256] {
         let code = program(insts);
-        let decoded = decode_program(&code[HEADER_SIZE..]).expect("decodes");
+        let decoded = decode_program_ext(&code[HEADER_SIZE..], true).expect("decodes");
         let mut program: Vec<Inst> = init
             .iter()
             .map(|&(dst, v)| {
@@ -1963,8 +2088,43 @@ mod more_tests {
                 })
             })
             .collect();
-        program.extend(decoded);
+        // Branch targets move past the prepended moves.
+        let shift = program.len();
+        program.extend(decoded.into_iter().map(|mut i| {
+            if let Op::Bra { target } | Op::Ssy { target } = &mut i.op {
+                *target += shift;
+            }
+            i
+        }));
         run(&program, io).expect("runs").0
+    }
+
+    #[test]
+    fn computed_branch() {
+        let set = |v: u32| {
+            inst(
+                0x810,
+                1,
+                &[
+                    (24, 8, 255),
+                    (32, 32, v),
+                    (64, 8, 255),
+                    (81, 3, 7),
+                    (84, 3, 7),
+                ],
+            )
+        };
+        // BRX R0 with relative -16: to the code offset in R0.
+        let brx = inst(
+            0x949,
+            0,
+            &[(24, 8, 0), (32, 32, (-16i32) as u32), (64, 18, 0x3FFFF)],
+        );
+        let code = [brx, set(1), exit(), set(2), exit()];
+        for (offset, want) in [(0x10, 1), (0x30, 2)] {
+            let r = exec(&code, &[(0, offset)], &mut Io::default());
+            assert_eq!(r[1], want, "offset {offset:#x}");
+        }
     }
 
     #[test]

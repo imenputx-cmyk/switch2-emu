@@ -123,6 +123,7 @@ mod op {
     pub const TYPE_IMAGE: u16 = 25;
     pub const TYPE_SAMPLED_IMAGE: u16 = 27;
     pub const COMPOSITE_EXTRACT: u16 = 81;
+    pub const IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
     pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
     pub const IMAGE_FETCH: u16 = 95;
     pub const IMAGE: u16 = 100;
@@ -254,6 +255,43 @@ pub fn texture_binding(stage: Stage, i: u32) -> u32 {
     }
 }
 
+/// The image view a sampled texture binding needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TexKind {
+    /// 2D (1D textures are 2D images of height 1).
+    D2,
+    D2Array,
+    D3,
+    Cube,
+    CubeArray,
+}
+
+impl TexKind {
+    /// The kind for a TEX dimension field.
+    pub fn from_dim(dim: u8) -> Option<TexKind> {
+        Some(match dim {
+            0 | 1 => TexKind::D2,
+            4 | 5 => TexKind::D2Array,
+            2 => TexKind::D3,
+            3 => TexKind::Cube,
+            7 => TexKind::CubeArray,
+            _ => return None,
+        })
+    }
+
+    /// The kind that holds a texture of TIC type `ty`.
+    pub fn for_tic_type(ty: u32) -> TexKind {
+        use crate::texture::ty;
+        match ty {
+            ty::D1_ARRAY | ty::D2_ARRAY => TexKind::D2Array,
+            ty::D3 => TexKind::D3,
+            ty::CUBE => TexKind::Cube,
+            ty::CUBE_ARRAY => TexKind::CubeArray,
+            _ => TexKind::D2,
+        }
+    }
+}
+
 /// A translated shader.
 pub struct Translated {
     pub words: Vec<u32>,
@@ -262,6 +300,8 @@ pub struct Translated {
     /// Handles (bindless constant buffer word offsets) of the textures
     /// sampled; the `i`-th is at [`texture_binding`]`(stage, i)`.
     pub textures: Vec<u32>,
+    /// The image view kind of each texture binding.
+    pub texture_kinds: Vec<TexKind>,
 }
 
 struct Translator {
@@ -273,8 +313,13 @@ struct Translator {
     flat: BTreeSet<u32>,
     cbufs: BTreeMap<u8, u32>,
     preds: BTreeMap<u8, u32>,
-    /// Texture variables by handle, in binding order.
-    textures: Vec<(u32, u32)>,
+    /// Texture variables by handle, in binding order, with their kind.
+    textures: Vec<(u32, u32, TexKind)>,
+    /// Image, sampled image and pointer types by kind (2D: the common
+    /// ones), and lazily declared vector types.
+    image_types: BTreeMap<u8, (u32, u32, u32)>,
+    vec3: Option<u32>,
+    uvec3: Option<u32>,
     stage: Stage,
     /// Local memory (LDL/STL): a private array of words.
     local: Option<u32>,
@@ -794,17 +839,90 @@ impl Translator {
     }
 
     fn texture_var(&mut self, handle: u32) -> Result<u32, String> {
-        if let Some(&(_, v)) = self.textures.iter().find(|t| t.0 == handle) {
+        self.texture_var_of(handle, TexKind::D2)
+    }
+
+    /// OpImageSample{Implicit,Explicit}Lod (explicit: level 0) into
+    /// `texel`.
+    fn sample_op(&mut self, texel: u32, sampled: u32, coord: u32, auto_lod: bool) {
+        if auto_lod && self.stage == Stage::Pixel {
+            inst(
+                &mut self.m.body,
+                op::IMAGE_SAMPLE_IMPLICIT_LOD,
+                &[self.c.vec4, texel, sampled, coord],
+            );
+        } else {
+            inst(
+                &mut self.m.body,
+                op::IMAGE_SAMPLE_EXPLICIT_LOD,
+                &[self.c.vec4, texel, sampled, coord, 0x2, self.c.zero_f],
+            );
+        }
+    }
+
+    /// (image, sampled image, pointer to sampled image) types of a kind.
+    fn image_types(&mut self, kind: TexKind) -> (u32, u32, u32) {
+        if kind == TexKind::D2 {
+            return (self.c.image_t, self.c.sampled_image, self.c.p_sampled_image);
+        }
+        if let Some(&t) = self.image_types.get(&(kind as u8)) {
+            return t;
+        }
+        let (dim, arrayed) = match kind {
+            TexKind::D2Array => (1, 1),
+            TexKind::D3 => (2, 0),
+            TexKind::Cube => (3, 0),
+            _ => (3, 1),
+        };
+        let (img, sampled, ptr) = (self.m.id(), self.m.id(), self.m.id());
+        let g = &mut self.m.globals;
+        inst(
+            g,
+            op::TYPE_IMAGE,
+            &[img, self.c.float, dim, 0, arrayed, 0, 1, 0],
+        );
+        inst(g, op::TYPE_SAMPLED_IMAGE, &[sampled, img]);
+        inst(g, op::TYPE_POINTER, &[ptr, UNIFORM_CONSTANT, sampled]);
+        self.image_types.insert(kind as u8, (img, sampled, ptr));
+        (img, sampled, ptr)
+    }
+
+    fn vec3(&mut self) -> u32 {
+        if let Some(v) = self.vec3 {
+            return v;
+        }
+        let v = self.m.id();
+        inst(&mut self.m.globals, op::TYPE_VECTOR, &[v, self.c.float, 3]);
+        self.vec3 = Some(v);
+        v
+    }
+
+    fn uvec3(&mut self) -> u32 {
+        if let Some(v) = self.uvec3 {
+            return v;
+        }
+        let v = self.m.id();
+        inst(&mut self.m.globals, op::TYPE_VECTOR, &[v, self.c.uint, 3]);
+        self.uvec3 = Some(v);
+        v
+    }
+
+    fn texture_var_of(&mut self, handle: u32, kind: TexKind) -> Result<u32, String> {
+        if let Some(&(_, v, k)) = self.textures.iter().find(|t| t.0 == handle) {
+            if k != kind {
+                return Err(format!("texture {handle:#x} used as {k:?} and {kind:?}"));
+            }
             return Ok(v);
         }
         if self.textures.len() == MAX_TEXTURES {
             return Err("too many textures".into());
         }
+        let (_, _, ptr) = self.image_types(kind);
         let v = self.m.id();
         inst(
             &mut self.m.globals,
             op::VARIABLE,
-            &[self.c.p_sampled_image, v, UNIFORM_CONSTANT],
+            &[ptr, v, UNIFORM_CONSTANT],
         );
         let binding = texture_binding(self.stage, self.textures.len() as u32);
         inst(
@@ -817,12 +935,97 @@ impl Translator {
             op::DECORATE,
             &[v, BINDING, binding],
         );
-        self.textures.push((handle, v));
+        self.textures.push((handle, v, kind));
         Ok(v)
     }
 
+    /// TEX/TLD of any dimension (level 0).
+    fn texture_any(
+        &mut self,
+        dim: u8,
+        handle: u32,
+        coords: [u8; 3],
+        layer: u8,
+        fetch: bool,
+        auto_lod: bool,
+    ) -> Result<[u32; 4], String> {
+        let kind = TexKind::from_dim(dim).ok_or("texture dimension")?;
+        let var = self.texture_var_of(handle, kind)?;
+        let (img_t, sampled_t, _) = self.image_types(kind);
+        let sampled = self.load(sampled_t, var);
+        let float = self.c.float;
+        let texel = self.m.id();
+        if fetch {
+            if matches!(kind, TexKind::Cube | TexKind::CubeArray) {
+                return Err("cube texel fetch".into());
+            }
+            let x = self.load_reg(coords[0]);
+            let y = if dim == 0 || dim == 4 {
+                self.c.zero_u
+            } else {
+                self.load_reg(coords[1])
+            };
+            let coord = self.m.id();
+            match kind {
+                TexKind::D2 => inst(
+                    &mut self.m.body,
+                    op::COMPOSITE_CONSTRUCT,
+                    &[self.c.uvec2, coord, x, y],
+                ),
+                _ => {
+                    let z = if kind == TexKind::D3 {
+                        self.load_reg(coords[2])
+                    } else {
+                        self.load_reg(layer)
+                    };
+                    let t = self.uvec3();
+                    inst(
+                        &mut self.m.body,
+                        op::COMPOSITE_CONSTRUCT,
+                        &[t, coord, x, y, z],
+                    );
+                }
+            }
+            let img = self.m.id();
+            inst(&mut self.m.body, op::IMAGE, &[img_t, img, sampled]);
+            inst(
+                &mut self.m.body,
+                op::IMAGE_FETCH,
+                &[self.c.vec4, texel, img, coord, 0x2, self.c.zero_u],
+            );
+        } else {
+            let no = Mods::default();
+            let mut parts: Vec<u32> = Vec::new();
+            let n = [1, 2, 3, 3, 1, 2, 0, 3][dim as usize];
+            for &r in coords.iter().take(n) {
+                parts.push(self.reg_float(r, no));
+            }
+            if dim == 0 || dim == 4 {
+                // 1D as a 2D image of height 1: sample its middle row.
+                parts.push(self.constant_f(0.5));
+            }
+            if matches!(kind, TexKind::D2Array | TexKind::CubeArray) {
+                let l = self.load_reg(layer);
+                parts.push(self.op1(op::CONVERT_U_TO_F, float, l));
+            }
+            let ty = match parts.len() {
+                2 => self.c.vec2,
+                3 => self.vec3(),
+                _ => self.c.vec4,
+            };
+            let coord = self.m.id();
+            let mut args = vec![ty, coord];
+            args.extend(&parts);
+            inst(&mut self.m.body, op::COMPOSITE_CONSTRUCT, &args);
+            self.sample_op(texel, sampled, coord, auto_lod);
+        }
+        Ok([0, 1, 2, 3].map(|k| self.extract(float, texel, k)))
+    }
+
     /// Samples level 0 of a texture; returns the RGBA components (floats).
-    fn sample(&mut self, handle: u32, u: u32, v: u32) -> Result<[u32; 4], String> {
+    /// With `auto_lod` in a pixel shader the level comes from the
+    /// derivatives (implicit LOD); otherwise level 0.
+    fn sample(&mut self, handle: u32, u: u32, v: u32, auto_lod: bool) -> Result<[u32; 4], String> {
         let var = self.texture_var(handle)?;
         let img = self.load(self.c.sampled_image, var);
         let coord = self.m.id();
@@ -832,12 +1035,7 @@ impl Translator {
             &[self.c.vec2, coord, u, v],
         );
         let texel = self.m.id();
-        // Image operand Lod (0x2) = 0.
-        inst(
-            &mut self.m.body,
-            op::IMAGE_SAMPLE_EXPLICIT_LOD,
-            &[self.c.vec4, texel, img, coord, 0x2, self.c.zero_f],
-        );
+        self.sample_op(texel, img, coord, auto_lod);
         Ok([0, 1, 2, 3].map(|k| {
             let id = self.m.id();
             inst(
@@ -1616,11 +1814,11 @@ impl Translator {
                 b,
                 handle,
                 comps,
-                ..
+                lz,
             } => {
                 let u = self.reg_float(a, no);
                 let v = self.reg_float(b, no);
-                let t = self.sample(handle, u, v)?;
+                let t = self.sample(handle, u, v, !lz)?;
                 for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
                     self.store_float(super::interp::texs_dst(dst0, dst1, k), t[c], false);
                 }
@@ -1645,11 +1843,11 @@ impl Translator {
                 a,
                 handle,
                 comps,
-                ..
+                lz,
             } => {
                 let u = self.reg_float(a, no);
                 let v = self.reg_float(a.wrapping_add(1), no);
-                let t = self.sample(handle, u, v)?;
+                let t = self.sample(handle, u, v, !lz)?;
                 for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
                     if dst != RZ {
                         self.store_float(dst.wrapping_add(k as u8), t[c], false);
@@ -1884,8 +2082,21 @@ impl Translator {
                     self.store_pred(i as u8, p);
                 }
             }
-            Op::TexN { .. } => {
-                return Err("textures other than 2D are not translated yet".into());
+            Op::TexN {
+                dst0,
+                dst1,
+                dim,
+                coords,
+                layer,
+                handle,
+                comps,
+                fetch,
+                auto_lod,
+            } => {
+                let t = self.texture_any(dim, handle, coords, layer, fetch, auto_lod)?;
+                for (k, c) in (0..4).filter(|c| comps & (1 << c) != 0).enumerate() {
+                    self.store_float(super::interp::texs_dst(dst0, dst1, k), t[c], false);
+                }
             }
             Op::Ldg { .. } | Op::Stg { .. } => {
                 return Err("global memory access is not translated yet".into());
@@ -2081,7 +2292,7 @@ impl Translator {
                 }
             }
             Op::Nop => {}
-            Op::Bra { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {
+            Op::Bra { .. } | Op::Brx { .. } | Op::Ssy { .. } | Op::Sync | Op::Kil | Op::Exit => {
                 unreachable!("control flow is translated by the caller")
             }
         }
@@ -2384,6 +2595,9 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         cbufs: BTreeMap::new(),
         preds: BTreeMap::new(),
         textures: Vec::new(),
+        image_types: BTreeMap::new(),
+        vec3: None,
+        uvec3: None,
         local: None,
         stage,
     };
@@ -2433,6 +2647,9 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     words.extend([0x0723_0203, 0x0001_0300, 0, bound, 0]);
     inst(&mut words, op::CAPABILITY, &[1]); // Shader
     inst(&mut words, op::CAPABILITY, &[50]); // ImageQuery
+    if t.textures.iter().any(|t| t.2 == TexKind::CubeArray) {
+        inst(&mut words, op::CAPABILITY, &[45]); // SampledCubeArray
+    }
     let mut ext = vec![glsl];
     ext.extend(string("GLSL.std.450"));
     inst(&mut words, op::EXT_INST_IMPORT, &ext);
@@ -2461,6 +2678,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         words,
         cbufs: t.cbufs.keys().fold(0, |m, &i| m | 1 << i),
         textures: t.textures.iter().map(|t| t.0).collect(),
+        texture_kinds: t.textures.iter().map(|t| t.2).collect(),
     })
 }
 
@@ -2604,6 +2822,40 @@ mod tests {
     }
 
     #[test]
+    fn switch2_computed_branch_validates() {
+        use crate::shader::sm86::asm::{exit, inst};
+        let set = |v: u32| {
+            inst(
+                0x810,
+                1,
+                &[
+                    (24, 8, 255),
+                    (32, 32, v),
+                    (64, 8, 255),
+                    (81, 3, 7),
+                    (84, 3, 7),
+                ],
+            )
+        };
+        let brx = inst(
+            0x949,
+            0,
+            &[(24, 8, 0), (32, 32, (-16i32) as u32), (64, 18, 0x3FFFF)],
+        );
+        let insts = [brx, set(1), exit(), set(2), exit()];
+        let mut code = crate::shader::sm86::asm::program(&insts);
+        code[..0x50].copy_from_slice(&vertex_header());
+        let h = super::super::Header::parse(&code);
+        let p = crate::shader::sm86::decode_program_ext(
+            &code[crate::shader::sm86::HEADER_SIZE..],
+            true,
+        )
+        .unwrap();
+        let t = translate(&p, &h).unwrap();
+        validate(&t.words);
+    }
+
+    #[test]
     fn switch2_integer_and_uniform_ops_validate() {
         use crate::shader::sm86::asm::{exit, inst};
         let insts = [
@@ -2700,6 +2952,55 @@ mod tests {
         let p =
             crate::shader::sm86::decode_program(&code[crate::shader::sm86::HEADER_SIZE..]).unwrap();
         let t = translate(&p, &h).unwrap();
+        validate(&t.words);
+    }
+
+    #[test]
+    fn texture_kinds_validate() {
+        let mut p = Vec::new();
+        for (k, (dim, fetch)) in [
+            (0u8, false),
+            (2, false),
+            (3, false),
+            (5, false),
+            (7, false),
+            (5, true),
+            (2, true),
+            (4, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            p.push(Inst::always(Op::TexN {
+                dst0: 8,
+                dst1: 10,
+                dim,
+                coords: [0, 1, 2],
+                layer: 3,
+                handle: 0x100 + 4 * k as u32,
+                comps: 0xF,
+                fetch,
+                auto_lod: true,
+            }));
+        }
+        p.push(Inst::always(Op::Exit));
+        let mut code = vec![0u8; 0x50];
+        code.copy_from_slice(&vertex_header());
+        let h = super::super::Header::parse(&code);
+        let t = translate(&p, &h).unwrap();
+        assert_eq!(
+            t.texture_kinds,
+            [
+                TexKind::D2,
+                TexKind::D3,
+                TexKind::Cube,
+                TexKind::D2Array,
+                TexKind::CubeArray,
+                TexKind::D2Array,
+                TexKind::D3,
+                TexKind::D2Array
+            ]
+        );
         validate(&t.words);
     }
 

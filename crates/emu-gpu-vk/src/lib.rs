@@ -149,10 +149,25 @@ struct TexImage {
     sampler: vk::Sampler,
 }
 
+/// Uploaded textures are cached by header, view kind and mip count.
+type TexKey = (usize, texture::Tic, spirv::TexKind, u32);
+
+/// Cached texture images kept at most.
+const MAX_CACHED_TEXTURES: usize = 512;
+
 /// A texture a draw samples: its descriptor binding and contents.
 struct BoundTexture {
+    key: TexKey,
+    /// Hash of the guest bytes the texture spans.
+    hash: u64,
+    /// The cache already holds this content: `texture` and `mips` are
+    /// empty.
+    cached: bool,
     binding: u32,
+    kind: spirv::TexKind,
     texture: Texture,
+    /// Mip levels 1.. (when the sampler uses mipmaps).
+    mips: Vec<Texture>,
     sampler: Tsc,
 }
 
@@ -185,6 +200,9 @@ pub struct VulkanBackend {
     /// memory still matches.
     idle_images: HashMap<(usize, Surface), (Image, u64)>,
     idle_depth: HashMap<(usize, DepthSurface), (Image, u64)>,
+    /// Uploaded textures (image, memory, view; no sampler) with the hash
+    /// of their guest bytes.
+    tex_cache: HashMap<TexKey, (TexImage, u64)>,
     /// Is depth clamping available (and enabled)?
     depth_clamp: bool,
     software: SoftwareBackend,
@@ -264,8 +282,11 @@ impl VulkanBackend {
             .queue_family_index(qf)
             .queue_priorities(&priorities)];
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
-        let depth_clamp = instance.get_physical_device_features(pd).depth_clamp != 0;
-        let features = vk::PhysicalDeviceFeatures::default().depth_clamp(depth_clamp);
+        let supported = instance.get_physical_device_features(pd);
+        let depth_clamp = supported.depth_clamp != 0;
+        let features = vk::PhysicalDeviceFeatures::default()
+            .depth_clamp(depth_clamp)
+            .image_cube_array(supported.image_cube_array != 0);
         let device = instance
             .create_device(
                 pd,
@@ -332,6 +353,7 @@ impl VulkanBackend {
             depth_images: HashMap::new(),
             idle_images: HashMap::new(),
             idle_depth: HashMap::new(),
+            tex_cache: HashMap::new(),
             depth_clamp,
             software: SoftwareBackend,
             layouts: HashMap::new(),
@@ -392,8 +414,8 @@ impl VulkanBackend {
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(aspect)
-                    .level_count(1)
-                    .layer_count(1),
+                    .level_count(vk::REMAINING_MIP_LEVELS)
+                    .layer_count(vk::REMAINING_ARRAY_LAYERS),
             );
         let barriers = [b];
         self.device.cmd_pipeline_barrier2(
@@ -840,6 +862,11 @@ impl VulkanBackend {
         }
         for t in std::mem::take(&mut self.textures) {
             self.destroy_texture(t);
+        }
+        while self.tex_cache.len() > MAX_CACHED_TEXTURES {
+            let key = *self.tex_cache.keys().next().unwrap();
+            let (img, _) = self.tex_cache.remove(&key).unwrap();
+            self.destroy_texture(img);
         }
         self.device
             .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
@@ -1479,13 +1506,16 @@ impl VulkanBackend {
         p: &Plan,
     ) -> Result<Vec<BoundTexture>, String> {
         let mut resolved = Vec::new();
-        for (handles, cbufs, stage) in [
-            (&p.vs.textures, &d.vs_cbufs, emu_gpu::shader::Stage::Vertex),
-            (&p.ps.textures, &d.ps_cbufs, emu_gpu::shader::Stage::Pixel),
+        for (t, cbufs, stage) in [
+            (&p.vs, &d.vs_cbufs, emu_gpu::shader::Stage::Vertex),
+            (&p.ps, &d.ps_cbufs, emu_gpu::shader::Stage::Pixel),
         ] {
-            for (i, &handle) in handles.iter().enumerate() {
+            for (i, (&handle, &kind)) in t.textures.iter().zip(&t.texture_kinds).enumerate() {
                 let word = emu_gpu::draw::texture_handle_word(g, &d.textures, cbufs, handle)?;
                 let (tic, tsc) = texture::resolve(g, &d.textures, word)?;
+                if spirv::TexKind::for_tic_type(tic.ty) != kind {
+                    return Err(format!("texture type {} sampled as {kind:?}", tic.ty));
+                }
                 if tsc.wrap.iter().take(2).any(|&m| address_mode(m).is_none()) {
                     return Err("sampler address mode".into());
                 }
@@ -1497,11 +1527,11 @@ impl VulkanBackend {
                 if tsc.linear && !self.linear_f32 {
                     return Err("linear filtering of float textures".into());
                 }
-                resolved.push((spirv::texture_binding(stage, i as u32), tic, tsc));
+                resolved.push((spirv::texture_binding(stage, i as u32), kind, tic, tsc));
             }
         }
         // Render-to-texture: write rendered images back first.
-        let overlaps = resolved.iter().any(|(_, tic, _)| {
+        let overlaps = resolved.iter().any(|(_, _, tic, _)| {
             let size = tic.size_bytes();
             self.images.keys().any(|(asid, s)| {
                 *asid == g.asid
@@ -1514,10 +1544,50 @@ impl VulkanBackend {
         }
         resolved
             .into_iter()
-            .map(|(binding, tic, tsc)| {
+            .map(|(binding, kind, tic, tsc)| {
+                let levels = if tsc.mip_filter >= 2 {
+                    tic.mip_levels()
+                } else {
+                    1
+                };
+                let key = (g.asid, tic, kind, levels);
+                let mut raw = vec![0u8; tic.byte_span().min(256 << 20) as usize];
+                let _ = g.read_prefix(tic.addr, &mut raw);
+                let hash = content_hash(&raw);
+                drop(raw);
+                if self.tex_cache.get(&key).is_some_and(|c| c.1 == hash) {
+                    return Ok(BoundTexture {
+                        key,
+                        hash,
+                        cached: true,
+                        binding,
+                        kind,
+                        texture: Texture {
+                            width: tic.width,
+                            height: tic.height,
+                            layers: 1,
+                            ty: tic.ty,
+                            texels: Vec::new(),
+                        },
+                        mips: Vec::new(),
+                        sampler: tsc,
+                    });
+                }
+                let mut mips = Vec::new();
+                for l in 1..levels {
+                    match Texture::decode(g, &tic.level(l)) {
+                        Ok(t) => mips.push(t),
+                        Err(_) => break,
+                    }
+                }
                 Ok(BoundTexture {
+                    key,
+                    hash,
+                    cached: false,
                     binding,
+                    kind,
                     texture: Texture::decode(g, &tic)?,
+                    mips,
                     sampler: tsc,
                 })
             })
@@ -1530,21 +1600,65 @@ impl VulkanBackend {
         &mut self,
         t: &BoundTexture,
     ) -> Result<(vk::ImageView, vk::Sampler), String> {
+        let view = match self.tex_cache.get(&t.key) {
+            Some((img, hash)) if t.cached && *hash == t.hash => img.view,
+            _ => self.upload_texture_image(t)?,
+        };
+        let sampler = self.sampler(t)?;
+        Ok((view, sampler))
+    }
+
+    /// Creates and fills a texture image and caches it (replacing an
+    /// older one for the same key, freed at the next flush).
+    unsafe fn upload_texture_image(&mut self, t: &BoundTexture) -> Result<vk::ImageView, String> {
         let format = vk::Format::R32G32B32A32_SFLOAT;
         let (w, h) = (t.texture.width, t.texture.height);
+        let layers = t.texture.layers.max(1);
+        use spirv::TexKind;
+        let (image_type, depth, array_layers, view_type) = match t.kind {
+            TexKind::D2 => (vk::ImageType::TYPE_2D, 1, 1, vk::ImageViewType::TYPE_2D),
+            TexKind::D2Array => (
+                vk::ImageType::TYPE_2D,
+                1,
+                layers,
+                vk::ImageViewType::TYPE_2D_ARRAY,
+            ),
+            TexKind::D3 => (
+                vk::ImageType::TYPE_3D,
+                layers,
+                1,
+                vk::ImageViewType::TYPE_3D,
+            ),
+            TexKind::Cube => (vk::ImageType::TYPE_2D, 1, 6, vk::ImageViewType::CUBE),
+            TexKind::CubeArray => (
+                vk::ImageType::TYPE_2D,
+                1,
+                layers.next_multiple_of(6),
+                vk::ImageViewType::CUBE_ARRAY,
+            ),
+        };
+        let cube = matches!(t.kind, TexKind::Cube | TexKind::CubeArray);
+        if cube && w != h {
+            return Err("cube texture with unequal sides".into());
+        }
         let image = self
             .device
             .create_image(
                 &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
+                    .flags(if cube {
+                        vk::ImageCreateFlags::CUBE_COMPATIBLE
+                    } else {
+                        vk::ImageCreateFlags::empty()
+                    })
+                    .image_type(image_type)
                     .format(format)
                     .extent(vk::Extent3D {
                         width: w,
                         height: h,
-                        depth: 1,
+                        depth,
                     })
-                    .mip_levels(1)
-                    .array_layers(1)
+                    .mip_levels(1 + t.mips.len() as u32)
+                    .array_layers(array_layers)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
                     .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
@@ -1570,50 +1684,61 @@ impl VulkanBackend {
             .create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .view_type(view_type)
                     .format(format)
                     .subresource_range(
                         vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
+                            .level_count(1 + t.mips.len() as u32)
+                            .layer_count(array_layers),
                     ),
                 None,
             )
             .map_err(err("texture view"))?;
-        let s = &t.sampler;
-        let filter = if s.linear {
-            vk::Filter::LINEAR
-        } else {
-            vk::Filter::NEAREST
-        };
-        let sampler = self
-            .device
-            .create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(filter)
-                    .min_filter(filter)
-                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-                    .address_mode_u(address_mode(s.wrap[0]).unwrap())
-                    .address_mode_v(address_mode(s.wrap[1]).unwrap())
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .border_color(border_color(s.border).unwrap_or_default())
-                    .max_lod(0.0),
-                None,
-            )
-            .map_err(err("sampler"))?;
-        self.textures.push(TexImage {
-            image,
-            memory,
-            view,
-            sampler,
-        });
-        let bytes: Vec<u8> = t
-            .texture
-            .texels
-            .iter()
-            .flat_map(|c| c.iter().flat_map(|f| f.to_le_bytes()))
-            .collect();
+        if let Some((old, _)) = self.tex_cache.insert(
+            t.key,
+            (
+                TexImage {
+                    image,
+                    memory,
+                    view,
+                    sampler: vk::Sampler::null(),
+                },
+                t.hash,
+            ),
+        ) {
+            // It may still be bound in this batch.
+            self.textures.push(old);
+        }
+        // Every level, each exactly the texels the image holds (missing
+        // ones zero).
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut regions = Vec::new();
+        for (level, tex) in std::iter::once(&t.texture).chain(&t.mips).enumerate() {
+            let (lw, lh) = ((w >> level).max(1), (h >> level).max(1));
+            let offset = bytes.len();
+            bytes.extend(
+                tex.texels
+                    .iter()
+                    .flat_map(|c| c.iter().flat_map(|f| f.to_le_bytes())),
+            );
+            bytes.resize(offset + (lw * lh * depth * array_layers) as usize * 16, 0);
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(offset as u64)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(level as u32)
+                            .layer_count(array_layers),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: lw,
+                        height: lh,
+                        depth,
+                    }),
+            );
+        }
         let staging = self.transient_buffer(&bytes, vk::BufferUsageFlags::TRANSFER_SRC)?;
         self.begin()?;
         self.barrier(
@@ -1626,24 +1751,65 @@ impl VulkanBackend {
             staging,
             image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[vk::BufferImageCopy::default()
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_extent(vk::Extent3D {
-                    width: w,
-                    height: h,
-                    depth: 1,
-                })],
+            &regions,
         );
         self.barrier(
             image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         );
-        Ok((view, sampler))
+        Ok(view)
+    }
+
+    /// A sampler for a bound texture, freed at the next flush.
+    unsafe fn sampler(&mut self, t: &BoundTexture) -> Result<vk::Sampler, String> {
+        let mips = t.key.3.saturating_sub(1) as usize;
+        let s = &t.sampler;
+        let filter = if s.linear {
+            vk::Filter::LINEAR
+        } else {
+            vk::Filter::NEAREST
+        };
+        let sampler = self
+            .device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(filter)
+                    .min_filter(if s.min_linear || s.linear {
+                        vk::Filter::LINEAR
+                    } else {
+                        vk::Filter::NEAREST
+                    })
+                    .mipmap_mode(if s.mip_filter == 3 {
+                        vk::SamplerMipmapMode::LINEAR
+                    } else {
+                        vk::SamplerMipmapMode::NEAREST
+                    })
+                    .mip_lod_bias(s.lod_bias.clamp(-15.0, 15.0))
+                    .min_lod(if mips == 0 { 0.0 } else { s.min_lod })
+                    .address_mode_u(address_mode(s.wrap[0]).unwrap())
+                    .address_mode_v(address_mode(s.wrap[1]).unwrap())
+                    .address_mode_w(if t.kind == spirv::TexKind::D3 {
+                        address_mode(s.wrap[2]).unwrap_or(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    } else {
+                        vk::SamplerAddressMode::CLAMP_TO_EDGE
+                    })
+                    .border_color(border_color(s.border).unwrap_or_default())
+                    .max_lod(if mips == 0 {
+                        0.0
+                    } else {
+                        s.max_lod.clamp(s.min_lod, mips as f32)
+                    }),
+                None,
+            )
+            .map_err(err("sampler"))?;
+        self.textures.push(TexImage {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            sampler,
+        });
+        Ok(sampler)
     }
 
     unsafe fn destroy_texture(&self, t: TexImage) {
@@ -1804,6 +1970,9 @@ impl Drop for VulkanBackend {
                 self.device.free_memory(b.memory, None);
             }
             for t in std::mem::take(&mut self.textures) {
+                self.destroy_texture(t);
+            }
+            for (_, (t, _)) in std::mem::take(&mut self.tex_cache) {
                 self.destroy_texture(t);
             }
             for (_, (pipe, modules)) in std::mem::take(&mut self.pipelines) {
