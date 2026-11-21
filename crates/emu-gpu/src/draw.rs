@@ -73,8 +73,10 @@ pub struct IndexBuffer {
 
 #[derive(Debug, Clone)]
 pub struct Draw {
-    /// Color target 0, if color is written.
+    /// Color target 0 (pixel shader output 0), if color is written.
     pub target: Option<Surface>,
+    /// Pixel shader outputs 1..8 (multiple render targets).
+    pub more_targets: [Option<Surface>; 7],
     pub vs: Vec<Inst>,
     pub ps: Vec<Inst>,
     pub ps_header: Header,
@@ -94,9 +96,21 @@ pub struct Draw {
     pub depth: Depth,
     pub blend: Blend,
     pub blend_constant: [f32; 4],
+    pub cull: crate::pipeline::Cull,
     /// Switch 2: NVN2's root tables (8 x 256 bytes), read by shaders as
     /// constant bank [`crate::shader::sm86::ROOT_TABLE_BANK`].
     pub root_tables: Option<Vec<u8>>,
+}
+
+impl Draw {
+    /// (pixel shader output, surface) of each bound color target.
+    pub fn color_targets(&self) -> Vec<(usize, Surface)> {
+        std::iter::once(self.target)
+            .chain(self.more_targets)
+            .enumerate()
+            .filter_map(|(k, t)| t.map(|t| (k, t)))
+            .collect()
+    }
 }
 
 /// The bytes a shader sees in constant buffer `slot`: the bound buffer,
@@ -550,9 +564,20 @@ fn rasterize(
         (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])
     };
     let area = edge(win[0], win[1], win[2][0], win[2][1]);
-    if area == 0.0 {
+    if area == 0.0 || d.cull.culls(area) {
         return Ok(());
     }
+    let front = if d.cull.front_ccw {
+        area < 0.0
+    } else {
+        area > 0.0
+    };
+    let stencil_on = d.depth.stencil.enabled;
+    let face = if front {
+        d.depth.stencil.front
+    } else {
+        d.depth.stencil.back
+    };
     // Pixel coverage uses the top-left rule on the triangle oriented so
     // its area is positive.
     let sign = area.signum();
@@ -578,8 +603,6 @@ fn rasterize(
     let x1 = ((maxx.ceil() as i64).clamp(0, i64::from(target.width)) as u32).min(d.clip.x1);
     let y1 = ((maxy.ceil() as i64).clamp(0, i64::from(target.height)) as u32).min(d.clip.y1);
 
-    let bpp = target.format.bytes_per_pixel();
-    let regs_per_target = d.ps_header.omap_targets[0];
     let near = d.viewport.offset[2];
     let far = near + d.viewport.scale[2];
     let (z_lo, z_hi) = (near.min(far), near.max(far));
@@ -615,53 +638,90 @@ fn rasterize(
             let Some(regs) = interp::run(&d.ps, &mut io) else {
                 continue; // discarded
             };
-            // Depth test against the stored value (in the buffer's
-            // precision), then the depth write.
-            if let (Some(ds), true) = (&d.depth.target, d.depth.test) {
+            // Stencil and depth tests against the stored values (depth
+            // in the buffer's precision), then their writes.
+            if let (Some(ds), true) = (&d.depth.target, d.depth.test || stencil_on) {
                 if x >= ds.width || y >= ds.height {
                     continue;
                 }
                 let bpp = ds.format.bytes_per_pixel() as usize;
                 let at = ds.byte_addr(x, y);
-                let mut cur = [0u8; 4];
+                let mut cur = [0u8; 8];
                 g.read(at, &mut cur[..bpp])
                     .map_err(|f| format!("depth read: {f:?}"))?;
                 let mut new = cur;
-                ds.format.encode(z, &mut new);
-                if !d
-                    .depth
-                    .func
-                    .test(ds.format.decode(&new), ds.format.decode(&cur))
-                {
-                    continue;
+                let sb = ds.format.stencil_byte().filter(|_| stencil_on);
+                if let Some(sb) = sb {
+                    let stored = cur[sb];
+                    if !face.test(stored) {
+                        new[sb] = face.update(face.fail, stored);
+                        if new != cur {
+                            g.write(at, &new[..bpp])
+                                .map_err(|f| format!("stencil write: {f:?}"))?;
+                        }
+                        continue;
+                    }
                 }
-                if d.depth.write {
+                let mut znew = new;
+                ds.format.encode(z, &mut znew);
+                let depth_pass = !d.depth.test
+                    || d.depth
+                        .func
+                        .test(ds.format.decode(&znew), ds.format.decode(&cur));
+                if let Some(sb) = sb {
+                    let op = if depth_pass { face.zpass } else { face.zfail };
+                    new[sb] = face.update(op, cur[sb]);
+                    znew[sb] = new[sb];
+                }
+                if depth_pass && d.depth.write {
+                    new = znew;
+                }
+                if new != cur {
                     g.write(at, &new[..bpp])
                         .map_err(|f| format!("depth write: {f:?}"))?;
                 }
-            }
-            // Outputs: enabled components of target 0 in r0, r1, ...
-            let mut color = [0f32; 4];
-            let mut next = 0u8;
-            for (c, slot) in color.iter_mut().enumerate() {
-                if regs_per_target & (1 << c) != 0 {
-                    *slot = regs.f(next);
-                    next += 1;
+                if !depth_pass {
+                    continue;
                 }
             }
-            let at = target.byte_addr(x * bpp, y);
-            if d.blend.enabled {
-                let mut cur = vec![0u8; bpp as usize];
-                g.read(at, &mut cur)
-                    .map_err(|f| format!("blend read: {f:?}"))?;
-                let unorm = !target.format.is_float();
-                color = d
-                    .blend
-                    .apply(color, target.format.decode(&cur), d.blend_constant, unorm);
+            // Outputs: the enabled components of each target, in
+            // target order, in r0, r1, ...
+            let mut next = 0u8;
+            for k in 0..8 {
+                let mask = d.ps_header.omap_targets[k];
+                let mut color = [0f32; 4];
+                for (c, slot) in color.iter_mut().enumerate() {
+                    if mask & (1 << c) != 0 {
+                        *slot = regs.f(next);
+                        next += 1;
+                    }
+                }
+                let surface = if k == 0 {
+                    Some(*target)
+                } else {
+                    d.more_targets[k - 1]
+                };
+                let Some(t) = surface else {
+                    continue;
+                };
+                if mask == 0 || x >= t.width || y >= t.height {
+                    continue;
+                }
+                let bpp = t.format.bytes_per_pixel();
+                let at = t.byte_addr(x * bpp, y);
+                if d.blend.enabled {
+                    let mut cur = vec![0u8; bpp as usize];
+                    g.read(at, &mut cur)
+                        .map_err(|f| format!("blend read: {f:?}"))?;
+                    let unorm = !t.format.is_float();
+                    color = d
+                        .blend
+                        .apply(color, t.format.decode(&cur), d.blend_constant, unorm);
+                }
+                let pixel = t.format.encode(color);
+                g.write(at, &pixel)
+                    .map_err(|f| format!("color write: {f:?}"))?;
             }
-            let pixel = target.format.encode(color);
-            g.write(at, &pixel)
-                .map_err(|f| format!("color write: {f:?}"))?;
         }
     }
     Ok(())
@@ -772,6 +832,8 @@ mod raster_tests {
             g.write(0x10_1000, &verts).unwrap();
             let d = Draw {
                 target: Some(target),
+                more_targets: Default::default(),
+                cull: Default::default(),
                 vs: vs.clone(),
                 ps: ps.clone(),
                 ps_header: Header::parse(&asm::pixel_header()),

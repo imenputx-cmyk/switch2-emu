@@ -1013,6 +1013,14 @@ fn plan(d: &Draw) -> Result<Plan, String> {
         min_depth: near,
         max_depth: far,
     };
+    if d.depth.stencil.enabled
+        && d.depth
+            .target
+            .is_some_and(|t| t.format.stencil_byte().is_some())
+    {
+        // Packed depth/stencil layouts are not copied to Vulkan yet.
+        return Err("stencil test".into());
+    }
     let depth = match (&d.depth.target, d.depth.test) {
         (Some(t), true) => Some(depth_format(t.format).ok_or("depth format")?),
         _ => None,
@@ -1120,18 +1128,19 @@ impl VulkanBackend {
         &mut self,
         p: &Plan,
         d: &Draw,
-        format: vk::Format,
+        formats: &[vk::Format],
     ) -> Result<vk::Pipeline, String> {
         let mut h = DefaultHasher::new();
         (
             &p.vs.words,
             &p.ps.words,
             p.topology.as_raw(),
-            format.as_raw(),
+            formats.iter().map(|f| f.as_raw()).collect::<Vec<_>>(),
             p.depth.map(|f| f.as_raw()),
             d.depth.write,
             d.depth.func,
             d.blend,
+            d.cull,
         )
             .hash(&mut h);
         for a in &p.attributes {
@@ -1191,11 +1200,32 @@ impl VulkanBackend {
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_clamp_enable(self.depth_clamp)
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
+            .cull_mode(match (d.cull.cull_front, d.cull.cull_back) {
+                (false, false) => vk::CullModeFlags::NONE,
+                (true, false) => vk::CullModeFlags::FRONT,
+                (false, true) => vk::CullModeFlags::BACK,
+                (true, true) => vk::CullModeFlags::FRONT_AND_BACK,
+            })
+            .front_face(if d.cull.front_ccw {
+                vk::FrontFace::COUNTER_CLOCKWISE
+            } else {
+                vk::FrontFace::CLOCKWISE
+            })
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let blend_attachments = [blend_attachment(&d.blend)];
+        let blend_attachments: Vec<_> = formats
+            .iter()
+            .map(|&f| {
+                let a = blend_attachment(&d.blend);
+                if f == vk::Format::UNDEFINED {
+                    a.blend_enable(false)
+                        .color_write_mask(vk::ColorComponentFlags::empty())
+                } else {
+                    a
+                }
+            })
+            .collect();
         let blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -1208,9 +1238,8 @@ impl VulkanBackend {
             vk::DynamicState::BLEND_CONSTANTS,
         ];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let formats = [format];
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&formats)
+            .color_attachment_formats(formats)
             .depth_attachment_format(p.depth.unwrap_or(vk::Format::UNDEFINED));
         let info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
@@ -1236,17 +1265,34 @@ impl VulkanBackend {
         &mut self,
         g: &mut GuestMemory,
         d: &Draw,
-        target: &Surface,
         p: Plan,
         textures: Vec<BoundTexture>,
     ) -> Result<(), String> {
-        let view = self.image(g, target)?;
+        // Attachment k is pixel shader output k (null where unbound or
+        // not written).
+        let mut views = Vec::new();
+        let mut formats = Vec::new();
+        let mut size: Option<(u32, u32)> = None;
+        for (k, t) in d.color_targets() {
+            if d.ps_header.omap_targets[k] == 0 {
+                continue;
+            }
+            let view = self.image(g, &t)?;
+            views.resize(k + 1, vk::ImageView::null());
+            formats.resize(k + 1, vk::Format::UNDEFINED);
+            views[k] = view;
+            formats[k] = vk_format(t.format);
+            size = Some(match size {
+                Some((w, h)) => (w.min(t.width), h.min(t.height)),
+                None => (t.width, t.height),
+            });
+        }
         let mut tex_writes = Vec::new();
         for t in &textures {
             let (view, sampler) = self.upload_texture(t)?;
             tex_writes.push((t.binding, view, sampler));
         }
-        let pipe = self.pipeline(&p, d, vk_format(target.format))?;
+        let pipe = self.pipeline(&p, d, &formats)?;
         let depth_view = match (&d.depth.target, p.depth) {
             (Some(ds), Some(_)) => Some((self.depth_image(g, ds)?, *ds)),
             _ => None,
@@ -1375,15 +1421,22 @@ impl VulkanBackend {
             Some(set)
         };
         self.begin()?;
-        let attachments = [vk::RenderingAttachmentInfo::default()
-            .image_view(view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE)];
+        let attachments: Vec<_> = views
+            .iter()
+            .map(|&view| {
+                vk::RenderingAttachmentInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::LOAD)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+            })
+            .collect();
         // With a depth buffer, only pixels inside both are drawn.
-        let (w, h) = match &depth_view {
-            Some((_, ds)) => (target.width.min(ds.width), target.height.min(ds.height)),
-            None => (target.width, target.height),
+        let (w, h) = match (&depth_view, size) {
+            (Some((_, ds)), Some((w, h))) => (w.min(ds.width), h.min(ds.height)),
+            (Some((_, ds)), None) => (ds.width, ds.height),
+            (None, Some(s)) => s,
+            (None, None) => return Ok(()),
         };
         let area = vk::Rect2D {
             offset: vk::Offset2D::default(),
@@ -1913,10 +1966,25 @@ impl Backend for VulkanBackend {
         emu_gpu::backend::clear_depth_software(g, t, r, z)
     }
 
+    fn clear_stencil(
+        &mut self,
+        g: &mut GuestMemory,
+        t: &DepthSurface,
+        r: Rect,
+        s: u8,
+    ) -> Result<(), String> {
+        if self.depth_images.contains_key(&(g.asid, *t)) {
+            self.flush(g)?;
+        }
+        emu_gpu::backend::clear_stencil_software(g, t, r, s)
+    }
+
     fn draw(&mut self, g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
-        let Some(target) = d.target else {
+        // Color targets the pixel shader writes, or a depth-only draw.
+        let depth_only = d.depth.test && d.depth.target.is_some();
+        if d.color_targets().is_empty() && !depth_only {
             return Ok(());
-        };
+        }
         let plan = match plan(d) {
             Ok(p) => p,
             Err(why) => {
@@ -1937,7 +2005,7 @@ impl Backend for VulkanBackend {
             }
         };
         // SAFETY: see `clear`.
-        unsafe { self.draw_gpu(g, d, &target, plan, textures) }?;
+        unsafe { self.draw_gpu(g, d, plan, textures) }?;
         self.gpu_draws += 1;
         Ok(())
     }

@@ -2605,38 +2605,44 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     let label = t.m.id();
     t.translate(program, stage)?;
 
-    // Pixel shader outputs: color target 0 from the registers its
-    // output map names (r0, r1, ... in RGBA order).
-    let mut color_out = None;
+    // Pixel shader outputs: each target's enabled components from the
+    // next registers (r0, r1, ... across targets in order), at the
+    // target's location.
+    let mut color_out = Vec::new();
     if stage == Stage::Pixel {
-        let mask = header.omap_targets[0];
-        if header.omap_targets[1..].iter().any(|&m| m != 0) {
-            return Err("pixel shaders writing several targets are not translated yet".into());
-        }
-        let out = t.m.id();
-        inst(
-            &mut t.m.globals,
-            op::VARIABLE,
-            &[t.c.p_out_vec4, out, OUTPUT],
-        );
-        inst(&mut t.m.annotations, op::DECORATE, &[out, LOCATION, 0]);
         let mut next = 0u8;
-        let mut parts = Vec::new();
-        for comp in 0..4 {
-            if mask & (1 << comp) != 0 {
-                let u = t.load_reg(next);
-                parts.push(t.bitcast_float(u));
-                next += 1;
-            } else {
-                parts.push(t.c.zero_f);
+        for (k, &mask) in header.omap_targets.iter().enumerate() {
+            if mask == 0 {
+                continue;
             }
+            let out = t.m.id();
+            inst(
+                &mut t.m.globals,
+                op::VARIABLE,
+                &[t.c.p_out_vec4, out, OUTPUT],
+            );
+            inst(
+                &mut t.m.annotations,
+                op::DECORATE,
+                &[out, LOCATION, k as u32],
+            );
+            let mut parts = Vec::new();
+            for comp in 0..4 {
+                if mask & (1 << comp) != 0 {
+                    let u = t.load_reg(next);
+                    parts.push(t.bitcast_float(u));
+                    next += 1;
+                } else {
+                    parts.push(t.c.zero_f);
+                }
+            }
+            let v = t.m.id();
+            let mut ops = vec![t.c.vec4, v];
+            ops.extend(parts);
+            inst(&mut t.m.body, op::COMPOSITE_CONSTRUCT, &ops);
+            inst(&mut t.m.body, op::STORE, &[out, v]);
+            color_out.push(out);
         }
-        let v = t.m.id();
-        let mut ops = vec![t.c.vec4, v];
-        ops.extend(parts);
-        inst(&mut t.m.body, op::COMPOSITE_CONSTRUCT, &ops);
-        inst(&mut t.m.body, op::STORE, &[out, v]);
-        color_out = Some(out);
     }
     for &v in &t.flat {
         inst(&mut t.m.annotations, op::DECORATE, &[v, FLAT]);

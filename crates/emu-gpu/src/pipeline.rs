@@ -57,6 +57,16 @@ impl DepthFormat {
         }
     }
 
+    /// The stencil byte of a pixel, if the format has one.
+    pub fn stencil_byte(self) -> Option<usize> {
+        match self {
+            DepthFormat::S8Z24Unorm => Some(0),
+            DepthFormat::Z24S8Unorm => Some(3),
+            DepthFormat::Z32FloatX24S8 => Some(4),
+            _ => None,
+        }
+    }
+
     /// Writes depth `z` into the pixel bytes `p` (keeping stencil).
     pub fn encode(self, z: f32, p: &mut [u8]) {
         let z = z.clamp(0.0, 1.0);
@@ -185,6 +195,123 @@ impl Compare {
     }
 }
 
+/// Stencil operations (D3D 1..=8 or GL values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum StencilOp {
+    #[default]
+    Keep,
+    Zero,
+    Replace,
+    IncrSaturate,
+    DecrSaturate,
+    Invert,
+    IncrWrap,
+    DecrWrap,
+}
+
+impl StencilOp {
+    pub fn from_raw(v: u32) -> StencilOp {
+        match v {
+            2 | 0 => StencilOp::Zero,
+            3 | 0x1E01 => StencilOp::Replace,
+            4 | 0x1E02 => StencilOp::IncrSaturate,
+            5 | 0x1E03 => StencilOp::DecrSaturate,
+            6 | 0x150A => StencilOp::Invert,
+            7 | 0x8507 => StencilOp::IncrWrap,
+            8 | 0x8508 => StencilOp::DecrWrap,
+            _ => StencilOp::Keep,
+        }
+    }
+
+    pub fn apply(self, s: u8, reference: u8) -> u8 {
+        match self {
+            StencilOp::Keep => s,
+            StencilOp::Zero => 0,
+            StencilOp::Replace => reference,
+            StencilOp::IncrSaturate => s.saturating_add(1),
+            StencilOp::DecrSaturate => s.saturating_sub(1),
+            StencilOp::Invert => !s,
+            StencilOp::IncrWrap => s.wrapping_add(1),
+            StencilOp::DecrWrap => s.wrapping_sub(1),
+        }
+    }
+}
+
+/// One face's stencil state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StencilFace {
+    pub fail: StencilOp,
+    pub zfail: StencilOp,
+    pub zpass: StencilOp,
+    pub func: Compare,
+    pub reference: u8,
+    pub func_mask: u8,
+    pub write_mask: u8,
+}
+
+impl Default for StencilFace {
+    fn default() -> Self {
+        StencilFace {
+            fail: StencilOp::Keep,
+            zfail: StencilOp::Keep,
+            zpass: StencilOp::Keep,
+            func: Compare::Always,
+            reference: 0,
+            func_mask: 0xFF,
+            write_mask: 0xFF,
+        }
+    }
+}
+
+impl StencilFace {
+    /// The stencil test against the stored value.
+    pub fn test(&self, stored: u8) -> bool {
+        let m = self.func_mask;
+        self.func
+            .test(f32::from(self.reference & m), f32::from(stored & m))
+    }
+
+    /// Applies `op` to `stored` through the write mask.
+    pub fn update(&self, op: StencilOp, stored: u8) -> u8 {
+        let v = op.apply(stored, self.reference);
+        (stored & !self.write_mask) | (v & self.write_mask)
+    }
+}
+
+/// Stencil test state (both faces).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Stencil {
+    pub enabled: bool,
+    pub front: StencilFace,
+    pub back: StencilFace,
+}
+
+/// Face culling, in Vulkan's convention (framebuffer coordinates, y
+/// down): `front_ccw` says counter-clockwise triangles face forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Cull {
+    pub front_ccw: bool,
+    pub cull_front: bool,
+    pub cull_back: bool,
+}
+
+impl Cull {
+    /// Whether a triangle with edge-function area `area` (positive:
+    /// clockwise in y-down framebuffer space) is culled.
+    pub fn culls(&self, area: f32) -> bool {
+        let front = if self.front_ccw {
+            area < 0.0
+        } else {
+            area > 0.0
+        };
+        if front {
+            self.cull_front
+        } else {
+            self.cull_back
+        }
+    }
+}
+
 /// Depth buffer and test state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Depth {
@@ -193,6 +320,8 @@ pub struct Depth {
     pub test: bool,
     pub write: bool,
     pub func: Compare,
+    /// Stencil test (needs a target format with stencil bits).
+    pub stencil: Stencil,
 }
 
 impl Default for Depth {
@@ -201,6 +330,7 @@ impl Default for Depth {
             target: None,
             test: false,
             write: false,
+            stencil: Stencil::default(),
             func: Compare::Always,
         }
     }
@@ -386,6 +516,27 @@ mod tests {
         };
         let out = b.apply([1.0, 0.0, 0.0, 0.25], [0.0, 0.0, 1.0, 1.0], [0.0; 4], true);
         assert_eq!(out, [0.25, 0.0, 0.75, 0.25]);
+    }
+
+    #[test]
+    fn stencil_faces() {
+        let f = StencilFace {
+            fail: StencilOp::Zero,
+            zfail: StencilOp::DecrSaturate,
+            zpass: StencilOp::Replace,
+            func: Compare::Equal,
+            reference: 0x35,
+            func_mask: 0x0F,
+            write_mask: 0xF0,
+        };
+        assert!(f.test(0x05));
+        assert!(!f.test(0x06));
+        // Replace through the write mask keeps the low bits.
+        assert_eq!(f.update(f.zpass, 0x0A), 0x3A);
+        assert_eq!(f.update(f.zfail, 0x00), 0x00);
+        assert_eq!(StencilOp::from_raw(0x8507), StencilOp::IncrWrap);
+        assert_eq!(StencilOp::IncrWrap.apply(0xFF, 0), 0);
+        assert_eq!(DepthFormat::from_raw(0x16).unwrap().stencil_byte(), Some(3));
     }
 
     #[test]

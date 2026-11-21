@@ -85,6 +85,12 @@ mod reg {
     pub const DEPTH_TARGET_HEIGHT: u32 = 0x122C;
     pub const DEPTH_TARGET_ENABLE: u32 = 0x1538;
     pub const DEPTH_TEST_ENABLE: u32 = 0x12CC;
+    pub const STENCIL_ENABLE: u32 = 0x1380;
+    pub const CLEAR_STENCIL: u32 = 0xDA0;
+    pub const WINDOW_ORIGIN: u32 = 0x13AC;
+    pub const CULL_TEST_ENABLE: u32 = 0x1918;
+    pub const FRONT_FACE: u32 = 0x191C;
+    pub const CULL_FACE: u32 = 0x1920;
     pub const DEPTH_WRITE_ENABLE: u32 = 0x12E8;
     pub const DEPTH_TEST_FUNC: u32 = 0x130C;
     pub const CLEAR_DEPTH: u32 = 0xD90;
@@ -638,16 +644,52 @@ impl Maxwell3D {
 
     fn depth_state(&self) -> Result<Depth, String> {
         let test = self.reg(reg::DEPTH_TEST_ENABLE) & 1 != 0;
-        if !test {
+        let stencil = self.stencil_state();
+        if !test && !stencil.enabled {
             return Ok(Depth::default());
         }
         let raw = self.reg(reg::DEPTH_TEST_FUNC);
         Ok(Depth {
             target: self.depth_target()?,
             test,
-            write: self.reg(reg::DEPTH_WRITE_ENABLE) & 1 != 0,
-            func: Compare::from_raw(raw).ok_or_else(|| format!("depth function {raw:#x}"))?,
+            write: test && self.reg(reg::DEPTH_WRITE_ENABLE) & 1 != 0,
+            func: if test {
+                Compare::from_raw(raw).ok_or_else(|| format!("depth function {raw:#x}"))?
+            } else {
+                Compare::Always
+            },
+            stencil,
         })
+    }
+
+    /// Stencil state (Lichii maxwell_3d.h: stencil_enable 0x1380, front
+    /// op/func 0x1384, ref/func mask/mask 0x1394; two-sided 0x1594, back
+    /// op/func 0x1598, back ref/mask/func mask 0xF54).
+    fn stencil_state(&self) -> crate::pipeline::Stencil {
+        use crate::pipeline::{Stencil, StencilFace, StencilOp};
+        if self.reg(reg::STENCIL_ENABLE) & 1 == 0 {
+            return Stencil::default();
+        }
+        let face = |ops: u32, reference: u32, func_mask: u32, mask: u32| StencilFace {
+            fail: StencilOp::from_raw(self.reg(ops)),
+            zfail: StencilOp::from_raw(self.reg(ops + 4)),
+            zpass: StencilOp::from_raw(self.reg(ops + 8)),
+            func: Compare::from_raw(self.reg(ops + 12)).unwrap_or(Compare::Always),
+            reference: self.reg(reference) as u8,
+            func_mask: self.reg(func_mask) as u8,
+            write_mask: self.reg(mask) as u8,
+        };
+        let front = face(0x1384, 0x1394, 0x1398, 0x139C);
+        let back = if self.reg(0x1594) & 1 != 0 {
+            face(0x1598, 0xF54, 0xF5C, 0xF58)
+        } else {
+            front
+        };
+        Stencil {
+            enabled: true,
+            front,
+            back,
+        }
     }
 
     /// Blending of color target 0.
@@ -683,6 +725,22 @@ impl Maxwell3D {
             src_alpha: factor(0x10)?,
             dst_alpha: factor(dst_alpha)?,
         })
+    }
+
+    /// Face culling (Lichii vk_rasterizer UpdateFrontFace/CullMode: the
+    /// front face flips with the window origin's flip_y).
+    fn cull_state(&self) -> crate::pipeline::Cull {
+        if self.reg(reg::CULL_TEST_ENABLE) & 1 == 0 {
+            return crate::pipeline::Cull::default();
+        }
+        let ccw = self.reg(reg::FRONT_FACE) == 0x901;
+        let flip = self.reg(reg::WINDOW_ORIGIN) & (1 << 4) != 0;
+        let face = self.reg(reg::CULL_FACE);
+        crate::pipeline::Cull {
+            front_ccw: ccw != flip,
+            cull_front: face == 0x404 || face == 0x408,
+            cull_back: face == 0x405 || face == 0x408,
+        }
     }
 
     fn texture_pools(&self) -> Pools {
@@ -738,12 +796,18 @@ impl Maxwell3D {
         }
         let vs = vs.ok_or("no vertex shader")?;
         let (ps_header, ps) = ps.ok_or("no pixel shader")?;
+        // CT_SELECT: target count in bits 0..4, then 3 bits per output
+        // naming its color target.
         let ct = self.reg(reg::CT_SELECT);
-        let target = if ct & 0xF == 0 {
-            None
-        } else {
-            self.color_target(bits(ct, 6, 4))
-        };
+        let count = (ct & 0xF).min(8);
+        let mut targets = [None; 8];
+        for (k, t) in targets.iter_mut().enumerate().take(count as usize) {
+            let lo = 4 + 3 * k as u32;
+            *t = self.color_target(bits(ct, lo + 2, lo));
+        }
+        let target = targets[0];
+        let mut more_targets = [None; 7];
+        more_targets.copy_from_slice(&targets[1..]);
         let attributes = (0..32)
             .map(|i| {
                 let v = self.reg(reg::VERTEX_ATTRIBUTE + 4 * i);
@@ -799,6 +863,7 @@ impl Maxwell3D {
         });
         let d = Draw {
             target,
+            more_targets,
             vs,
             ps,
             ps_header,
@@ -819,6 +884,7 @@ impl Maxwell3D {
             textures: self.texture_pools(),
             depth: self.depth_state()?,
             blend: self.blend_state()?,
+            cull: self.cull_state(),
             root_tables,
             blend_constant: [0, 1, 2, 3]
                 .map(|i| f32::from_bits(self.reg(reg::BLEND_CONSTANT + 4 * i))),
@@ -902,12 +968,31 @@ impl Maxwell3D {
         }
     }
 
+    fn clear_stencil(&mut self, ctx: &mut EngineCtx) {
+        let Ok(Some(target)) = self.depth_target() else {
+            return;
+        };
+        if target.format.stencil_byte().is_none() {
+            return;
+        }
+        let Some(rect) = self.clear_rect(target.width, target.height) else {
+            return;
+        };
+        let s = self.reg(reg::CLEAR_STENCIL) as u8;
+        if let Err(e) = ctx.backend.clear_stencil(&mut ctx.guest, &target, rect, s) {
+            ctx.faults.push(format!("stencil clear: {e}"));
+        }
+    }
+
     /// CLEAR_SURFACE: fills the selected render target with the clear
     /// color, limited by the surface clip, scissor 0 and the clear rect.
     fn clear(&mut self, v: u32, ctx: &mut EngineCtx) {
         let mask = [v & 4 != 0, v & 8 != 0, v & 16 != 0, v & 32 != 0];
         if v & 1 != 0 {
             self.clear_depth(ctx);
+        }
+        if v & 2 != 0 {
+            self.clear_stencil(ctx);
         }
         if !mask.iter().any(|&m| m) {
             return;

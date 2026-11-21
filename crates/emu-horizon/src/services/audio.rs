@@ -223,6 +223,13 @@ impl AudioRenderer {
             section(resources_at, word(0x10)),
             section(voices_at, word(0x0C)),
         );
+        // Then effects, splitters, mixes.
+        let splitters_at = voices_at + word(0x0C) + word(0x14);
+        let mixes_at = splitters_at + word(0x24);
+        self.voices
+            .update_splitters(section(splitters_at, word(0x24)));
+        self.voices
+            .update_mixes(section(mixes_at, word(0x18)), self.params.mixes);
         if self.running {
             let mem = &*ctx.mem;
             let read = |a: u64, b: &mut [u8]| mem.read(a, b).is_ok();

@@ -184,6 +184,17 @@ pub trait Backend {
         clear_depth_software(g, target, rect, z)
     }
 
+    /// Fills the stencil bits of `rect` of a depth/stencil buffer.
+    fn clear_stencil(
+        &mut self,
+        g: &mut GuestMemory,
+        target: &crate::pipeline::DepthSurface,
+        rect: Rect,
+        s: u8,
+    ) -> Result<(), String> {
+        clear_stencil_software(g, target, rect, s)
+    }
+
     /// Executes a draw.
     fn draw(&mut self, g: &mut GuestMemory, d: &crate::draw::Draw) -> Result<(), String>;
 
@@ -204,6 +215,25 @@ pub fn clear_depth_software(
         for x in r.x0..r.x1.min(t.width) {
             let i = (y * t.width + x) as usize * bpp;
             t.format.encode(z, &mut data[i..i + bpp]);
+        }
+    }
+    t.write_linear(g, &data)
+}
+
+pub fn clear_stencil_software(
+    g: &mut GuestMemory,
+    t: &crate::pipeline::DepthSurface,
+    r: Rect,
+    s: u8,
+) -> Result<(), String> {
+    let Some(at) = t.format.stencil_byte() else {
+        return Ok(());
+    };
+    let mut data = t.read_linear(g)?;
+    let bpp = t.format.bytes_per_pixel() as usize;
+    for y in r.y0..r.y1.min(t.height) {
+        for x in r.x0..r.x1.min(t.width) {
+            data[(y * t.width + x) as usize * bpp + at] = s;
         }
     }
     t.write_linear(g, &data)

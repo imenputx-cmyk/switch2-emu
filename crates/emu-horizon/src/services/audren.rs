@@ -114,6 +114,30 @@ struct Voice {
     flush: u32,
 }
 
+/// A mix (Eden MixInfo): its buffers go to a destination mix through
+/// a volume matrix, or through a splitter.
+#[derive(Debug, Clone)]
+struct Mix {
+    in_use: bool,
+    volume: f32,
+    buffers: usize,
+    dest_mix: u32,
+    dest_splitter: u32,
+    /// `matrix[i * MIX_BUFFERS + j]`: from buffer i to destination j.
+    matrix: Vec<f32>,
+}
+
+/// A splitter destination (Eden SplitterDestinationData).
+#[derive(Debug, Clone, Copy)]
+struct Destination {
+    in_use: bool,
+    mix_id: u32,
+    volumes: [f32; MIX_BUFFERS],
+}
+
+/// Mix id of the final mix.
+const FINAL_MIX: usize = 0;
+
 /// Reads guest memory; false if unmapped.
 pub type ReadFn<'a> = dyn Fn(u64, &mut [u8]) -> bool + 'a;
 
@@ -123,6 +147,10 @@ pub struct Voices {
     voices: Vec<Voice>,
     states: Vec<ChannelState>,
     volumes: Vec<[f32; MIX_BUFFERS]>,
+    mixes: Vec<Mix>,
+    /// Destination ids of each splitter.
+    splitters: Vec<Vec<u32>>,
+    destinations: Vec<Destination>,
 }
 
 fn u32_at(b: &[u8], o: usize) -> u32 {
@@ -150,7 +178,157 @@ impl Voices {
             voices: vec![Voice::default(); n],
             states: vec![ChannelState::default(); n],
             volumes: vec![[0.0; MIX_BUFFERS]; n],
+            mixes: Vec::new(),
+            splitters: Vec::new(),
+            destinations: Vec::new(),
         }
+    }
+
+    /// Applies the mix section (MixInfo::InParameter, 0x930 bytes each,
+    /// optionally after a 0x20-byte dirty-only header) for `count` mixes.
+    pub fn update_mixes(&mut self, data: &[u8], count: u32) {
+        let count = count as usize;
+        if self.mixes.len() < count {
+            self.mixes.resize(
+                count,
+                Mix {
+                    in_use: false,
+                    volume: 0.0,
+                    buffers: 0,
+                    dest_mix: UNUSED_MIX,
+                    dest_splitter: UNUSED_SPLITTER,
+                    matrix: vec![0.0; MIX_BUFFERS * MIX_BUFFERS],
+                },
+            );
+        }
+        let (start, entries, dirty) = if data.len() == count * 0x930 {
+            (0, count, false)
+        } else if data.len() >= 0x20 {
+            let n = (u32_at(data, 4) as usize).min((data.len() - 0x20) / 0x930);
+            (0x20, n, true)
+        } else {
+            return;
+        };
+        for i in 0..entries {
+            let p = &data[start + i * 0x930..start + (i + 1) * 0x930];
+            let id = if dirty { u32_at(p, 0x10) as usize } else { i };
+            let Some(m) = self.mixes.get_mut(id) else {
+                continue;
+            };
+            m.in_use = byte(p, 0xC) != 0;
+            if !m.in_use {
+                continue;
+            }
+            m.volume = f32_at(p, 0);
+            m.buffers = (u32_at(p, 8) as usize).min(MIX_BUFFERS);
+            for (k, v) in m.matrix.iter_mut().enumerate() {
+                *v = f32_at(p, 0x24 + 4 * k);
+            }
+            m.dest_mix = u32_at(p, 0x924);
+            m.dest_splitter = u32_at(p, 0x928);
+        }
+    }
+
+    /// Applies the splitter section ('SNDH' header, 'SNDI' infos with
+    /// their destination ids, 'SNDD' destinations of 0x70, 0x90 or 0xA8
+    /// bytes by revision).
+    pub fn update_splitters(&mut self, data: &[u8]) {
+        if data.len() < 0x20 || &data[..4] != b"SNDH" {
+            return;
+        }
+        let infos = u32_at(data, 4) as usize;
+        let dests = u32_at(data, 8) as usize;
+        let mut at = 0x20;
+        for _ in 0..infos {
+            if data.get(at..at + 4) != Some(b"SNDI") {
+                break;
+            }
+            let id = u32_at(data, at + 4) as usize;
+            let n = (u32_at(data, at + 0xC) as usize).min(256);
+            let ids: Vec<u32> = (0..n).map(|k| u32_at(data, at + 0x10 + 4 * k)).collect();
+            if id < 4096 {
+                if self.splitters.len() <= id {
+                    self.splitters.resize(id + 1, Vec::new());
+                }
+                self.splitters[id] = ids;
+            }
+            at += 0x1C + 4 * n;
+        }
+        if dests == 0 {
+            return;
+        }
+        let stride = [0xA8, 0x90, 0x70]
+            .into_iter()
+            .find(|&s| {
+                at + s * dests <= data.len() && {
+                    // The next destination starts right after this one.
+                    dests == 1 || data.get(at + s..at + s + 4) == Some(b"SNDD")
+                }
+            })
+            .unwrap_or(0x70);
+        let in_use_at = match stride {
+            0xA8 => 0x9C,
+            0x90 => 0x84,
+            _ => 0x6C,
+        };
+        for k in 0..dests {
+            let p = at + k * stride;
+            if data.get(p..p + 4) != Some(b"SNDD") {
+                continue;
+            }
+            let id = u32_at(data, p + 4) as usize;
+            if id >= 1 << 16 {
+                continue;
+            }
+            if self.destinations.len() <= id {
+                self.destinations.resize(
+                    id + 1,
+                    Destination {
+                        in_use: false,
+                        mix_id: UNUSED_MIX,
+                        volumes: [0.0; MIX_BUFFERS],
+                    },
+                );
+            }
+            let d = &mut self.destinations[id];
+            d.in_use = byte(data, p + in_use_at) != 0;
+            d.mix_id = u32_at(data, p + 0x68);
+            for (j, v) in d.volumes.iter_mut().enumerate() {
+                *v = f32_at(data, p + 8 + 4 * j);
+            }
+        }
+    }
+
+    /// Destination `index` of splitter `splitter`, if configured.
+    fn destination(&self, splitter: u32, index: usize) -> Option<Option<&Destination>> {
+        let ids = self.splitters.get(splitter as usize)?;
+        let id = *ids.get(index)?;
+        Some(
+            self.destinations
+                .get(id as usize)
+                .filter(|d| d.in_use && (d.mix_id as usize) < self.mixes.len()),
+        )
+    }
+
+    /// Steps from mix `m` to the final mix (for processing order).
+    fn distance(&self, m: usize) -> usize {
+        let mut d = 0;
+        let mut cur = m;
+        while cur != FINAL_MIX && d < self.mixes.len() {
+            let mix = &self.mixes[cur];
+            cur = if (mix.dest_mix as usize) < self.mixes.len() {
+                mix.dest_mix as usize
+            } else if mix.dest_splitter != UNUSED_SPLITTER {
+                match self.destination(mix.dest_splitter, 0) {
+                    Some(Some(dst)) => dst.mix_id as usize,
+                    _ => return d + 1,
+                }
+            } else {
+                return d + 1;
+            };
+            d += 1;
+        }
+        d
     }
 
     /// Applies the channel resource and voice sections of an update
@@ -263,7 +441,14 @@ impl Voices {
 
     /// Renders `frames` stereo frames at `rate` Hz (interleaved L, R).
     pub fn render(&mut self, frames: usize, rate: u32, read: &ReadFn) -> Vec<f32> {
-        let mut mix = vec![0f32; frames * 2];
+        let mixing = self.mixes.get(FINAL_MIX).is_some_and(|m| m.in_use);
+        // Each mix's buffers (Eden mix buffers, kept per mix).
+        let mut bufs: Vec<Vec<Vec<f32>>> = self
+            .mixes
+            .iter()
+            .map(|m| vec![vec![0f32; frames]; if m.in_use { m.buffers } else { 0 }])
+            .collect();
+        let mut direct = vec![0f32; frames * 2];
         let mut buf = vec![0f32; frames];
         for vi in 0..self.voices.len() {
             if !self.voices[vi].in_use {
@@ -276,39 +461,105 @@ impl Voices {
             if v.wave_buffer_count == 0 || v.play != Play::Started {
                 continue;
             }
-            let routed = v.mix_id != UNUSED_MIX || v.splitter_id != UNUSED_SPLITTER;
-            if !routed {
-                continue;
-            }
             for c in 0..v.channels {
                 let r = v.resources[c] as usize;
                 buf.iter_mut().for_each(|s| *s = 0.0);
                 decode(&v, c, &mut self.states[r], rate, &mut buf, read);
-                let vol = &self.volumes[r];
-                let (l, rr) = if v.mix_id == UNUSED_MIX {
-                    // Through a splitter: its volumes are not applied.
-                    match (v.channels, c) {
-                        (1, _) => (1.0, 1.0),
-                        (_, 0) | (_, 4) => (1.0, 0.0),
-                        (_, 1) | (_, 5) => (0.0, 1.0),
-                        (_, 2) => (0.707, 0.707),
-                        _ => (0.0, 0.0),
+                let g = v.volume;
+                // Eden GenerateVoiceMixCommand: into the voice's mix with
+                // its channel volumes, or into each splitter
+                // destination (c, c + channels, ...) with its volumes.
+                let mut sends: Vec<(usize, [f32; MIX_BUFFERS])> = Vec::new();
+                if mixing && (v.mix_id as usize) < self.mixes.len() {
+                    sends.push((v.mix_id as usize, self.volumes[r]));
+                } else if mixing && v.splitter_id != UNUSED_SPLITTER {
+                    let mut i = c;
+                    while let Some(d) = self.destination(v.splitter_id, i) {
+                        if let Some(d) = d {
+                            sends.push((d.mix_id as usize, d.volumes));
+                        }
+                        i += v.channels;
                     }
-                } else {
-                    (
+                } else if v.mix_id != UNUSED_MIX || v.splitter_id != UNUSED_SPLITTER {
+                    // No mixes known: straight to the speakers.
+                    let vol = &self.volumes[r];
+                    let (l, rr) = (
                         vol[0] + 0.707 * vol[2] + vol[4],
                         vol[1] + 0.707 * vol[2] + vol[5],
-                    )
-                };
-                let g = v.volume;
-                for (f, &s) in buf.iter().enumerate() {
-                    mix[2 * f] += s * g * l;
-                    mix[2 * f + 1] += s * g * rr;
+                    );
+                    for (f, &s) in buf.iter().enumerate() {
+                        direct[2 * f] += s * g * l;
+                        direct[2 * f + 1] += s * g * rr;
+                    }
+                }
+                for (m, vol) in sends {
+                    for (j, dst) in bufs[m].iter_mut().enumerate() {
+                        let k = g * vol[j];
+                        if k != 0.0 {
+                            for (o, &s) in dst.iter_mut().zip(&buf) {
+                                *o += s * k;
+                            }
+                        }
+                    }
                 }
             }
             self.voices[vi].is_new = false;
         }
-        mix
+        if !mixing {
+            return direct;
+        }
+        // Sub-mixes, farthest from the final mix first (Eden SortInfo,
+        // GenerateMixCommands).
+        let mut order: Vec<usize> = (0..self.mixes.len())
+            .filter(|&m| m != FINAL_MIX && self.mixes[m].in_use)
+            .collect();
+        order.sort_by_key(|&m| std::cmp::Reverse(self.distance(m)));
+        for m in order {
+            let mix = self.mixes[m].clone();
+            let src = std::mem::take(&mut bufs[m]);
+            if (mix.dest_mix as usize) < self.mixes.len() {
+                let dm = mix.dest_mix as usize;
+                for (i, s) in src.iter().enumerate() {
+                    for (j, dst) in bufs[dm].iter_mut().enumerate() {
+                        let k = mix.volume * mix.matrix[i * MIX_BUFFERS + j];
+                        if k != 0.0 {
+                            for (o, &x) in dst.iter_mut().zip(s) {
+                                *o += x * k;
+                            }
+                        }
+                    }
+                }
+            } else if mix.dest_splitter != UNUSED_SPLITTER && mix.buffers > 0 {
+                let mut dest_id = 0;
+                while let Some(d) = self.destination(mix.dest_splitter, dest_id) {
+                    if let Some(d) = d {
+                        let input = &src[dest_id % mix.buffers];
+                        let (dm, vols) = (d.mix_id as usize, d.volumes);
+                        for (j, dst) in bufs[dm].iter_mut().enumerate() {
+                            let k = mix.volume * vols[j];
+                            if k != 0.0 {
+                                for (o, &x) in dst.iter_mut().zip(input) {
+                                    *o += x * k;
+                                }
+                            }
+                        }
+                    }
+                    dest_id += 1;
+                }
+            }
+        }
+        // The final mix to stereo: FL, FR, FC, LFE, RL, RR.
+        let fin = &self.mixes[FINAL_MIX];
+        let b = &bufs[FINAL_MIX];
+        let ch = |k: usize, f: usize| b.get(k).map_or(0.0, |x| x[f]);
+        let mut out = direct;
+        for f in 0..frames {
+            let (c, l, r) = (0.707 * ch(2, f), ch(0, f) + ch(4, f), ch(1, f) + ch(5, f));
+            let mono = b.len() == 1;
+            out[2 * f] += fin.volume * if mono { ch(0, f) } else { l + c };
+            out[2 * f + 1] += fin.volume * if mono { ch(0, f) } else { r + c };
+        }
+        out
     }
 
     /// Eden UpdateParametersForCommandGeneration: hands wave buffers to
@@ -655,6 +906,39 @@ mod tests {
         assert_eq!(out[2 * 99], 0.0);
         let status = v.update(&res, &p2);
         assert_eq!(u32::from_le_bytes(status[8..12].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn sub_mix_routes_to_final_mix() {
+        let read = |_: u64, b: &mut [u8]| {
+            for c in b.chunks_exact_mut(2) {
+                c.copy_from_slice(&0x4000i16.to_le_bytes());
+            }
+            true
+        };
+        let mix = |volume: f32, dest: u32, gain: f32| {
+            let mut p = vec![0u8; 0x930];
+            p[..4].copy_from_slice(&volume.to_bits().to_le_bytes());
+            p[8..12].copy_from_slice(&2u32.to_le_bytes());
+            p[0xC] = 1;
+            for i in 0..2 {
+                let at = 0x24 + 4 * (i * MIX_BUFFERS + i);
+                p[at..at + 4].copy_from_slice(&gain.to_bits().to_le_bytes());
+            }
+            p[0x924..0x928].copy_from_slice(&dest.to_le_bytes());
+            p[0x928..0x92C].copy_from_slice(&UNUSED_SPLITTER.to_le_bytes());
+            p
+        };
+        let mut mixes = mix(1.0, UNUSED_MIX, 0.0);
+        mixes.extend(mix(1.0, 0, 0.5)); // sub-mix 1 -> final, half volume
+        let mut v = Voices::new(1);
+        let (res, mut p) = voice_input(0, false);
+        p[0x58..0x5C].copy_from_slice(&1u32.to_le_bytes()); // to the sub-mix
+        v.update(&res, &p);
+        v.update_mixes(&mixes, 2);
+        let out = v.render(16, 48_000, &read);
+        // 0.5 sample * 0.5 voice * 1.0 channel volume * 0.5 matrix.
+        assert_eq!((out[4], out[5]), (0.125, 0.125));
     }
 
     #[test]

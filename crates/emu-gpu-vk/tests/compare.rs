@@ -282,6 +282,87 @@ fn depth_test_and_blending() {
     assert!(written > 500, "only {written} depth values written");
 }
 
+fn color_shaders(second_target: bool) -> (Vec<u8>, Vec<u8>) {
+    use emu_gpu::shader::{asm, attr};
+    let vs = asm::program(
+        &asm::vertex_header(),
+        &[
+            asm::ald(0, attr::generic(0), 4),
+            asm::ald(4, attr::generic(1), 4),
+            asm::ast(0, attr::POSITION, 4),
+            asm::ast(4, attr::generic(0), 4),
+            asm::exit(),
+        ],
+    );
+    let mut header = asm::pixel_header();
+    let mut code = vec![
+        asm::ipa(0, 0x80),
+        asm::ipa(1, 0x84),
+        asm::ipa(2, 0x88),
+        asm::mov32i(3, 1.0f32.to_bits()),
+    ];
+    if second_target {
+        // Target 1 (r4..r7): the color reversed, alpha 0.75.
+        header[0x48..0x4C].copy_from_slice(&0xFFu32.to_le_bytes());
+        code.extend([
+            asm::ipa(6, 0x80),
+            asm::ipa(5, 0x84),
+            asm::ipa(4, 0x88),
+            asm::mov32i(7, 0.75f32.to_bits()),
+        ]);
+    }
+    code.push(asm::exit());
+    (vs, asm::program(&header, &code))
+}
+
+#[test]
+fn culled_draws() {
+    // Clockwise front faces: these triangles are back faces in
+    // framebuffer space, so front culling keeps them, and so does back
+    // culling with the window origin's y flip.
+    for (face, origin) in [(0x404u32, 0u32), (0x405, 1 << 4)] {
+        let (vs, ps) = color_shaders(false);
+        let extra = [
+            incr(0, 0x1918, 3),
+            1,
+            0x900,
+            face,
+            incr(0, 0x13AC, 1),
+            origin,
+        ];
+        shaded_draw(vs, ps, 16, &extra);
+    }
+}
+
+#[test]
+fn multiple_render_targets() {
+    let (vs, ps) = color_shaders(true);
+    let rt1 = GPU_VA + 0x6_0000;
+    let extra = [
+        incr(0, 0x840, 6),
+        (rt1 >> 32) as u32,
+        rt1 as u32,
+        96,
+        64,
+        RGBA8,
+        2 << 4,
+        // Two targets: output 0 -> target 0, output 1 -> target 1.
+        incr(0, 0x121C, 1),
+        2 | 1 << 7,
+    ];
+    let Some((soft, _)) = shaded_draw(vs, ps, 16, &extra) else {
+        return;
+    };
+    // Target 1 was drawn: its reversed colors differ from the clear.
+    let at = 0x6_0000 - 0x1_0000;
+    let size = emu_gpu::blocklinear::size(96 * 4, 64, 2);
+    let alpha_075 = soft[at..at + size]
+        .chunks(4)
+        .filter(|p| p[3] == 191)
+        .count();
+    assert!(alpha_075 > 500, "only {alpha_075} pixels in target 1");
+}
+
 /// Two textures for `shaded_draw`: handle word 0 is an 8x8 pitch-linear
 /// checkerboard sampled nearest with repeat, handle word 1 a 4x4
 /// block-linear gradient sampled linearly with clamp to edge.
