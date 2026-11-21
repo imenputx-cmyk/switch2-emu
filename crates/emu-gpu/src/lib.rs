@@ -108,8 +108,9 @@ struct HostState {
 /// Queued work on a channel.
 #[derive(Debug, Clone, Copy)]
 enum Work {
-    /// Command words at a GPU address.
-    Words { va: u64, words: usize },
+    /// Command words at a GPU address. `resume` marks the rest of an
+    /// entry that stopped at an unmet acquire.
+    Words { va: u64, words: usize, resume: bool },
     /// Raise the channel's syncpoint (a fence) once the work before is done.
     Increment(u32),
 }
@@ -129,6 +130,13 @@ pub struct Channel {
     pub syncpoint: u32,
     subchannels: [Option<Engine>; 8],
     pending: Option<Pending>,
+    /// Where the last entry ended: an entry starting there continues its
+    /// unfinished method.
+    split_end: u64,
+    /// Unfinished methods set aside for an entry that started elsewhere,
+    /// with the address their stream resumes at (Lichii
+    /// DmaPusher::ResolveSplitMethod).
+    parked: Vec<(u64, Pending)>,
     host: HostState,
     /// Work not run yet (behind an unmet semaphore acquire).
     queue: std::collections::VecDeque<Work>,
@@ -255,6 +263,8 @@ impl Gpu {
             syncpoint: 32 + id as u32,
             subchannels: Default::default(),
             pending: None,
+            split_end: 0,
+            parked: Vec::new(),
             host: HostState::default(),
             queue: Default::default(),
             stalled: None,
@@ -312,6 +322,8 @@ impl Gpu {
                 self.channels[channel].stalled = None;
             }
             let Some(work) = self.channels[channel].queue.pop_front() else {
+                // A split method resumes within the work that split it.
+                self.channels[channel].parked.clear();
                 return;
             };
             let (va, words) = match work {
@@ -320,7 +332,12 @@ impl Gpu {
                     self.syncpoints[sp] = self.syncpoints[sp].wrapping_add(n);
                     continue;
                 }
-                Work::Words { va, words } => (va, words),
+                Work::Words { va, words, resume } => {
+                    if !resume {
+                        self.resolve_split(channel, va);
+                    }
+                    (va, words)
+                }
             };
             let Some(asid) = self.channels[channel].address_space else {
                 self.faults
@@ -344,10 +361,12 @@ impl Gpu {
                     self.channels[channel].queue.push_front(Work::Words {
                         va: va + 4 * (i as u64 + 1),
                         words: words - i - 1,
+                        resume: true,
                     });
                     break;
                 }
             }
+            self.channels[channel].split_end = va + 4 * words as u64;
         }
     }
 
@@ -371,7 +390,11 @@ impl Gpu {
             let va = (entry & 0xFFFF_FFFC) | ((entry >> 32) & 0xFF) << 32;
             let words = ((entry >> 42) & 0x1F_FFFF) as usize;
             if words != 0 {
-                ch.queue.push_back(Work::Words { va, words });
+                ch.queue.push_back(Work::Words {
+                    va,
+                    words,
+                    resume: false,
+                });
             } // else a control entry (NOP etc.)
         }
         let increment =
@@ -414,6 +437,31 @@ impl Gpu {
         mem: &mut Memory,
     ) -> (u32, u32) {
         self.submit_with_increment(channel, entries, flags, 0, mem)
+    }
+
+    /// Before an entry at `va`: an unfinished method is set aside when
+    /// the entry does not continue the last one (NVN2 runs other work,
+    /// such as a compute dispatch, between the entries of a split method),
+    /// and one set aside for this address resumes.
+    fn resolve_split(&mut self, channel: usize, va: u64) {
+        const MAX_PARKED: usize = 8;
+        let ch = &mut self.channels[channel];
+        let resume = ch
+            .parked
+            .iter()
+            .position(|&(at, _)| at == va)
+            .map(|i| ch.parked.remove(i).1);
+        if va != ch.split_end {
+            if let Some(p) = ch.pending.take() {
+                if ch.parked.len() == MAX_PARKED {
+                    ch.parked.remove(0);
+                }
+                ch.parked.push((ch.split_end, p));
+            }
+        }
+        if ch.pending.is_none() {
+            ch.pending = resume;
+        }
     }
 
     fn process_word(&mut self, channel: usize, word: u32, mem: &mut Memory) {
@@ -803,6 +851,70 @@ mod tests {
         assert_eq!(e.reg(0x0d80), 42);
         assert_eq!(e.macro_calls, 1);
         assert!(gpu.faults.is_empty(), "{:?}", gpu.faults);
+    }
+
+    #[test]
+    fn split_method_resumes_after_an_entry_elsewhere() {
+        use engines::mme64::asm::{inst, Lane, LOAD0, NOP, ZERO};
+        let (mut gpu, mut mem) = setup();
+        let mut first = inst(
+            false,
+            0,
+            0,
+            [
+                Lane {
+                    op: 0,
+                    dst: 0,
+                    src_a: LOAD0,
+                    src_b: LOAD0 + 1,
+                    imm: 0,
+                    out_method: 6,
+                    out_emit: 1,
+                },
+                Lane {
+                    imm: 0x0d80 / 4,
+                    ..NOP
+                },
+            ],
+        );
+        first[2] |= 1;
+        let second = inst(false, 0, 0, [NOP, Lane { dst: ZERO, ..NOP }]);
+        let mut words = vec![incr(0, 0, 1), class::AMPERE_THREED];
+        words.extend([incr(0, 0x114, 1), 0, (3 << 29) | (6 << 16) | (0x118 / 4)]);
+        words.extend(first);
+        words.extend(second);
+        words.extend([incr(0, 0x11C, 2), 0, 0]);
+        run(&mut gpu, &mut mem, &words);
+        // Entry A at 0x1000_0000: the call's header and first parameter.
+        // Entry B at 0x1000_1000: other work. Entry C continues A.
+        let a = [incr(0, 0x3800, 2), 40];
+        let b = [incr(0, 0x0d84, 1), 7];
+        let c = [2];
+        let put = |mem: &mut Memory, at: u64, w: &[u32]| {
+            let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+            mem.write(at, &bytes).unwrap();
+        };
+        put(&mut mem, 0x100_0000, &a);
+        put(&mut mem, 0x100_1000, &b);
+        put(&mut mem, 0x100_0008, &c);
+        let entry = |va: u64, n: u64| va | (n << 42);
+        gpu.submit(
+            0,
+            &[
+                entry(0x1000_0000, 2),
+                entry(0x1000_1000, 2),
+                entry(0x1000_0008, 1),
+            ],
+            0,
+            &mut mem,
+        );
+        assert!(gpu.faults.is_empty(), "{:?}", gpu.faults);
+        let Some(Engine::ThreeD(e)) = &gpu.channels[0].subchannels[0] else {
+            panic!()
+        };
+        assert_eq!(e.reg(0x0d84), 7);
+        assert_eq!(e.reg(0x0d80), 42);
+        assert_eq!(e.macro_calls, 1);
     }
 
     #[test]
