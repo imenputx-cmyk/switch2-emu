@@ -138,6 +138,22 @@ impl GuestMemory<'_> {
     pub fn write(&mut self, va: u64, data: &[u8]) -> Result<(), GpuFault> {
         self.aspace.write(self.mem, va, data)
     }
+
+    /// Reads as much of `buf` as is mapped from `va` on (page by page),
+    /// returning the bytes read; the rest stays zero.
+    pub fn read_prefix(&self, va: u64, buf: &mut [u8]) -> Result<usize, GpuFault> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let at = va + done as u64;
+            let n = ((0x1000 - (at & 0xFFF)) as usize).min(buf.len() - done);
+            match self.read(at, &mut buf[done..done + n]) {
+                Ok(()) => done += n,
+                Err(f) if done == 0 => return Err(f),
+                Err(_) => break,
+            }
+        }
+        Ok(done)
+    }
 }
 
 pub trait Backend {

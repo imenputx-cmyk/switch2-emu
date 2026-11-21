@@ -27,7 +27,7 @@
 
 use super::decode::{
     AtomOp, Bop, DecodeError, HalfOp, HalfSrc, Inst, IntFunc, IpaMode, Mods, MufuOp, Op, Operand,
-    Pred, Round, Space, HALF_ZERO, PT, RZ,
+    Pred, Round, Space, HALF_ZERO, PT, PT_FALSE, RZ,
 };
 
 /// Uniform predicates UP0-UP6 are IR predicates 8-14 (UPT is PT).
@@ -197,6 +197,7 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Inst>, DecodeError> {
             }))
         })
         .collect();
+    let mut ended = false;
     for (index, &inst) in all.iter().enumerate() {
         let insts = decode(inst, index)?;
         for inst in &insts {
@@ -207,8 +208,12 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Inst>, DecodeError> {
         let terminal = insts.last().is_some_and(Inst::is_terminal);
         lowered.push(insts);
         if terminal && index >= furthest {
+            ended = true;
             break;
         }
+    }
+    if !ended {
+        return Err(DecodeError::Truncated);
     }
     // Registers past the program's own hold the uniforms.
     let program = &all[..lowered.len()];
@@ -489,13 +494,12 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 pred: i.bits(81, 3) as u8,
             })
         }
-        // IADD3 without carries.
+        // IADD3: carry outs at 81 and 84; .X (74) adds the carry-in
+        // predicates at 87 and 77.
         0x010 => {
-            if i.on(74) || i.bits(81, 3) != 7 || i.bits(84, 3) != 7 {
-                return err("IADD3 carry");
-            }
             let (b, b_mods) = src_b()?;
             let (c, c_mods) = src_c()?;
+            let x = i.on(74);
             one(Op::Iadd3 {
                 dst,
                 a,
@@ -504,6 +508,13 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 neg_b: b_mods.neg,
                 c,
                 neg_c: c_mods.neg,
+                x,
+                cin: if x {
+                    [i.pred_at(87), i.pred_at(77)]
+                } else {
+                    [PT_FALSE; 2]
+                },
+                co: [i.bits(81, 3) as u8, i.bits(84, 3) as u8],
             })
         }
         // IMAD (low word). Bit 75 negates the addend.
@@ -751,11 +762,28 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 c: src_c()?.0,
             })
         }
-        // LEA: (a << shift) + b, low word only.
-        0x011 => {
-            if i.on(80) || i.on(74) || i.bits(81, 3) != 7 {
-                return err("LEA.HI, .X or carry");
+        // LEA: (a << shift) + b; .HI (80) shifts the c:a pair and keeps
+        // the high word; .X (74) adds the carry-in at 87; carry out at 81.
+        0x011 if i.on(80) || i.on(74) || i.bits(81, 3) != 7 => {
+            let (b, b_mods) = src_b()?;
+            if b_mods.neg {
+                return err("LEA with carries and a negated addend");
             }
+            let x = i.on(74);
+            one(Op::Lea {
+                dst,
+                a,
+                neg_a: i.on(72),
+                b,
+                c: if i.on(80) { i.reg(64) } else { RZ },
+                shift: i.bits(75, 5),
+                hi: i.on(80),
+                x,
+                cin: if x { i.pred_at(87) } else { PT_FALSE },
+                co: i.bits(81, 3) as u8,
+            })
+        }
+        0x011 => {
             let (b, b_mods) = src_b()?;
             one(Op::Iscadd {
                 dst,
@@ -1472,6 +1500,25 @@ fn decode_uniform_op(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeEr
                     }
                 }
             }
+            // UIADD3/ULEA carries are uniform predicates.
+            let remap = |p: &mut Pred| {
+                if *p != PT_FALSE {
+                    p.index = upred(u32::from(p.index));
+                }
+            };
+            for inst in &mut out {
+                match &mut inst.op {
+                    Op::Iadd3 { cin, co, .. } => {
+                        cin.iter_mut().for_each(remap);
+                        co.iter_mut().for_each(|c| *c = upred(u32::from(*c)));
+                    }
+                    Op::Lea { cin, co, .. } => {
+                        remap(cin);
+                        *co = upred(u32::from(*co));
+                    }
+                    _ => {}
+                }
+            }
             Ok(out)
         }
     }
@@ -1918,6 +1965,83 @@ mod more_tests {
             .collect();
         program.extend(decoded);
         run(&program, io).expect("runs").0
+    }
+
+    #[test]
+    fn carry_chains() {
+        let r = exec(
+            &[
+                // IADD3 R4, P0, PT = R0 + R2 + RZ
+                inst(
+                    0x210,
+                    4,
+                    &[(24, 8, 0), (32, 8, 2), (64, 8, 255), (81, 3, 0), (84, 3, 7)],
+                ),
+                // IADD3.X R5 = R1 + R3 + RZ + P0 + !PT
+                inst(
+                    0x210,
+                    5,
+                    &[
+                        (24, 8, 1),
+                        (32, 8, 3),
+                        (64, 8, 255),
+                        (74, 1, 1),
+                        (87, 4, 0),
+                        (77, 4, 0xF),
+                    ],
+                ),
+                // IADD3 R6, P1 = -R2 + R0
+                inst(
+                    0x210,
+                    6,
+                    &[
+                        (24, 8, 2),
+                        (72, 1, 1),
+                        (32, 8, 0),
+                        (64, 8, 255),
+                        (81, 3, 1),
+                        (84, 3, 7),
+                    ],
+                ),
+                // IADD3.X R7 = ~R3 + R1 + P1
+                inst(
+                    0x210,
+                    7,
+                    &[
+                        (24, 8, 3),
+                        (72, 1, 1),
+                        (32, 8, 1),
+                        (64, 8, 255),
+                        (74, 1, 1),
+                        (87, 4, 1),
+                        (77, 4, 0xF),
+                    ],
+                ),
+                // LEA R8, P2 = (R0 << 4) + R9
+                inst(0x211, 8, &[(24, 8, 0), (32, 8, 9), (75, 5, 4), (81, 3, 2)]),
+                // LEA.HI.X R10 = (R1:R0 << 4 >> 32) + R3 + P2
+                inst(
+                    0x211,
+                    10,
+                    &[
+                        (24, 8, 0),
+                        (32, 8, 3),
+                        (64, 8, 1),
+                        (75, 5, 4),
+                        (80, 1, 1),
+                        (74, 1, 1),
+                        (81, 3, 7),
+                        (87, 4, 2),
+                    ],
+                ),
+                exit(),
+            ],
+            &[(0, 0xFFFF_FFFF), (1, 1), (2, 1), (3, 2), (9, 0x20)],
+            &mut Io::default(),
+        );
+        assert_eq!((r[4], r[5]), (0, 4));
+        assert_eq!((r[6], r[7]), (0xFFFF_FFFE, 0xFFFF_FFFF));
+        assert_eq!((r[8], r[10]), (0x10, 0x22));
     }
 
     #[test]

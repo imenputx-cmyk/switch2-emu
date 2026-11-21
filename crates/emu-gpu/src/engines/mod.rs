@@ -16,18 +16,34 @@ pub struct EngineCtx<'a> {
     pub syncpoints: &'a mut Vec<u32>,
     pub faults: &'a mut Vec<String>,
     pub backend: &'a mut dyn Backend,
+    /// MME64 macros (Ampere classes), shared by every channel.
+    pub mme: &'a mut super::engines::mme64::Shared,
 }
 
 impl EngineCtx<'_> {
+    /// Writes guest memory; a fault is recorded with the calling engine
+    /// source line (the fault kind is the message up to the colon).
+    #[track_caller]
     pub fn write(&mut self, va: u64, data: &[u8]) {
         if let Err(f) = self.guest.write(va, data) {
-            self.faults.push(format!("write at {va:#x}: {f:?}"));
+            let at = std::panic::Location::caller();
+            self.faults.push(format!(
+                "write at {va:#x} from {}:{}: {f:?}",
+                at.file().rsplit(['/', '\\']).next().unwrap_or(""),
+                at.line()
+            ));
         }
     }
 
+    #[track_caller]
     pub fn read(&mut self, va: u64, buf: &mut [u8]) {
         if let Err(f) = self.guest.read(va, buf) {
-            self.faults.push(format!("read at {va:#x}: {f:?}"));
+            let at = std::panic::Location::caller();
+            self.faults.push(format!(
+                "read at {va:#x} from {}:{}: {f:?}",
+                at.file().rsplit(['/', '\\']).next().unwrap_or(""),
+                at.line()
+            ));
         }
     }
 

@@ -568,12 +568,57 @@ impl Machine<'_> {
                 neg_b,
                 c,
                 neg_c,
+                x,
+                cin,
+                co,
             } => {
-                let n = |v: u32, on: bool| if on { v.wrapping_neg() } else { v };
-                let v = n(self.regs.get(a), neg_a)
-                    .wrapping_add(n(self.operand(b), neg_b))
-                    .wrapping_add(n(self.operand(c), neg_c));
-                self.regs.set(dst, v);
+                // Negation is ~v + 1; in .X mode the +1 is the carry-in.
+                let mut sum = 0u64;
+                for (v, neg) in [
+                    (self.regs.get(a), neg_a),
+                    (self.operand(b), neg_b),
+                    (self.operand(c), neg_c),
+                ] {
+                    sum += u64::from(if neg { !v } else { v });
+                    if neg && !x {
+                        sum += 1;
+                    }
+                }
+                if x {
+                    sum += cin.iter().filter(|&&p| self.pred(p)).count() as u64;
+                }
+                self.regs.set(dst, sum as u32);
+                self.set_pred(co[0], sum >> 32 & 1 != 0);
+                self.set_pred(co[1], sum >> 33 & 1 != 0);
+            }
+            Op::Lea {
+                dst,
+                a,
+                neg_a,
+                b,
+                c,
+                shift,
+                hi,
+                x,
+                cin,
+                co,
+            } => {
+                let pair = u64::from(self.regs.get(a)) | u64::from(self.regs.get(c)) << 32;
+                let shifted = if hi {
+                    (pair << shift >> 32) as u32
+                } else {
+                    self.regs.get(a) << shift
+                };
+                let mut sum = u64::from(if neg_a { !shifted } else { shifted });
+                if neg_a && !x {
+                    sum += 1;
+                }
+                sum += u64::from(self.operand(b));
+                if x && self.pred(cin) {
+                    sum += 1;
+                }
+                self.regs.set(dst, sum as u32);
+                self.set_pred(co, sum >> 32 & 1 != 0);
             }
             Op::Lop3 {
                 dst,

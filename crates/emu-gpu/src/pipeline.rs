@@ -16,6 +16,10 @@ pub enum DepthFormat {
     Z16Unorm,
     /// Stencil in the low byte, depth in the upper 24 bits.
     S8Z24Unorm,
+    /// Depth in the low 24 bits, stencil in the top byte (format 0x16).
+    Z24S8Unorm,
+    /// 32-bit float depth followed by a 32-bit word with stencil (0x19).
+    Z32FloatX24S8,
 }
 
 impl DepthFormat {
@@ -23,7 +27,9 @@ impl DepthFormat {
         Some(match v {
             0x0A => DepthFormat::Z32Float,
             0x13 => DepthFormat::Z16Unorm,
-            0x14 => DepthFormat::S8Z24Unorm,
+            0x14 | 0x15 => DepthFormat::S8Z24Unorm,
+            0x16 => DepthFormat::Z24S8Unorm,
+            0x19 => DepthFormat::Z32FloatX24S8,
             _ => return None,
         })
     }
@@ -31,14 +37,20 @@ impl DepthFormat {
     pub fn bytes_per_pixel(self) -> u32 {
         match self {
             DepthFormat::Z16Unorm => 2,
+            DepthFormat::Z32FloatX24S8 => 8,
             _ => 4,
         }
     }
 
     pub fn decode(self, p: &[u8]) -> f32 {
         match self {
-            DepthFormat::Z32Float => f32::from_le_bytes(p[..4].try_into().unwrap()),
+            DepthFormat::Z32Float | DepthFormat::Z32FloatX24S8 => {
+                f32::from_le_bytes(p[..4].try_into().unwrap())
+            }
             DepthFormat::Z16Unorm => f32::from(u16::from_le_bytes([p[0], p[1]])) / 65535.0,
+            DepthFormat::Z24S8Unorm => {
+                (u32::from_le_bytes(p[..4].try_into().unwrap()) & 0xFF_FFFF) as f32 / 16_777_215.0
+            }
             DepthFormat::S8Z24Unorm => {
                 (u32::from_le_bytes(p[..4].try_into().unwrap()) >> 8) as f32 / 16_777_215.0
             }
@@ -49,7 +61,14 @@ impl DepthFormat {
     pub fn encode(self, z: f32, p: &mut [u8]) {
         let z = z.clamp(0.0, 1.0);
         match self {
-            DepthFormat::Z32Float => p[..4].copy_from_slice(&z.to_le_bytes()),
+            DepthFormat::Z32Float | DepthFormat::Z32FloatX24S8 => {
+                p[..4].copy_from_slice(&z.to_le_bytes())
+            }
+            DepthFormat::Z24S8Unorm => {
+                let d = (z * 16_777_215.0).round() as u32;
+                let v = d | u32::from(p[3]) << 24;
+                p[..4].copy_from_slice(&v.to_le_bytes());
+            }
             DepthFormat::Z16Unorm => {
                 p[..2].copy_from_slice(&((z * 65535.0).round() as u16).to_le_bytes())
             }

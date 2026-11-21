@@ -109,7 +109,10 @@ impl Scheduler {
                             return "unmapped QMD".into();
                         };
                         if q[18] & 0xFF != 0x30 || q[4] & 0x100 != 0 {
-                            return "unsupported QMD version or queue".into();
+                            return format!(
+                                "unsupported QMD version or queue (QMD {address:#x}: version word {:#x}, word 4 {:#x})",
+                                q[18], q[4]
+                            );
                         }
                         state.dependencies = ((q[4] >> 14) & 0xFFFF) as i32 + state.deferred;
                         state.deferred = 0;

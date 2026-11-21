@@ -37,13 +37,12 @@ pub const MAX_INVOCATIONS: u64 = 1 << 21;
 pub struct Compute {
     regs: Vec<u32>,
     inline: InlineToMemory,
-    mme64_code: Vec<u32>,
-    mme64_write: usize,
-    starts: Vec<u32>,
     data_ram: Vec<u32>,
     pending_call: Option<(usize, Vec<u32>)>,
     scheduler: Scheduler,
     programs: HashMap<u64, Vec<Inst>>,
+    /// Failed programs: first bytes (to retry on change) and the error.
+    failed_programs: HashMap<u64, ([u8; 256], String)>,
     /// Grids run, and grids skipped (too large or failed to decode).
     pub dispatches: u64,
     pub skipped: u64,
@@ -54,13 +53,11 @@ impl Default for Compute {
         Compute {
             regs: vec![0; REGS],
             inline: InlineToMemory::default(),
-            mme64_code: vec![0; 0x8000],
-            mme64_write: 0,
-            starts: vec![0; 0x100],
             data_ram: vec![0; 0xC00],
             pending_call: None,
             scheduler: Scheduler::default(),
             programs: HashMap::new(),
+            failed_programs: HashMap::new(),
             dispatches: 0,
             skipped: 0,
         }
@@ -108,12 +105,12 @@ impl Compute {
         }
         if last {
             if let Some((index, mut params)) = self.pending_call.take() {
-                let Some(&start) = self.starts.get(index) else {
+                let Some(&start) = ctx.mme.starts.get(index) else {
                     ctx.faults
                         .push(format!("compute macro {index} out of range"));
                     return true;
                 };
-                let code = std::mem::take(&mut self.mme64_code);
+                let code = std::mem::take(&mut ctx.mme.code);
                 let mut target = Target { engine: self, ctx };
                 let result = mme64::execute(&code, start, &mut params, &mut target);
                 let Target { ctx, .. } = target;
@@ -123,7 +120,7 @@ impl Compute {
                         e.message, e.pc
                     ));
                 }
-                self.mme64_code = code;
+                ctx.mme.code = code;
             }
         }
         true
@@ -138,22 +135,10 @@ impl Compute {
             *r = value;
         }
         match offset {
-            reg::MME_INSTRUCTION_RAM_POINTER => {
-                self.mme64_write = (value as usize * 3).min(self.mme64_code.len());
-            }
-            reg::MME_INSTRUCTION_RAM => {
-                if let Some(slot) = self.mme64_code.get_mut(self.mme64_write) {
-                    *slot = value;
-                    self.mme64_write += 1;
-                }
-            }
-            reg::MME_START_ADDRESS_RAM => {
-                let p = self.reg(reg::MME_START_ADDRESS_RAM_POINTER);
-                if let Some(slot) = self.starts.get_mut(p as usize) {
-                    *slot = value;
-                }
-                self.regs[reg::MME_START_ADDRESS_RAM_POINTER as usize / 4] = p.wrapping_add(1);
-            }
+            reg::MME_INSTRUCTION_RAM_POINTER => ctx.mme.set_pointer(value),
+            reg::MME_INSTRUCTION_RAM => ctx.mme.upload(value),
+            reg::MME_START_ADDRESS_RAM_POINTER => ctx.mme.set_start_pointer(value),
+            reg::MME_START_ADDRESS_RAM => ctx.mme.bind(value),
             reg::SEND_PCAS_B | reg::SEND_SIGNALING_PCAS_B | reg::SEND_SIGNALING_PCAS2_B => {
                 let action = value & 15;
                 let skip = offset == reg::SEND_PCAS_B
@@ -186,18 +171,36 @@ impl Compute {
         if let Some(p) = self.programs.get(&address) {
             return Ok(p.clone());
         }
+        let mut head = [0u8; 256];
+        let _ = g.read_prefix(address, &mut head);
+        if let Some((h, e)) = self.failed_programs.get(&address) {
+            if *h == head {
+                return Err(e.clone());
+            }
+        }
+        let r = self.decode_program_at(address, g);
+        if let Err(e) = &r {
+            self.failed_programs.insert(address, (head, e.clone()));
+        }
+        r
+    }
+
+    fn decode_program_at(&mut self, address: u64, g: &GuestMemory) -> Result<Vec<Inst>, String> {
         let mut len = 0x400usize;
         loop {
             let mut code = vec![0u8; len];
-            g.read(address, &mut code)
+            let got = g
+                .read_prefix(address, &mut code)
                 .map_err(|f| format!("compute program at {address:#x}: {f:?}"))?;
-            let insts = crate::shader::sm86::decode_program(&code)
-                .map_err(|e| format!("compute program at {address:#x}: {e:x?}"))?;
+            let insts = match crate::shader::sm86::decode_program(&code) {
+                Err(crate::shader::decode::DecodeError::Truncated) if got == len => Vec::new(),
+                r => r.map_err(|e| format!("compute program at {address:#x}: {e:x?}"))?,
+            };
             if is_complete(&insts) {
                 self.programs.insert(address, insts.clone());
                 return Ok(insts);
             }
-            if len >= 1 << 20 {
+            if len >= 1 << 20 || got < len {
                 return Err(format!("compute program at {address:#x}: no EXIT"));
             }
             len *= 4;

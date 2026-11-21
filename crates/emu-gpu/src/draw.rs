@@ -654,7 +654,7 @@ fn rasterize(
                 let mut cur = vec![0u8; bpp as usize];
                 g.read(at, &mut cur)
                     .map_err(|f| format!("blend read: {f:?}"))?;
-                let unorm = target.format != crate::surface::ColorFormat::Rgba32Float;
+                let unorm = !target.format.is_float();
                 color = d
                     .blend
                     .apply(color, target.format.decode(&cur), d.blend_constant, unorm);

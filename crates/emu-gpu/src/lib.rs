@@ -151,6 +151,8 @@ pub struct Gpu {
     pub trace: bool,
     /// Carries out rendering work (software by default).
     pub backend: Box<dyn backend::Backend>,
+    /// MME64 macro code and starts, shared by all channels and classes.
+    pub mme: engines::mme64::Shared,
     /// Switch 2 mappings made through the graphics server, which apply to
     /// every address space (also ones created later), in order:
     /// (GPU address, guest address or None to unmap, size).
@@ -168,6 +170,7 @@ impl Default for Gpu {
             trace: false,
             backend: Box::new(backend::SoftwareBackend),
             shared_maps: Vec::new(),
+            mme: Default::default(),
         }
     }
 }
@@ -475,6 +478,7 @@ impl Gpu {
             faults,
             trace,
             backend,
+            mme,
             ..
         } = self;
         let mut ctx = EngineCtx {
@@ -486,6 +490,7 @@ impl Gpu {
             syncpoints,
             faults,
             backend: backend.as_mut(),
+            mme,
         };
         let mut from_macros = Vec::new();
         // NVN2 writes inline-to-memory methods on subchannel 2 without

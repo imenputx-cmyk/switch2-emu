@@ -696,6 +696,46 @@ impl Translator {
         self.select(uint, big, self.c.zero_u, shifted)
     }
 
+    /// Adds 32-bit `terms` and boolean `ones`, returning the low word and
+    /// the number of carries out of bit 31 (a uint, 0..=len-1).
+    fn add_chain(&mut self, terms: &[u32], ones: &[u32]) -> (u32, u32) {
+        let uint = self.c.uint;
+        let one = self.constant_u(1);
+        let mut sum = self.c.zero_u;
+        let mut carries = self.c.zero_u;
+        let addends: Vec<u32> = terms
+            .iter()
+            .copied()
+            .chain(
+                ones.iter()
+                    .map(|&b| self.select(uint, b, one, self.c.zero_u))
+                    .collect::<Vec<_>>(),
+            )
+            .collect();
+        for v in addends {
+            let next = self.op2(op::I_ADD, uint, sum, v);
+            let wrapped = self.op2(op::U_LESS_THAN, self.c.bool_t, next, sum);
+            let c = self.select(uint, wrapped, one, self.c.zero_u);
+            carries = self.op2(op::I_ADD, uint, carries, c);
+            sum = next;
+        }
+        (sum, carries)
+    }
+
+    /// Writes bits 0 and 1 of the carry count to two predicates.
+    fn store_carries(&mut self, co: [u8; 2], carries: u32) {
+        let uint = self.c.uint;
+        for (k, &p) in co.iter().enumerate() {
+            if p == 7 {
+                continue;
+            }
+            let bit = self.constant_u(1 << k);
+            let m = self.op2(op::BITWISE_AND, uint, carries, bit);
+            let v = self.op2(op::I_NOT_EQUAL, self.c.bool_t, m, self.c.zero_u);
+            self.store_pred(p, v);
+        }
+    }
+
     fn negate_int(&mut self, v: u32, on: bool) -> u32 {
         if on {
             self.op1(op::S_NEGATE, self.c.uint, v)
@@ -1210,7 +1250,11 @@ impl Translator {
                 neg_b,
                 c,
                 neg_c,
-            } => {
+                x: ext,
+                cin,
+                co,
+            } if !ext && co == [7, 7] => {
+                let _ = cin;
                 let x = self.load_reg(a);
                 let x = self.negate_int(x, neg_a);
                 let y = self.operand_uint(b)?;
@@ -1220,6 +1264,80 @@ impl Translator {
                 let r = self.op2(op::I_ADD, uint, x, y);
                 let r = self.op2(op::I_ADD, uint, r, z);
                 self.store_reg(dst, r);
+            }
+            Op::Iadd3 {
+                dst,
+                a,
+                neg_a,
+                b,
+                neg_b,
+                c,
+                neg_c,
+                x: ext,
+                cin,
+                co,
+            } => {
+                let mut terms = vec![];
+                let mut ones = vec![];
+                let va = self.load_reg(a);
+                let vb = self.operand_uint(b)?;
+                let vc = self.operand_uint(c)?;
+                for (v, neg) in [(va, neg_a), (vb, neg_b), (vc, neg_c)] {
+                    if neg {
+                        terms.push(self.op1(op::NOT, uint, v));
+                        if !ext {
+                            ones.push(self.c.true_c);
+                        }
+                    } else {
+                        terms.push(v);
+                    }
+                }
+                if ext {
+                    for p in cin {
+                        ones.push(self.load_pred(p));
+                    }
+                }
+                let (sum, carries) = self.add_chain(&terms, &ones);
+                self.store_reg(dst, sum);
+                self.store_carries(co, carries);
+            }
+            Op::Lea {
+                dst,
+                a,
+                neg_a,
+                b,
+                c,
+                shift,
+                hi,
+                x: ext,
+                cin,
+                co,
+            } => {
+                let va = self.load_reg(a);
+                let s = self.constant_u(shift);
+                let mut shifted = self.op2(op::SHIFT_LEFT_LOGICAL, uint, va, s);
+                if hi {
+                    // (c << shift) | (a >> (32 - shift)); shift 0 gives c.
+                    let vc = self.load_reg(c);
+                    let lo = self.constant_u(32 - shift);
+                    let top = self.safe_shift(op::SHIFT_RIGHT_LOGICAL, va, lo);
+                    shifted = self.op2(op::SHIFT_LEFT_LOGICAL, uint, vc, s);
+                    shifted = self.op2(op::BITWISE_OR, uint, shifted, top);
+                }
+                let mut ones = vec![];
+                if neg_a {
+                    shifted = self.op1(op::NOT, uint, shifted);
+                    if !ext {
+                        ones.push(self.c.true_c);
+                    }
+                }
+                if ext {
+                    ones.push(self.load_pred(cin));
+                }
+                let vb = self.operand_uint(b)?;
+                let (sum, carries) = self.add_chain(&[shifted, vb], &ones);
+                self.store_reg(dst, sum);
+                self.store_carries([co, 7], carries);
             }
             Op::Lop3 {
                 dst,
@@ -2518,6 +2636,38 @@ mod tests {
             ),
             inst(0x919, 4, &[(72, 8, 56)]),
             inst(0x806, 10, &[(81, 3, 1), (87, 4, 7)]),
+            inst(
+                0x210,
+                5,
+                &[(24, 8, 1), (32, 8, 3), (64, 8, 255), (81, 3, 2), (84, 3, 3)],
+            ),
+            inst(
+                0x210,
+                6,
+                &[
+                    (24, 8, 1),
+                    (72, 1, 1),
+                    (32, 8, 3),
+                    (64, 8, 255),
+                    (74, 1, 1),
+                    (87, 4, 2),
+                    (77, 4, 0xF),
+                ],
+            ),
+            inst(
+                0x211,
+                7,
+                &[
+                    (24, 8, 0),
+                    (32, 8, 3),
+                    (64, 8, 1),
+                    (75, 5, 4),
+                    (80, 1, 1),
+                    (74, 1, 1),
+                    (81, 3, 4),
+                    (87, 4, 3),
+                ],
+            ),
             inst(
                 0x81C,
                 0,

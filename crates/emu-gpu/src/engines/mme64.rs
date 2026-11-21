@@ -34,6 +34,55 @@ pub trait Mme64Target {
     fn data_ram(&mut self) -> &mut [u32];
 }
 
+/// The macro code and start addresses, shared by a process's channels
+/// and by its 3D and compute classes (NVN2 uploads macros through one and
+/// calls them through the other; Lichii NX2_NOTES row 53).
+pub struct Shared {
+    pub code: Vec<u32>,
+    pub write: usize,
+    pub starts: Vec<u32>,
+    pub start_pointer: usize,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Shared {
+            code: vec![0; 0x8000],
+            write: 0,
+            starts: vec![0; 0x100],
+            start_pointer: 0,
+        }
+    }
+}
+
+impl Shared {
+    /// MME_INSTRUCTION_RAM_POINTER (instructions).
+    pub fn set_pointer(&mut self, value: u32) {
+        self.write = (value as usize * 3).min(self.code.len());
+    }
+
+    /// MME_INSTRUCTION_RAM: the next code word.
+    pub fn upload(&mut self, value: u32) {
+        if let Some(slot) = self.code.get_mut(self.write) {
+            *slot = value;
+            self.write += 1;
+        }
+    }
+
+    /// MME_START_ADDRESS_RAM_POINTER.
+    pub fn set_start_pointer(&mut self, value: u32) {
+        self.start_pointer = value as usize;
+    }
+
+    /// MME_START_ADDRESS_RAM: the next macro's start.
+    pub fn bind(&mut self, value: u32) {
+        if let Some(slot) = self.starts.get_mut(self.start_pointer) {
+            *slot = value;
+        }
+        self.start_pointer += 1;
+    }
+}
+
 /// Instructions a call may run before it is stopped.
 const STEP_LIMIT: u32 = 1 << 20;
 
@@ -373,7 +422,13 @@ pub fn execute(
     let from = start as usize * 3;
     let to = (pc as usize * 3 + 24).min(code.len());
     for (i, w) in code.get(from..to).unwrap_or(&[]).chunks(3).enumerate() {
-        detail += &format!("\n    {:#x}: {:08x} {:08x} {:08x}", start as usize + i, w[0], w.get(1).unwrap_or(&0), w.get(2).unwrap_or(&0));
+        detail += &format!(
+            "\n    {:#x}: {:08x} {:08x} {:08x}",
+            start as usize + i,
+            w[0],
+            w.get(1).unwrap_or(&0),
+            w.get(2).unwrap_or(&0)
+        );
     }
     Err(Mme64Error {
         pc,

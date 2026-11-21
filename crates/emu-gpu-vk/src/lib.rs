@@ -25,6 +25,23 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::hash::{Hash, Hasher};
 
+/// A fast non-cryptographic hash (FxHash-style) of surface contents.
+fn content_hash(data: &[u8]) -> u64 {
+    let mut h = data.len() as u64;
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let w = u64::from_le_bytes(c.try_into().unwrap());
+        h = (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    for &b in chunks.remainder() {
+        h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    h
+}
+
+/// Idle images kept at most (each holds device and staging memory).
+const MAX_IDLE_IMAGES: usize = 64;
+
 fn vk_format(f: ColorFormat) -> vk::Format {
     match f {
         ColorFormat::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
@@ -34,6 +51,17 @@ fn vk_format(f: ColorFormat) -> vk::Format {
         ColorFormat::Rgba8Unorm | ColorFormat::Rgbx8Unorm => vk::Format::R8G8B8A8_UNORM,
         ColorFormat::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
         ColorFormat::B5G6R5Unorm => vk::Format::R5G6B5_UNORM_PACK16,
+        ColorFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        ColorFormat::Rg16Float => vk::Format::R16G16_SFLOAT,
+        ColorFormat::R16Float => vk::Format::R16_SFLOAT,
+        ColorFormat::Rg32Float => vk::Format::R32G32_SFLOAT,
+        ColorFormat::R32Float => vk::Format::R32_SFLOAT,
+        ColorFormat::R32Uint => vk::Format::R32_UINT,
+        ColorFormat::R11G11B10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
+        ColorFormat::Rg16Unorm => vk::Format::R16G16_UNORM,
+        ColorFormat::R16Unorm => vk::Format::R16_UNORM,
+        ColorFormat::Rg8Unorm => vk::Format::R8G8_UNORM,
+        ColorFormat::R8Unorm => vk::Format::R8_UNORM,
     }
 }
 
@@ -42,7 +70,7 @@ fn depth_format(f: DepthFormat) -> Option<vk::Format> {
         DepthFormat::Z32Float => Some(vk::Format::D32_SFLOAT),
         DepthFormat::Z16Unorm => Some(vk::Format::D16_UNORM),
         // The packed stencil/depth layout differs from Vulkan's copies.
-        DepthFormat::S8Z24Unorm => None,
+        DepthFormat::S8Z24Unorm | DepthFormat::Z24S8Unorm | DepthFormat::Z32FloatX24S8 => None,
     }
 }
 
@@ -152,6 +180,11 @@ pub struct VulkanBackend {
     recording: bool,
     images: HashMap<(usize, Surface), Image>,
     depth_images: HashMap<(usize, DepthSurface), Image>,
+    /// Images kept after a flush (in TRANSFER_SRC_OPTIMAL) with a hash
+    /// of what was written back: reused without an upload while guest
+    /// memory still matches.
+    idle_images: HashMap<(usize, Surface), (Image, u64)>,
+    idle_depth: HashMap<(usize, DepthSurface), (Image, u64)>,
     /// Is depth clamping available (and enabled)?
     depth_clamp: bool,
     software: SoftwareBackend,
@@ -297,6 +330,8 @@ impl VulkanBackend {
             recording: false,
             images: HashMap::new(),
             depth_images: HashMap::new(),
+            idle_images: HashMap::new(),
+            idle_depth: HashMap::new(),
             depth_clamp,
             software: SoftwareBackend,
             layouts: HashMap::new(),
@@ -446,6 +481,42 @@ impl VulkanBackend {
         if let Some(img) = self.images.get(&(g.asid, *s)) {
             return Ok(img.view);
         }
+        if let Some((img, hash)) = self.idle_images.remove(&(g.asid, *s)) {
+            let linear = s
+                .read_linear(g)
+                .map_err(|f| format!("reading surface: {f:?}"))?;
+            self.begin()?;
+            if content_hash(&linear) == hash {
+                self.barrier(
+                    img.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                );
+            } else {
+                let n = linear.len().min(img.staging.size);
+                std::ptr::copy_nonoverlapping(linear.as_ptr(), img.staging.ptr, n);
+                self.barrier(
+                    img.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+                self.device.cmd_copy_buffer_to_image(
+                    self.cmd,
+                    img.staging.buffer,
+                    img.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[self.copy_region(s)],
+                );
+                self.barrier(
+                    img.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                );
+            }
+            let view = img.view;
+            self.images.insert((g.asid, *s), img);
+            return Ok(view);
+        }
         let format = vk_format(s.format);
         let image = self
             .device
@@ -546,6 +617,43 @@ impl VulkanBackend {
     ) -> Result<vk::ImageView, String> {
         if let Some(img) = self.depth_images.get(&(g.asid, *s)) {
             return Ok(img.view);
+        }
+        if let Some((img, hash)) = self.idle_depth.remove(&(g.asid, *s)) {
+            let linear = s.read_linear(g)?;
+            self.begin()?;
+            if content_hash(&linear) == hash {
+                self.barrier_aspect(
+                    img.image,
+                    vk::ImageAspectFlags::DEPTH,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                );
+            } else {
+                let n = linear.len().min(img.staging.size);
+                std::ptr::copy_nonoverlapping(linear.as_ptr(), img.staging.ptr, n);
+                self.barrier_aspect(
+                    img.image,
+                    vk::ImageAspectFlags::DEPTH,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+                self.device.cmd_copy_buffer_to_image(
+                    self.cmd,
+                    img.staging.buffer,
+                    img.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[depth_copy_region(s)],
+                );
+                self.barrier_aspect(
+                    img.image,
+                    vk::ImageAspectFlags::DEPTH,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                );
+            }
+            let view = img.view;
+            self.depth_images.insert((g.asid, *s), img);
+            return Ok(view);
         }
         let format = depth_format(s.format).ok_or("depth format")?;
         let image = self
@@ -741,23 +849,50 @@ impl VulkanBackend {
             let img = self.images.remove(&key).unwrap();
             let data = std::slice::from_raw_parts(img.staging.ptr, img.staging.size);
             if key.0 == g.asid {
-                if let Err(f) = key.1.write_linear(g, data) {
+                // Read the staging memory once; hash what guest memory
+                // now holds.
+                let data = data.to_vec();
+                if let Err(f) = key.1.write_linear(g, &data) {
                     result = Err(format!("writing surface back: {f:?}"));
+                    self.destroy_image(img);
+                } else {
+                    self.idle_images.insert(key, (img, content_hash(&data)));
                 }
+            } else {
+                self.destroy_image(img);
             }
-            self.destroy_image(img);
         }
         for key in depth_keys {
             let img = self.depth_images.remove(&key).unwrap();
             let data = std::slice::from_raw_parts(img.staging.ptr, img.staging.size);
             if key.0 == g.asid {
-                if let Err(e) = key.1.write_linear(g, data) {
+                let data = data.to_vec();
+                if let Err(e) = key.1.write_linear(g, &data) {
                     result = Err(format!("writing depth buffer back: {e}"));
+                    self.destroy_image(img);
+                } else {
+                    self.idle_depth.insert(key, (img, content_hash(&data)));
                 }
+            } else {
+                self.destroy_image(img);
             }
+        }
+        self.trim_idle();
+        result
+    }
+
+    /// Frees idle images beyond the cap.
+    unsafe fn trim_idle(&mut self) {
+        while self.idle_images.len() > MAX_IDLE_IMAGES {
+            let key = *self.idle_images.keys().next().unwrap();
+            let (img, _) = self.idle_images.remove(&key).unwrap();
             self.destroy_image(img);
         }
-        result
+        while self.idle_depth.len() > MAX_IDLE_IMAGES {
+            let key = *self.idle_depth.keys().next().unwrap();
+            let (img, _) = self.idle_depth.remove(&key).unwrap();
+            self.destroy_image(img);
+        }
     }
 }
 
@@ -1656,6 +1791,12 @@ impl Drop for VulkanBackend {
                 self.destroy_image(img);
             }
             for (_, img) in std::mem::take(&mut self.depth_images) {
+                self.destroy_image(img);
+            }
+            for (_, (img, _)) in std::mem::take(&mut self.idle_images) {
+                self.destroy_image(img);
+            }
+            for (_, (img, _)) in std::mem::take(&mut self.idle_depth) {
                 self.destroy_image(img);
             }
             for b in std::mem::take(&mut self.transient) {

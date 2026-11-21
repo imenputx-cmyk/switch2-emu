@@ -95,6 +95,9 @@ fn layout(format: u32) -> Option<&'static [u32]> {
         0x18 => &[8, 8],
         0x1B => &[16],
         0x1D => &[8],
+        // B10G11R11 float and E5B9G9R9 shared-exponent.
+        0x21 => &[11, 11, 10],
+        0x20 => &[9, 9, 9, 5],
         _ => return None,
     })
 }
@@ -297,6 +300,16 @@ fn srgb_to_linear(c: f32) -> f32 {
 
 /// Decodes one texel's components (R, G, B, A, missing ones 0).
 fn components(tic: &Tic, raw: &[u8]) -> [f32; 4] {
+    if tic.format == 0x20 {
+        let v = u32::from_le_bytes(raw[..4].try_into().unwrap());
+        let scale = 2f32.powi((v >> 27) as i32 - 15 - 9);
+        return [
+            (v & 0x1FF) as f32 * scale,
+            (v >> 9 & 0x1FF) as f32 * scale,
+            (v >> 18 & 0x1FF) as f32 * scale,
+            1.0,
+        ];
+    }
     let widths = layout(tic.format).unwrap();
     let mut out = [0f32; 4];
     let mut bit = 0u32;
@@ -331,6 +344,13 @@ fn components(tic: &Tic, raw: &[u8]) -> [f32; 4] {
             Kind::Float => match w {
                 32 => f32::from_bits(v),
                 16 => crate::draw::half_to_f32(v as u16),
+                // Unsigned small floats: 5 exponent bits, no sign.
+                11 | 10 => {
+                    let m = w - 5;
+                    crate::draw::half_to_f32(
+                        (((v >> m) << 10) | ((v & ((1 << m) - 1)) << (10 - m))) as u16,
+                    )
+                }
                 _ => 0.0,
             },
             // Integer textures return the integer bits.
@@ -831,6 +851,21 @@ mod tests {
         assert_eq!(s.border, [0.0, 0.0, 0.0, 1.0]);
         let t = Tic::parse(&build::rgba8_tic(0x1000, 16, 16, None, 2)).unwrap();
         assert_eq!((t.pitch, t.block_height_log2), (None, 2));
+    }
+
+    #[test]
+    fn packed_float_formats() {
+        let mut t = Tic::parse(&build::rgba8_tic(0, 4, 4, Some(64), 0)).unwrap();
+        t.format = 0x21;
+        t.kinds = [Kind::Float; 4];
+        // R = 1.0 (exp 15), G = 2.0 (exp 16), B = 0.5 (exp 14).
+        let v: u32 = (15 << 6) | (16 << 6) << 11 | (14 << 5) << 22;
+        assert_eq!(t.element(), (1, 1, 4));
+        assert_eq!(components(&t, &v.to_le_bytes())[..3], [1.0, 2.0, 0.5]);
+        t.format = 0x20;
+        // Shared exponent 15+9 = 24 → scale 1: R = 3.
+        let v: u32 = 3 | 24 << 27;
+        assert_eq!(components(&t, &v.to_le_bytes())[0], 3.0);
     }
 
     #[test]

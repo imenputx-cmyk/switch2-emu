@@ -32,6 +32,12 @@ pub const PT: Pred = Pred {
     neg: false,
 };
 
+/// !PT: always false (an absent carry-in).
+pub const PT_FALSE: Pred = Pred {
+    index: 7,
+    neg: true,
+};
+
 impl Pred {
     fn at(v: u64, lo: u32) -> Pred {
         Pred {
@@ -389,6 +395,26 @@ pub enum Op {
         neg_b: bool,
         c: Operand,
         neg_c: bool,
+        /// .X: add the carry-in predicates; negation is then a bitwise
+        /// NOT (the +1 comes from the carry).
+        x: bool,
+        cin: [Pred; 2],
+        /// Predicates receiving bits 32 and 33 of the full sum (PT: none).
+        co: [u8; 2],
+    },
+    /// LEA with carries or the high half: lo form `(a << shift) + b`,
+    /// .HI form `((c:a) << shift >> 32) + b`.
+    Lea {
+        dst: u8,
+        a: u8,
+        neg_a: bool,
+        b: Operand,
+        c: u8,
+        shift: u32,
+        hi: bool,
+        x: bool,
+        cin: Pred,
+        co: u8,
     },
     /// Three-input logic by truth table (LOP3.LUT): bit i of `lut` is the
     /// result for (a, b, c) = (i >> 2 & 1, i >> 1 & 1, i & 1). `pred`
@@ -823,6 +849,8 @@ pub enum DecodeError {
         opcode: u32,
         what: &'static str,
     },
+    /// The code ran out before the program's end: read more.
+    Truncated,
 }
 
 fn bits(v: u64, lo: u32, len: u32) -> u64 {

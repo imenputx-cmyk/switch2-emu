@@ -123,13 +123,13 @@ pub struct Maxwell3D {
     cbufs: [[Option<ConstBuffer>; CBUF_SLOTS]; 5],
     /// Decoded programs by GPU address.
     programs: std::collections::HashMap<u64, (Header, Vec<Inst>)>,
+    /// Programs that failed to decode, with their first bytes (to retry
+    /// once the memory changes) and the error.
+    failed_programs: std::collections::HashMap<u64, ([u8; 256], String)>,
     /// Draws executed (for diagnostics and tests).
     pub draws: u64,
     /// Bound as the Ampere 3D class: macros are MME64 code.
     ampere: bool,
-    /// MME64 code (three words per instruction) and the upload position.
-    pub mme64_code: Vec<u32>,
-    mme64_write: usize,
     /// MME64 data RAM.
     pub data_ram: Vec<u32>,
     /// NVN2 root tables (8 x 64 words), loaded through methods 0x504
@@ -210,10 +210,9 @@ impl Default for Maxwell3D {
             index_ranges: Vec::new(),
             cbufs: [[None; CBUF_SLOTS]; 5],
             programs: Default::default(),
+            failed_programs: Default::default(),
             draws: 0,
             ampere: false,
-            mme64_code: Vec::new(),
-            mme64_write: 0,
             data_ram: Vec::new(),
             root_tables: [[0; 64]; 8],
             root_select: (0, 0),
@@ -228,7 +227,6 @@ impl Maxwell3D {
     pub fn ampere() -> Self {
         Maxwell3D {
             ampere: true,
-            mme64_code: vec![0; 0x8000],
             data_ram: vec![0; 0xC00],
             ..Self::default()
         }
@@ -303,11 +301,11 @@ impl Maxwell3D {
         ctx: &mut EngineCtx,
         unhandled: &mut Vec<(u32, u32)>,
     ) {
-        let Some(&start) = self.mme_starts.get(index) else {
+        let Some(&start) = ctx.mme.starts.get(index) else {
             ctx.faults.push(format!("macro {index} out of range"));
             return;
         };
-        let code = std::mem::take(&mut self.mme64_code);
+        let code = std::mem::take(&mut ctx.mme.code);
         let mut target = Target64 {
             engine: self,
             ctx,
@@ -330,7 +328,7 @@ impl Maxwell3D {
                 e.message, e.pc
             ));
         }
-        self.mme64_code = code;
+        ctx.mme.code = code;
         self.macro_calls += 1;
     }
 
@@ -387,14 +385,19 @@ impl Maxwell3D {
         if self.ampere {
             match offset {
                 reg::MME_INSTRUCTION_RAM_POINTER => {
-                    self.mme64_write = (value as usize * 3).min(self.mme64_code.len());
+                    ctx.mme.set_pointer(value);
                     return true;
                 }
                 reg::MME_INSTRUCTION_RAM => {
-                    if let Some(slot) = self.mme64_code.get_mut(self.mme64_write) {
-                        *slot = value;
-                        self.mme64_write += 1;
-                    }
+                    ctx.mme.upload(value);
+                    return true;
+                }
+                reg::MME_START_ADDRESS_RAM_POINTER => {
+                    ctx.mme.set_start_pointer(value);
+                    return true;
+                }
+                reg::MME_START_ADDRESS_RAM => {
+                    ctx.mme.bind(value);
                     return true;
                 }
                 reg::MME_MEM_ADDRESS_A | reg::MME_MEM_ADDRESS_B | reg::MME_DATA_RAM_ADDRESS => {
@@ -518,26 +521,49 @@ impl Maxwell3D {
         if let Some(p) = self.programs.get(&addr) {
             return Ok(p.clone());
         }
+        let mut head = [0u8; 256];
+        let _ = ctx.guest.read_prefix(addr, &mut head);
+        if let Some((h, e)) = self.failed_programs.get(&addr) {
+            if *h == head {
+                return Err(e.clone());
+            }
+        }
+        let r = self.decode_program_at(addr, ctx);
+        if let Err(e) = &r {
+            self.failed_programs.insert(addr, (head, e.clone()));
+        }
+        r
+    }
+
+    fn decode_program_at(
+        &mut self,
+        addr: u64,
+        ctx: &mut EngineCtx,
+    ) -> Result<(Header, Vec<Inst>), String> {
         // Read in growing chunks until the program's EXIT is decoded.
         let mut len = 0x400usize;
         loop {
             let mut code = vec![0u8; len];
-            ctx.guest
-                .read(addr, &mut code)
+            let got = ctx
+                .guest
+                .read_prefix(addr, &mut code)
                 .map_err(|f| format!("shader at {addr:#x}: {f:?}"))?;
             // Switch 2 programs are SM86 code after a 0x80-byte header.
             let insts = if self.ampere {
                 crate::shader::sm86::decode_program(&code[crate::shader::sm86::HEADER_SIZE..])
             } else {
                 decode_program(&code[HEADER_SIZE..])
-            }
-            .map_err(|e| format!("shader at {addr:#x}: {e:x?}"))?;
+            };
+            let insts = match insts {
+                Err(crate::shader::decode::DecodeError::Truncated) if got == len => Vec::new(),
+                r => r.map_err(|e| format!("shader at {addr:#x}: {e:x?}"))?,
+            };
             if is_complete(&insts) {
                 let p = (Header::parse(&code[..HEADER_SIZE]), insts);
                 self.programs.insert(addr, p.clone());
                 return Ok(p);
             }
-            if len >= 1 << 20 {
+            if len >= 1 << 20 || got < len {
                 return Err(format!("shader at {addr:#x}: no EXIT"));
             }
             len *= 4;
