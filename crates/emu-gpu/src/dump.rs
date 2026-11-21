@@ -122,6 +122,19 @@ impl Gpu {
                 mme64::disassemble(&self.mme.code, pc as u32)
             );
         }
+        if let Some(c) = &self.mme.compute {
+            s += "\n## Compute macro RAM (own RAM after compute uploaded code)\n";
+            for (i, &st) in c.starts.iter().enumerate() {
+                if st != 0 || i == 0 {
+                    let _ = writeln!(s, "start[{i}] = {st:#x}");
+                }
+            }
+            for pc in 0..c.code.len() / 3 {
+                if c.code[pc * 3..pc * 3 + 3].iter().any(|&x| x != 0) {
+                    let _ = writeln!(s, "{pc:#06x}: {}", mme64::disassemble(&c.code, pc as u32));
+                }
+            }
+        }
         s += "\n## Recent macro calls (index, start, parameters; index | 0x1000 = compute)\n";
         for (i, st, p) in &self.mme.calls {
             let _ = writeln!(s, "macro {i:#x} at {st:#x}: {p:x?}");

@@ -941,6 +941,55 @@ mod tests {
     }
 
     #[test]
+    fn compute_macro_upload_keeps_the_3d_macros() {
+        use engines::mme64::asm::{inst, Lane, LOAD0, NOP, ZERO};
+        let (mut gpu, mut mem) = setup();
+        let mut first = inst(
+            false,
+            0,
+            0,
+            [
+                Lane {
+                    op: 0,
+                    dst: 0,
+                    src_a: LOAD0,
+                    src_b: LOAD0 + 1,
+                    imm: 0,
+                    out_method: 6,
+                    out_emit: 1,
+                },
+                Lane {
+                    imm: 0x0d80 / 4,
+                    ..NOP
+                },
+            ],
+        );
+        first[2] |= 1;
+        let second = inst(false, 0, 0, [NOP, Lane { dst: ZERO, ..NOP }]);
+        let mut words = vec![incr(0, 0, 1), class::AMPERE_THREED];
+        words.extend([incr(0, 0x114, 1), 0, (3 << 29) | (6 << 16) | (0x118 / 4)]);
+        words.extend(first);
+        words.extend(second);
+        words.extend([incr(0, 0x11C, 2), 0, 0]);
+        // Compute uploads its own code at the same instruction address.
+        words.extend([incr(1, 0, 1), class::AMPERE_COMPUTE]);
+        words.extend([
+            incr(1, 0x114, 1),
+            0,
+            incr(1, 0x118, 3),
+            0xdead_beef,
+            0xdead_beef,
+            0xdead_beef,
+        ]);
+        words.extend([incr(0, 0x3800, 2), 40, 2]);
+        run(&mut gpu, &mut mem, &words);
+        let Some(Engine::ThreeD(e)) = &gpu.channels[0].subchannels[0] else {
+            panic!()
+        };
+        assert_eq!(e.reg(0x0d80), 42);
+    }
+
+    #[test]
     fn failing_macro_writes_a_dump() {
         use engines::mme64::asm::{inst, Lane, NOP};
         let (mut gpu, mut mem) = setup();

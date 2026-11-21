@@ -49,6 +49,9 @@ pub struct Compute {
     pub gpu_dispatches: u64,
     /// Programs the backend could not run (interpreted from then on).
     gpu_failed: std::collections::HashSet<u64>,
+    /// Compute wrote its own macro code or start table: it has its own
+    /// macro RAM from then on (Lichii native_compute_uploaded).
+    uploaded: bool,
 }
 
 impl Default for Compute {
@@ -64,6 +67,7 @@ impl Default for Compute {
             skipped: 0,
             gpu_dispatches: 0,
             gpu_failed: Default::default(),
+            uploaded: false,
         }
     }
 }
@@ -112,13 +116,14 @@ impl Compute {
         }
         if last {
             if let Some((index, mut params)) = self.pending_call.take() {
-                let Some(&start) = ctx.mme.starts.get(index) else {
+                let uploaded = self.uploaded;
+                let Some(&start) = ctx.mme.for_compute(uploaded).starts.get(index) else {
                     ctx.faults
                         .push(format!("compute macro {index} out of range"));
                     return true;
                 };
                 ctx.mme.record_call(index | 0x1000, start, &params);
-                let code = std::mem::take(&mut ctx.mme.code);
+                let code = std::mem::take(&mut ctx.mme.for_compute(uploaded).code);
                 let mut target = Target { engine: self, ctx };
                 let result = mme64::execute(&code, start, &mut params, &mut target);
                 let Target { ctx, .. } = target;
@@ -129,7 +134,7 @@ impl Compute {
                         e.message, e.pc
                     ));
                 }
-                ctx.mme.code = code;
+                ctx.mme.for_compute(uploaded).code = code;
             }
         }
         true
@@ -144,10 +149,17 @@ impl Compute {
             *r = value;
         }
         match offset {
-            reg::MME_INSTRUCTION_RAM_POINTER => ctx.mme.set_pointer(value),
-            reg::MME_INSTRUCTION_RAM => ctx.mme.upload(value),
-            reg::MME_START_ADDRESS_RAM_POINTER => ctx.mme.set_start_pointer(value),
-            reg::MME_START_ADDRESS_RAM => ctx.mme.bind(value),
+            reg::MME_INSTRUCTION_RAM_POINTER | reg::MME_START_ADDRESS_RAM_POINTER => {
+                self.uploaded = true;
+                let ram = ctx.mme.for_compute(true);
+                if offset == reg::MME_INSTRUCTION_RAM_POINTER {
+                    ram.set_pointer(value)
+                } else {
+                    ram.set_start_pointer(value)
+                }
+            }
+            reg::MME_INSTRUCTION_RAM => ctx.mme.for_compute(self.uploaded).upload(value),
+            reg::MME_START_ADDRESS_RAM => ctx.mme.for_compute(self.uploaded).bind(value),
             reg::SEND_PCAS_B | reg::SEND_SIGNALING_PCAS_B | reg::SEND_SIGNALING_PCAS2_B => {
                 let action = value & 15;
                 let skip = offset == reg::SEND_PCAS_B

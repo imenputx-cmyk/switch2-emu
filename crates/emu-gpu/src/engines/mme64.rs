@@ -50,6 +50,9 @@ pub struct Shared {
     pub failed: bool,
     /// Words uploaded since the last pointer write (for the log).
     pub(crate) run: (usize, usize),
+    /// The compute class's own macro RAM, used once compute uploads code
+    /// (Lichii NativeMacroContext::compute_engine).
+    pub compute: Option<Box<Shared>>,
 }
 
 impl Default for Shared {
@@ -63,11 +66,22 @@ impl Default for Shared {
             calls: Default::default(),
             failed: false,
             run: (0, 0),
+            compute: None,
         }
     }
 }
 
 impl Shared {
+    /// The macro RAM compute uses: its own after it uploaded code,
+    /// otherwise the 3D class's.
+    pub fn for_compute(&mut self, uploaded: bool) -> &mut Shared {
+        if uploaded {
+            self.compute.get_or_insert_with(Box::default)
+        } else {
+            self
+        }
+    }
+
     /// MME_INSTRUCTION_RAM_POINTER (instructions).
     pub fn set_pointer(&mut self, value: u32) {
         self.end_run();
