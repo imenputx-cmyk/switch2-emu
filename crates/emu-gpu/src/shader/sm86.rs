@@ -689,7 +689,8 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
         }),
         // F2I to a 32-bit integer from F32 (bits 72 signed, 78..80 rounding).
         0x105 => {
-            if i.0[2] & !0x1_C100 != 0x0020_3000 {
+            let small = i.0[2] & !0xC000 == 0x0021_2800;
+            if i.0[2] & !0x1_C100 != 0x0020_3000 && !small {
                 return err("F2I types");
             }
             let (src, mods) = src_b()?;
@@ -705,6 +706,7 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 mods,
                 signed: i.on(72),
                 round,
+                bits: if small { 16 } else { 32 },
             })
         }
         // IPA: attribute word at 64..72, flat (constant) at 78.

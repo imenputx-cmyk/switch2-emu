@@ -129,8 +129,22 @@ pub fn cbuf_bytes(
     match bound {
         Some(b) => {
             let mut data = vec![0u8; b.size as usize];
-            g.read(b.addr, &mut data)
-                .map_err(|f| format!("constant buffer: {f:?}"))?;
+            if g.read(b.addr, &mut data).is_err() {
+                // The buffer may reach past its mapping: read what is
+                // mapped, page by page, and leave the rest zero.
+                let mut ok = false;
+                let mut off = 0usize;
+                while off < data.len() {
+                    let page = (0x1000 - ((b.addr as usize + off) & 0xFFF)).min(data.len() - off);
+                    ok |= g
+                        .read(b.addr + off as u64, &mut data[off..off + page])
+                        .is_ok();
+                    off += page;
+                }
+                if !ok {
+                    return Err(format!("constant buffer: Unmapped({:#x})", b.addr));
+                }
+            }
             Ok(data)
         }
         None => Ok(Vec::new()),

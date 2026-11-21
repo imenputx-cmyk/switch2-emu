@@ -321,6 +321,8 @@ pub enum Op {
         mods: Mods,
         signed: bool,
         round: Round,
+        /// Result width: 32, or 16 (saturates to the 16-bit range).
+        bits: u8,
     },
     /// 32-bit integer to f32.
     I2f {
@@ -1353,6 +1355,7 @@ pub fn decode(v: u64, at: usize) -> Result<Inst, DecodeError> {
             },
             signed: on(v, 12),
             round: round(bits(v, 39, 2)),
+            bits: 32,
         }
     } else if alu(v, 0xb8) {
         // I2F: 32-bit source, f32 destination, byte selector 0.

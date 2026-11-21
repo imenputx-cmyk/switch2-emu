@@ -976,7 +976,8 @@ mod tests {
                 src: Operand::Reg(2),
                 mods: Mods::default(),
                 signed: true,
-                round: Round::Floor
+                round: Round::Floor,
+                bits: 32
             }
         );
         assert_eq!(

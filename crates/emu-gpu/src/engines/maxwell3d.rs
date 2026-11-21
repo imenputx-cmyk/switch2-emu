@@ -948,6 +948,9 @@ impl Maxwell3D {
         }
         let va = u64::from(self.reg(reg::REPORT_SEMAPHORE_A) & 0xFF) << 32
             | u64::from(self.reg(reg::REPORT_SEMAPHORE_A + 4));
+        if va == 0 {
+            return; // NVN's null-address fence: only orders, writes nothing
+        }
         // Release writes the payload; a report writes the counter (none
         // are tracked yet, so 0).
         let value = if operation == 0 {

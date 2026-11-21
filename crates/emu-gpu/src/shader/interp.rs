@@ -733,10 +733,16 @@ impl Machine<'_> {
                 mods,
                 signed,
                 round: r,
+                bits,
             } => {
                 // Rust's float-to-int casts saturate and map NaN to 0.
                 let x = round(self.float(src, mods), r);
-                let v = if signed { x as i32 as u32 } else { x as u32 };
+                let v = match (bits, signed) {
+                    (16, true) => x.clamp(-32768.0, 32767.0) as i32 as u32,
+                    (16, false) => x.clamp(0.0, 65535.0) as u32,
+                    (_, true) => x as i32 as u32,
+                    _ => x as u32,
+                };
                 self.regs.set(dst, v);
             }
             Op::I2f {

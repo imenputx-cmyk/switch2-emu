@@ -2061,13 +2061,20 @@ impl Translator {
                 mods,
                 signed,
                 round,
+                bits,
             } => {
                 // Saturating like the hardware (and Rust's casts); NaN
                 // gives 0. Out-of-range conversions are undefined in
                 // SPIR-V, so clamp first.
                 let x = self.operand_float(src, mods)?;
                 let x = self.round(x, round);
-                let (lo, hi, limit, top) = if signed {
+                let (lo, hi, limit, top) = if bits == 16 {
+                    if signed {
+                        (-32768.0, 32767.0, 32768.0, 32767)
+                    } else {
+                        (0.0, 65535.0, 65536.0, 65535)
+                    }
+                } else if signed {
                     (
                         -2_147_483_648.0,
                         2_147_483_520.0,
