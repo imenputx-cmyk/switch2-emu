@@ -434,6 +434,9 @@ pub enum Op {
         b: Operand,
         c: Operand,
         neg_c: bool,
+        /// .X: add the carry-in predicate; negation is then a bitwise NOT.
+        x: bool,
+        cin: Pred,
     },
     /// Funnel shift (SHF) of the 64-bit value c:a (high:low) by b.
     Shf {

@@ -642,9 +642,7 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
         }
         // IMAD (low word). Bit 75 negates the addend.
         0x024 => {
-            if i.on(74) {
-                return err("IMAD.X");
-            }
+            let x = i.on(74);
             let c = src_c()?.0;
             one(Op::Imad {
                 dst,
@@ -652,6 +650,8 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 b: src_b()?.0,
                 c,
                 neg_c: i.on(75),
+                x,
+                cin: if x { i.pred_at(87) } else { PT_FALSE },
             })
         }
         // SHF: type at 73..75 (0 S64, 1 U64, 2 S32, 3 U32).

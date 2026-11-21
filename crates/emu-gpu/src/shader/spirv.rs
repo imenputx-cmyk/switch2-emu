@@ -1921,13 +1921,21 @@ impl Translator {
                 b,
                 c,
                 neg_c,
+                x: ext,
+                cin,
             } => {
                 let x = self.load_reg(a);
                 let y = self.operand_uint(b)?;
                 let z = self.operand_uint(c)?;
-                let z = self.negate_int(z, neg_c);
                 let p = self.op2(op::I_MUL, uint, x, y);
-                let r = self.op2(op::I_ADD, uint, p, z);
+                let r = if ext {
+                    let z = if neg_c { self.op1(op::NOT, uint, z) } else { z };
+                    let carry = self.load_pred(cin);
+                    self.add_chain(&[p, z], &[carry]).0
+                } else {
+                    let z = self.negate_int(z, neg_c);
+                    self.op2(op::I_ADD, uint, p, z)
+                };
                 self.store_reg(dst, r);
             }
             Op::Shf {

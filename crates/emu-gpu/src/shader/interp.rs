@@ -638,14 +638,22 @@ impl Machine<'_> {
                 b,
                 c,
                 neg_c,
+                x,
+                cin,
             } => {
                 let c = self.operand(c);
-                let c = if neg_c { c.wrapping_neg() } else { c };
+                let c = match (neg_c, x) {
+                    (true, true) => !c,
+                    (true, false) => c.wrapping_neg(),
+                    _ => c,
+                };
+                let carry = u32::from(x && self.pred(cin));
                 let v = self
                     .regs
                     .get(a)
                     .wrapping_mul(self.operand(b))
-                    .wrapping_add(c);
+                    .wrapping_add(c)
+                    .wrapping_add(carry);
                 self.regs.set(dst, v);
             }
             Op::Shf {
