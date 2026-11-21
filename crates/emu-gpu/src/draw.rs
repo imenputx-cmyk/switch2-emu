@@ -503,6 +503,7 @@ pub fn triangles(topology: u32, count: u32) -> Result<Vec<[u32; 3]>, String> {
 
 /// Executes a draw on guest memory.
 pub fn draw_software(g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
+    let _prof = crate::prof::Guard::new(crate::prof::Part::Software);
     let Some(target) = d.target else {
         return Ok(());
     };

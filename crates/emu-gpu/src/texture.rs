@@ -101,6 +101,13 @@ fn layout(format: u32) -> Option<&'static [u32]> {
         // B10G11R11 float and E5B9G9R9 shared-exponent.
         0x21 => &[11, 11, 10],
         0x20 => &[9, 9, 9, 5],
+        // Depth formats sampled as textures (low bits first): S8Z24 and
+        // X8Z24 hold depth in the low 24 bits, Z24S8 stencil in the low 8.
+        0x0D | 0x2A | 0x2B => &[24, 8],
+        0x0E | 0x29 => &[8, 24],
+        0x2F => &[32],
+        0x30 => &[32, 32],
+        0x3A => &[16],
         _ => return None,
     })
 }

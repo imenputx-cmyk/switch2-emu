@@ -21,6 +21,7 @@ pub mod engines;
 pub mod framedebug;
 pub mod mmu;
 pub mod pipeline;
+pub mod prof;
 pub mod regnames;
 pub mod shader;
 pub mod surface;
@@ -325,6 +326,7 @@ impl Gpu {
     /// Runs queued work on a channel until it is empty or an acquire is
     /// not met.
     fn pump(&mut self, channel: usize, mem: &mut Memory) {
+        let _prof = prof::Guard::new(prof::Part::Submit);
         loop {
             if self.channels[channel].stalled.is_some() {
                 if !self.acquire_met(channel, mem) {

@@ -586,6 +586,10 @@ impl Horizon {
             "; frames {}, draws {draws}, compute {grids} (skipped {skipped}), GPU errors {}",
             self.system.frames_presented, self.system.gpu_faults
         );
+        let prof = emu_gpu::prof::report();
+        if !prof.is_empty() {
+            s += &format!("; host time: {prof}");
+        }
         if let Some((objects, timeout)) = &self.last_wait {
             s += &format!("; last wait: [{}] timeout {timeout}", objects.join(", "));
         }

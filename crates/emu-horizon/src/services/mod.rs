@@ -207,7 +207,8 @@ impl System {
         self.frames_presented += 1;
         match self.on_present.as_mut() {
             Some(f) => {
-                if !f(&frame, &mut self.input) {
+                let input = &mut self.input;
+                if !emu_gpu::prof::time(emu_gpu::prof::Part::Present, || f(&frame, input)) {
                     self.quit = true;
                 }
             }

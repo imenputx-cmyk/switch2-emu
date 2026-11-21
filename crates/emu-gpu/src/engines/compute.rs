@@ -267,6 +267,7 @@ impl Compute {
 
     /// Runs a QMD's grid.
     fn dispatch(&mut self, q: &Descriptor, ctx: &mut EngineCtx) -> bool {
+        let _prof = crate::prof::Guard::new(crate::prof::Part::Compute);
         let grid = [q[12], q[13] & 0xFFFF, q[14] & 0xFFFF];
         let block = [q[18] >> 16, q[19] & 0xFFFF, q[19] >> 16];
         let invocations = grid

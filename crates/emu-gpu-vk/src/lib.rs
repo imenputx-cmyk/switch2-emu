@@ -2432,15 +2432,18 @@ impl Backend for VulkanBackend {
             Err(why) => {
                 // Not translatable yet: draw in software on up-to-date
                 // guest memory.
-                let _ = why;
+                emu_gpu::prof::fallback(&why);
                 self.fallback_draws += 1;
                 self.flush(g)?;
                 return self.software.draw(g, d);
             }
         };
-        let textures = match self.bind_textures(g, d, &plan) {
+        let textures = match emu_gpu::prof::time(emu_gpu::prof::Part::Textures, || {
+            self.bind_textures(g, d, &plan)
+        }) {
             Ok(t) => t,
-            Err(_why) => {
+            Err(why) => {
+                emu_gpu::prof::fallback(&why);
                 self.fallback_draws += 1;
                 self.flush(g)?;
                 return self.software.draw(g, d);
@@ -2448,7 +2451,9 @@ impl Backend for VulkanBackend {
         };
         // SAFETY: see `clear`.
         let writes_memory = plan.vs.storage_written || plan.ps.storage_written;
-        unsafe { self.draw_gpu(g, d, plan, textures) }?;
+        emu_gpu::prof::time(emu_gpu::prof::Part::VkDraw, || unsafe {
+            self.draw_gpu(g, d, plan, textures)
+        })?;
         if writes_memory {
             // Guest memory the shader wrote is needed by whatever reads
             // it next (the CPU, a copy, another draw).
@@ -2460,7 +2465,9 @@ impl Backend for VulkanBackend {
 
     fn flush(&mut self, g: &mut GuestMemory) -> Result<(), String> {
         // SAFETY: see `clear`.
-        unsafe { self.flush_images(g) }
+        emu_gpu::prof::time(emu_gpu::prof::Part::VkFlush, || unsafe {
+            self.flush_images(g)
+        })
     }
 }
 
