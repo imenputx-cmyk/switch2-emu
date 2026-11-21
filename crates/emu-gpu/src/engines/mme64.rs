@@ -182,10 +182,20 @@ struct Step {
     loop_count: u32,
     read: Option<(u32, u32)>,
     consumed: u32,
+    /// Methods written (method, value), up to two.
+    emits: [(u32, u32); 2],
+    emit_count: u8,
 }
 
 /// A failure's details: the parameters and the last steps.
-fn describe(ring: &[Step; RING], step: usize, params: &[u32], consumed: usize) -> String {
+fn describe(
+    ring: &[Step; RING],
+    step: usize,
+    params: &[u32],
+    consumed: usize,
+    code: &[u32],
+    start: u32,
+) -> String {
     let mut s = format!(
         "  {} parameters, {consumed} consumed: {:x?}{}\n  last steps:\n",
         params.len(),
@@ -204,8 +214,27 @@ fn describe(ring: &[Step; RING], step: usize, params: &[u32], consumed: usize) -
         if let Some((r, v)) = st.read {
             s += &format!(", read reg {r:#x} = {v:#x}");
         }
+        for &(m, v) in &st.emits[..st.emit_count as usize] {
+            s += &format!(", emit {:#x} = {v:#x}", m * 4);
+        }
         s.push('\n');
     }
+    // The macro's code from its start, to disassemble offline.
+    let last = ring.iter().filter(|st| st.valid).map(|st| st.pc).max().unwrap_or(start);
+    let end = (last.max(start) + 8).min(start + 160) as usize * 3;
+    s += &format!("  code from {start:#x}:");
+    for (i, w) in code
+        .get(start as usize * 3..end.min(code.len()))
+        .unwrap_or(&[])
+        .chunks(3)
+        .enumerate()
+    {
+        if i % 4 == 0 {
+            s += "\n   ";
+        }
+        s += &format!(" {:08x}{:08x}{:08x}", w[0], w.get(1).unwrap_or(&0), w.get(2).unwrap_or(&0));
+    }
+    s.push('\n');
     s
 }
 
@@ -247,7 +276,7 @@ pub fn execute(
                     return Err(Mme64Error {
                         pc,
                         message: "parameter FIFO underflow",
-                        detail: describe(&ring, step as usize, params, consumed),
+                        detail: describe(&ring, step as usize, params, consumed, code, start),
                     });
                 };
                 *slot = v;
@@ -414,6 +443,8 @@ pub fn execute(
                 _ => return None,
             })
         };
+        let mut emits = [(0u32, 0u32); 2];
+        let mut emit_count = 0u8;
         for lane in 0..2 {
             if mask & (4 << lane) == 0 {
                 continue;
@@ -429,6 +460,8 @@ pub fn execute(
                 let Some(value) = output(d.out_emit[lane]) else {
                     return Err(err("invalid output selector"));
                 };
+                emits[emit_count as usize] = (method, value);
+                emit_count += 1;
                 if !target.emit(method, value, params) {
                     return Err(err("unsupported emitted method"));
                 }
@@ -447,6 +480,8 @@ pub fn execute(
             loop_count,
             read: read_note.take(),
             consumed: consumed as u32,
+            emits,
+            emit_count,
         };
         if end_next || stopped {
             return Ok(());
@@ -461,7 +496,7 @@ pub fn execute(
     Err(Mme64Error {
         pc,
         message: "instruction limit reached (runaway macro)",
-        detail: describe(&ring, STEP_LIMIT as usize, params, consumed),
+        detail: describe(&ring, STEP_LIMIT as usize, params, consumed, code, start),
     })
 }
 

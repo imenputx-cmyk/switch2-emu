@@ -521,6 +521,7 @@ impl Gpu {
         let Some(asid) = self.channels[channel].address_space else {
             return;
         };
+        let channels_ampere = self.channels.iter().any(|c| c.ampere);
         let Gpu {
             address_spaces,
             channels,
@@ -552,9 +553,20 @@ impl Gpu {
         let mut from_macros = Vec::new();
         // NVN2 writes inline-to-memory methods on subchannel 2 without
         // binding a class first (Lichii NX2_NOTES row 49).
+        let switch2 = subchannels.iter().flatten().any(|e| e.class() >> 8 >= 0xC5)
+            || channels_ampere;
         let slot = &mut subchannels[subchannel];
-        if slot.is_none() && subchannel == 2 {
-            *slot = Some(Engine::Inline(InlineToMemory::default()));
+        if slot.is_none() {
+            // Switch 2 channels start with NVK's subchannel layout: NVN2
+            // uses them without binding classes (Lichii channel_state.cpp
+            // BindNvkDefaultSubchannels).
+            *slot = match subchannel {
+                2 => Some(Engine::Inline(InlineToMemory::default())),
+                0 if switch2 => Some(Engine::new(class::AMPERE_THREED)),
+                1 if switch2 => Some(Engine::new(class::AMPERE_COMPUTE)),
+                4 if switch2 => Some(Engine::new(class::AMPERE_DMA_COPY)),
+                _ => None,
+            };
         }
         let handled = match slot.as_mut() {
             Some(Engine::ThreeD(e)) => e.write(method, value, last, &mut ctx, &mut from_macros),
