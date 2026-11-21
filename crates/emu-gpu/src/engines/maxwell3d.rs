@@ -72,6 +72,9 @@ mod reg {
     pub const DRAW_INDEX_BUFFER: u32 = 0x17E0;
     pub const CBUF_SELECTOR: u32 = 0x2380; // size, address upper, lower
     pub const LOAD_CBUF_OFFSET: u32 = 0x238C;
+    pub const FALCON_4: u32 = 0x2310;
+    pub const SHADOW_RAM_CONTROL: u32 = 0x124;
+    pub const SHADOW_SCRATCH: u32 = 0x3400;
     pub const LOAD_CBUF: u32 = 0x2390; // ..0x23CC
     pub const BIND_GROUP_CBUF: u32 = 0x2410; // + 32 * stage
     pub const TEX_SAMPLER_POOL: u32 = 0x155C; // address upper, lower, maximum index
@@ -133,6 +136,10 @@ pub struct Maxwell3D {
     /// (select table and byte offset) and 0x508 (data), as in Lichii.
     pub root_tables: [[u32; 64]; 8],
     root_select: (usize, u32),
+    /// MME shadow RAM: the tracked method values.
+    shadow: Vec<u32>,
+    /// Macros that failed already (their details are shown once).
+    failed_macros: std::collections::HashSet<usize>,
 }
 
 /// Words a single MME DMA read may fetch.
@@ -210,6 +217,8 @@ impl Default for Maxwell3D {
             data_ram: Vec::new(),
             root_tables: [[0; 64]; 8],
             root_select: (0, 0),
+            failed_macros: Default::default(),
+            shadow: vec![0; REGS],
         }
     }
 }
@@ -310,8 +319,14 @@ impl Maxwell3D {
         } = target;
         unhandled.extend(u);
         if let Err(e) = result {
+            // The details of a macro's first failure.
+            let detail = if self.failed_macros.insert(index) && !e.detail.is_empty() {
+                format!("\n{}", e.detail)
+            } else {
+                String::new()
+            };
             ctx.faults.push(format!(
-                "MME64 macro {index} at {start:#x}: {} (pc {:#x})",
+                "MME64 macro {index} at {start:#x}: {} (pc {:#x}){detail}",
                 e.message, e.pc
             ));
         }
@@ -354,6 +369,16 @@ impl Maxwell3D {
         let offset = method * 4;
         if offset >= reg::MACRO_CALLS {
             return false;
+        }
+        // Shadow RAM (MME_SHADOW_RAM_CONTROL): track writes, or replay
+        // the tracked value in their place.
+        let mut value = value;
+        if offset != reg::SHADOW_RAM_CONTROL {
+            match self.reg(reg::SHADOW_RAM_CONTROL) & 3 {
+                0 | 1 => self.shadow[method as usize] = value,
+                3 => value = self.shadow[method as usize],
+                _ => {}
+            }
         }
         if (0x180..=0x1B4).contains(&offset) {
             return self.inline.write(method, value, ctx);
@@ -447,6 +472,15 @@ impl Maxwell3D {
                     Some(size),
                     ctx,
                 );
+            }
+            // FALCON[4]: a firmware call that changes registers which do
+            // not matter here; macros wait for it by polling
+            // SHADOW_SCRATCH[0], which it sets to 1 (yuzu/Lichii
+            // ProcessFirmwareCall4).
+            reg::FALCON_4 => {
+                if let Some(r) = self.regs.get_mut(reg::SHADOW_SCRATCH as usize / 4) {
+                    *r = 1;
+                }
             }
             reg::LOAD_CBUF..=0x23CC => {
                 // Constant buffer update: written to memory at the

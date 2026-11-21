@@ -884,6 +884,20 @@ mod tests {
     }
 
     #[test]
+    fn firmware_call_4_sets_shadow_scratch() {
+        let (mut gpu, mut mem) = setup();
+        run(
+            &mut gpu,
+            &mut mem,
+            &[incr(0, 0, 1), class::AMPERE_THREED, incr(0, 0x2310, 1), 7],
+        );
+        let Some(Engine::ThreeD(e)) = &gpu.channels[0].subchannels[0] else {
+            panic!()
+        };
+        assert_eq!(e.reg(0x3400), 1);
+    }
+
+    #[test]
     fn shared_mappings_reach_every_address_space() {
         let mut gpu = Gpu::default();
         let a = gpu.new_address_space();

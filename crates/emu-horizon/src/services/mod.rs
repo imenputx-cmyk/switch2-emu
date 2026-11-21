@@ -107,6 +107,8 @@ pub struct System {
     /// latest one.
     pub gpu_faults: u64,
     pub last_gpu_fault: Option<String>,
+    /// Kinds of GPU errors already printed (their text without numbers).
+    pub gpu_fault_kinds: std::collections::HashMap<String, u64>,
     /// Events signalled every emulated vblank (60 Hz of guest time).
     pub vblank_events: Vec<usize>,
     /// Events signalled every audio frame (5 ms of guest time): the audio
@@ -127,8 +129,19 @@ impl System {
     /// Counts (and with `print`, prints) the GPU's new faults.
     pub fn note_gpu_faults(&mut self, print: bool) {
         for f in self.gpu.faults.drain(..) {
-            if print || self.gpu_faults < 16 {
+            // Each kind of error is printed the first time (and at powers
+            // of ten after), so one noisy error does not hide the others.
+            let first_line = f.lines().next().unwrap_or("");
+            let kind: String = first_line
+                .chars()
+                .filter(|c| !c.is_ascii_hexdigit() || c.is_alphabetic() && !c.is_ascii_digit())
+                .collect();
+            let n = self.gpu_fault_kinds.entry(kind).or_insert(0);
+            *n += 1;
+            if print || *n == 1 {
                 eprintln!("[gpu] {f}");
+            } else if n.is_power_of_two() && *n >= 16 {
+                eprintln!("[gpu] ({}x) {first_line}", *n);
             }
             self.gpu_faults += 1;
             self.last_gpu_fault = Some(f);

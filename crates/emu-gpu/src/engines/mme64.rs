@@ -41,6 +41,8 @@ const STEP_LIMIT: u32 = 1 << 20;
 pub struct Mme64Error {
     pub pc: u32,
     pub message: &'static str,
+    /// For a runaway macro: its last steps and the registers.
+    pub detail: String,
 }
 
 #[derive(Clone, Copy)]
@@ -131,9 +133,15 @@ pub fn execute(
     let (mut loop_count, mut loop_start, mut loop_end) = (0u32, 0u32, 0u32);
     let mut consumed = 0usize;
     let mut end_next = false;
+    // The last steps (pc, ALU results, register reads), for a runaway macro.
+    let mut trail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
-    for _ in 0..STEP_LIMIT {
-        let err = |message| Mme64Error { pc, message };
+    for step in 0..STEP_LIMIT {
+        let err = |message| Mme64Error {
+            pc,
+            message,
+            detail: String::new(),
+        };
         let base = pc as usize * 3;
         if base + 2 >= code.len() {
             return Err(err("instruction outside uploaded RAM"));
@@ -247,7 +255,15 @@ pub fn execute(
                     value = (x & !(bits << dest)) | (((y >> source) & bits) << dest);
                 }
                 17..=21 => value = if condition(d.op[lane]) { u32::MAX } else { 0 },
-                22 => value = target.read(x.wrapping_add(y) & 0xFFFF),
+                22 => {
+                    value = target.read(x.wrapping_add(y) & 0xFFFF);
+                    if step + 64 >= STEP_LIMIT {
+                        trail.push_back(format!(
+                            "  read reg {:#x} = {value:#x}",
+                            x.wrapping_add(y) & 0xFFFF
+                        ));
+                    }
+                }
                 23 => {
                     if loop_count != 0 || imm < 2 {
                         return Err(err("invalid loop"));
@@ -329,6 +345,15 @@ pub fn execute(
             }
         }
 
+        if step + 32 >= STEP_LIMIT {
+            trail.push_back(format!(
+                "  pc {pc:#x}: ops {:?} x {xs:x?} y {ys:x?} -> {alu:x?}, next {next_pc:#x}, loop {loop_count}",
+                d.op
+            ));
+            while trail.len() > 48 {
+                trail.pop_front();
+            }
+        }
         if end_next || stopped {
             return Ok(());
         }
@@ -339,9 +364,21 @@ pub fn execute(
         }
         pc = next_pc;
     }
+    let mut detail = String::from("last steps:\n");
+    for line in trail {
+        detail += &line;
+        detail.push('\n');
+    }
+    detail += &format!("  registers {regs:x?}\n  code from {start:#x}:");
+    let from = start as usize * 3;
+    let to = (pc as usize * 3 + 24).min(code.len());
+    for (i, w) in code.get(from..to).unwrap_or(&[]).chunks(3).enumerate() {
+        detail += &format!("\n    {:#x}: {:08x} {:08x} {:08x}", start as usize + i, w[0], w.get(1).unwrap_or(&0), w.get(2).unwrap_or(&0));
+    }
     Err(Mme64Error {
         pc,
         message: "instruction limit exceeded",
+        detail,
     })
 }
 
