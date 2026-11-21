@@ -158,6 +158,8 @@ const BUILTIN: u32 = 11;
 const FLAT: u32 = 14;
 const BUILTIN_POSITION: u32 = 0;
 const BUILTIN_FRAG_COORD: u32 = 15;
+const BUILTIN_VERTEX_INDEX: u32 = 42;
+const BUILTIN_INSTANCE_INDEX: u32 = 43;
 const GLSL_FABS: u32 = 4;
 const GLSL_FCLAMP: u32 = 43;
 const GLSL_FMA: u32 = 50;
@@ -937,6 +939,31 @@ impl Translator {
 
     fn texture_var(&mut self, handle: u32) -> Result<u32, String> {
         self.texture_var_of(handle, TexKind::D2)
+    }
+
+    /// A scalar uint built-in input (vertex and instance index).
+    fn builtin_scalar(&mut self, builtin: u32) -> u32 {
+        let var = match self.builtins.get(&builtin) {
+            Some(&v) => v,
+            None => {
+                let (ptr, v) = (self.m.id(), self.m.id());
+                inst(
+                    &mut self.m.globals,
+                    op::TYPE_POINTER,
+                    &[ptr, INPUT, self.c.uint],
+                );
+                inst(&mut self.m.globals, op::VARIABLE, &[ptr, v, INPUT]);
+                inst(
+                    &mut self.m.annotations,
+                    op::DECORATE,
+                    &[v, BUILTIN, builtin],
+                );
+                self.builtins.insert(builtin, v);
+                v
+            }
+        };
+        let uint = self.c.uint;
+        self.load(uint, var)
     }
 
     /// A uvec3 built-in input (compute ids), component `k` as a uint.
@@ -2146,6 +2173,16 @@ impl Translator {
                 }
                 for k in 0..count {
                     let a = addr + 4 * k;
+                    if matches!(stage, Stage::Vertex) && (a == 0x2f8 || a == 0x2fc) {
+                        // InstanceId / VertexId.
+                        let u = self.builtin_scalar(if a == 0x2fc {
+                            BUILTIN_VERTEX_INDEX
+                        } else {
+                            BUILTIN_INSTANCE_INDEX
+                        });
+                        self.store_reg(dst.wrapping_add(k as u8), u);
+                        continue;
+                    }
                     let var = self.interface(a, false, stage)?;
                     let p = self.component_ptr(var, a, false);
                     let f = self.load(float, p);

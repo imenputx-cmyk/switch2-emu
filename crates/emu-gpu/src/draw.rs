@@ -344,6 +344,7 @@ impl Cbufs {
 struct VertexIo<'a, 'g> {
     mem: &'a mut GuestMemory<'g>,
     inputs: &'a [[u32; 4]],
+    vertex_id: u32,
     out: Varyings,
     cbufs: &'a Cbufs,
     tex: &'a texture::Bound,
@@ -377,7 +378,10 @@ impl ShaderIo for VertexIo<'_, '_> {
                 .get(i)
                 .map_or(0, |v| v[((addr / 4) % 4) as usize])
         } else {
-            0 // system values (vertex id etc.) are not modelled yet
+            match addr {
+                0x2fc => self.vertex_id,
+                _ => 0, // instance id and the rest are not modelled
+            }
         }
     }
     fn store_attr(&mut self, addr: u32, value: u32) {
@@ -538,6 +542,7 @@ pub fn draw_software(g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
             let mut io = VertexIo {
                 mem: g,
                 inputs: &inputs,
+                vertex_id: v,
                 out: Varyings { words: [0; 128] },
                 cbufs: &vs_cbufs,
                 tex: &vs_tex,
