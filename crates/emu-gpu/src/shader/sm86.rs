@@ -179,6 +179,7 @@ fn native(index: usize, i: &Instruction, what: &'static str) -> DecodeError {
         index,
         opcode: i.opcode(),
         what,
+        words: i.0,
     }
 }
 
@@ -279,6 +280,7 @@ pub fn decode_program_ext(code: &[u8], at_end: bool) -> Result<Vec<Inst>, Decode
                 *target = *first.get(*target).ok_or(DecodeError::Native {
                     index,
                     opcode: 0,
+                    words: [0; 4],
                     what: "branch past the program",
                 })?;
             }
@@ -460,7 +462,9 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
         // FMUL (bits 84..87: result scale, 4 = none).
         0x020 => {
             let (b, b_mods) = src_b()?;
-            if i.bits(84, 3) != 4 || a_mods.abs || b_mods.abs {
+            // Scale 1..7 is 2^(s-4); 0 is invalid (Lichii).
+            let s = i.bits(84, 3);
+            if s == 0 {
                 return err("FMUL scale or absolute value");
             }
             one(Op::Fmul {
@@ -468,6 +472,9 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 a,
                 b,
                 neg_b: a_mods.neg != b_mods.neg,
+                a_abs: a_mods.abs,
+                b_abs: b_mods.abs,
+                scale: s as i8 - 4,
                 sat: i.on(77),
             })
         }
@@ -528,6 +535,9 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                         a: dst,
                         b: Operand::Imm(std::f32::consts::TAU.to_bits()),
                         neg_b: false,
+                        a_abs: false,
+                        b_abs: false,
+                        scale: 0,
                         sat: false,
                     },
                 });

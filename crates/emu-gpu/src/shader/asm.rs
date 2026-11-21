@@ -566,6 +566,9 @@ mod tests {
                     a: 8,
                     b: Operand::Reg(9),
                     neg_b: false,
+                    a_abs: false,
+                    b_abs: false,
+                    scale: 0,
                     sat: false,
                 },
             ),
@@ -576,6 +579,9 @@ mod tests {
                     a: 8,
                     b: Operand::Imm(2.0f32.to_bits()),
                     neg_b: false,
+                    a_abs: false,
+                    b_abs: false,
+                    scale: 0,
                     sat: false,
                 },
             ),
@@ -632,6 +638,9 @@ mod tests {
                     offset: 0x20
                 },
                 neg_b: false,
+                a_abs: false,
+                b_abs: false,
+                scale: 0,
                 sat: false
             })
         );

@@ -156,6 +156,11 @@ pub enum Op {
         a: u8,
         b: Operand,
         neg_b: bool,
+        /// Absolute value of a / of b (before the negation).
+        a_abs: bool,
+        b_abs: bool,
+        /// Result scale, a power of two (-3..=3).
+        scale: i8,
         sat: bool,
     },
     Ffma {
@@ -867,6 +872,8 @@ pub enum DecodeError {
         index: usize,
         opcode: u32,
         what: &'static str,
+        /// The raw 128-bit instruction (for reports).
+        words: [u32; 4],
     },
     /// The code ran out before the program's end: read more.
     Truncated,
@@ -1034,6 +1041,9 @@ pub fn decode(v: u64, at: usize) -> Result<Inst, DecodeError> {
             a,
             b: alu_b(v, true),
             neg_b: on(v, 48),
+            a_abs: false,
+            b_abs: false,
+            scale: 0,
             sat: on(v, 50),
         }
     } else if top(0xff00, 0x1e00) {
@@ -1043,6 +1053,9 @@ pub fn decode(v: u64, at: usize) -> Result<Inst, DecodeError> {
             a,
             b: Operand::Imm(bits(v, 20, 32) as u32),
             neg_b: false,
+            a_abs: false,
+            b_abs: false,
+            scale: 0,
             sat: on(v, 55),
         }
     } else if top(0xff80, 0x5980)

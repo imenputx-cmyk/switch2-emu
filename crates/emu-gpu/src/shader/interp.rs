@@ -343,9 +343,22 @@ impl Machine<'_> {
                 a,
                 b,
                 neg_b,
+                a_abs,
+                b_abs,
+                scale,
                 sat: s,
             } => {
-                let v = self.regs.f(a) * self.float(b, neg(neg_b));
+                let x = self.regs.f(a);
+                let x = if a_abs { x.abs() } else { x };
+                let y = self.float(
+                    b,
+                    Mods {
+                        neg: false,
+                        abs: b_abs,
+                    },
+                );
+                let y = if neg_b { -y } else { y };
+                let v = x * y * 2f32.powi(i32::from(scale));
                 self.set_f(dst, v, s);
             }
             Op::Ffma {

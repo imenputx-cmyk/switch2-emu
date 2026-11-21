@@ -1534,11 +1534,30 @@ impl Translator {
                 a,
                 b,
                 neg_b,
+                a_abs,
+                b_abs,
+                scale,
                 sat,
             } => {
-                let x = self.reg_float(a, no);
-                let y = self.operand_float(b, neg(neg_b))?;
-                let r = self.binary(op::F_MUL, x, y);
+                let x = self.reg_float(
+                    a,
+                    Mods {
+                        neg: false,
+                        abs: a_abs,
+                    },
+                );
+                let y = self.operand_float(
+                    b,
+                    Mods {
+                        neg: neg_b,
+                        abs: b_abs,
+                    },
+                )?;
+                let mut r = self.binary(op::F_MUL, x, y);
+                if scale != 0 {
+                    let k = self.constant_f(2f32.powi(i32::from(scale)));
+                    r = self.binary(op::F_MUL, r, k);
+                }
                 self.store_float(dst, r, sat);
             }
             Op::Ffma {
