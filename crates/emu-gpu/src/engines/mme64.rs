@@ -32,6 +32,12 @@ pub trait Mme64Target {
     fn emit(&mut self, method: u32, value: u32, fifo: &mut Vec<u32>) -> bool;
     /// The macro data RAM.
     fn data_ram(&mut self) -> &mut [u32];
+    /// Whether this call's steps are being traced.
+    fn tracing(&self) -> bool {
+        false
+    }
+    /// A traced step.
+    fn trace_line(&mut self, _line: String) {}
 }
 
 /// The macro code and start addresses, shared by a process's channels
@@ -53,6 +59,8 @@ pub struct Shared {
     /// The compute class's own macro RAM, used once compute uploads code
     /// (Lichii NativeMacroContext::compute_engine).
     pub compute: Option<Box<Shared>>,
+    /// The GPU trace (see [`crate::debug`]).
+    pub trace: crate::debug::Trace,
 }
 
 impl Default for Shared {
@@ -67,6 +75,7 @@ impl Default for Shared {
             failed: false,
             run: (0, 0),
             compute: None,
+            trace: Default::default(),
         }
     }
 }
@@ -637,6 +646,22 @@ pub fn execute(
             }
         }
 
+        if target.tracing() {
+            let mut line = format!(
+                "{pc:#06x}: {}   x {xs:x?} y {ys:x?} -> {alu:x?}",
+                disassemble(code, pc)
+            );
+            if let Some((r, v)) = read_note {
+                line += &format!("  read {:#x} = {v:#x}", r * 4);
+            }
+            for &(m, v) in &emits[..emit_count as usize] {
+                line += &format!("  EMIT {:#x} = {v:#x}", m * 4);
+            }
+            if next_pc != pc + 1 || loop_count != 0 {
+                line += &format!("  next {next_pc:#x} loop {loop_count}");
+            }
+            target.trace_line(line);
+        }
         ring[step as usize % RING] = Step {
             valid: true,
             pc,

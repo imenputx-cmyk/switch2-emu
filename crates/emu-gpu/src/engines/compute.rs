@@ -75,6 +75,7 @@ impl Default for Compute {
 struct Target<'e, 'c, 'm> {
     engine: &'e mut Compute,
     ctx: &'c mut EngineCtx<'m>,
+    macro_index: usize,
 }
 
 impl Mme64Target for Target<'_, '_, '_> {
@@ -86,12 +87,31 @@ impl Mme64Target for Target<'_, '_, '_> {
         if method * 4 >= reg::MACRO_CALLS {
             return false;
         }
+        if self.ctx.mme.trace.on {
+            let (channel, sub) = self.ctx.mme.trace.context;
+            self.ctx.mme.trace.push(crate::debug::Event::Method {
+                channel,
+                sub,
+                class: crate::class::AMPERE_COMPUTE,
+                offset: method * 4,
+                value,
+                source: crate::debug::Source::Macro(self.macro_index | 0x1000),
+            });
+        }
         self.engine.write_method(method, value, self.ctx);
         true
     }
 
     fn data_ram(&mut self) -> &mut [u32] {
         self.ctx.data_ram
+    }
+
+    fn tracing(&self) -> bool {
+        self.ctx.mme.trace.stepping
+    }
+
+    fn trace_line(&mut self, line: String) {
+        self.ctx.mme.trace.push(crate::debug::Event::Step(line));
     }
 }
 
@@ -123,10 +143,26 @@ impl Compute {
                     return true;
                 };
                 ctx.mme.record_call(index | 0x1000, start, &params);
+                if ctx.mme.trace.on {
+                    let channel = ctx.mme.trace.context.0;
+                    ctx.mme.trace.begin_call(index | 0x1000);
+                    ctx.mme.trace.push(crate::debug::Event::Call {
+                        channel,
+                        index,
+                        compute: true,
+                        start,
+                        params: params[..params.len().min(64)].to_vec(),
+                    });
+                }
                 let code = std::mem::take(&mut ctx.mme.for_compute(uploaded).code);
-                let mut target = Target { engine: self, ctx };
+                let mut target = Target {
+                    engine: self,
+                    ctx,
+                    macro_index: index,
+                };
                 let result = mme64::execute(&code, start, &mut params, &mut target);
                 let Target { ctx, .. } = target;
+                ctx.mme.trace.stepping = false;
                 if let Err(e) = result {
                     ctx.mme.failed = true;
                     ctx.faults.push(format!(

@@ -155,6 +155,7 @@ struct Target64<'e, 'c, 'm> {
     engine: &'e mut Maxwell3D,
     ctx: &'c mut EngineCtx<'m>,
     unhandled: Vec<(u32, u32)>,
+    macro_index: usize,
 }
 
 impl Mme64Target for Target64<'_, '_, '_> {
@@ -165,6 +166,17 @@ impl Mme64Target for Target64<'_, '_, '_> {
     fn emit(&mut self, method: u32, value: u32, fifo: &mut Vec<u32>) -> bool {
         if method * 4 >= reg::MACRO_CALLS {
             return false;
+        }
+        if self.ctx.mme.trace.on {
+            let (channel, sub) = self.ctx.mme.trace.context;
+            self.ctx.mme.trace.push(crate::debug::Event::Method {
+                channel,
+                sub,
+                class: crate::class::AMPERE_THREED,
+                offset: method * 4,
+                value,
+                source: crate::debug::Source::Macro(self.macro_index),
+            });
         }
         if method * 4 == reg::MME_DMA_READ_FIFOED {
             self.engine.regs[method as usize] = value;
@@ -177,6 +189,14 @@ impl Mme64Target for Target64<'_, '_, '_> {
 
     fn data_ram(&mut self) -> &mut [u32] {
         self.ctx.data_ram
+    }
+
+    fn tracing(&self) -> bool {
+        self.ctx.mme.trace.stepping
+    }
+
+    fn trace_line(&mut self, line: String) {
+        self.ctx.mme.trace.push(crate::debug::Event::Step(line));
     }
 }
 
@@ -317,19 +337,38 @@ impl Maxwell3D {
             return;
         };
         ctx.mme.record_call(index, start, &params);
+        if ctx.mme.trace.on {
+            let channel = ctx.mme.trace.context.0;
+            ctx.mme.trace.begin_call(index);
+            ctx.mme.trace.push(crate::debug::Event::Call {
+                channel,
+                index,
+                compute: false,
+                start,
+                params: params[..params.len().min(64)].to_vec(),
+            });
+        }
         let code = std::mem::take(&mut ctx.mme.code);
         let mut target = Target64 {
             engine: self,
             ctx,
             unhandled: Vec::new(),
+            macro_index: index,
         };
         let result = mme64::execute(&code, start, &mut params, &mut target);
         let Target64 {
             unhandled: u, ctx, ..
         } = target;
         unhandled.extend(u);
+        ctx.mme.trace.stepping = false;
         if let Err(e) = result {
             ctx.mme.failed = true;
+            if ctx.mme.trace.on {
+                ctx.mme.trace.note(format!(
+                    "macro {index} FAILED: {} (pc {:#x})",
+                    e.message, e.pc
+                ));
+            }
             // The details of a macro's first failure.
             let detail = if self.failed_macros.insert(index) && !e.detail.is_empty() {
                 format!("\n{}", e.detail)

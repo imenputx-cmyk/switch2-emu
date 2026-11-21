@@ -30,6 +30,7 @@ commands:
   stubs              stubbed (auto-answered) IPC commands
   trace on|off       print every SVC
   dump               the full stop report
+  gpu [CMD ...]      GPU debugger (`gpu help`): trace, macros, registers, dumps
   q                  quit";
 
 /// Runs the program under the console: stops are reported and handled at
@@ -397,6 +398,11 @@ impl Console {
                     }
                     None => eprintln!("  usage: mem ADDR"),
                 },
+                "gpu" => {
+                    let rest: Vec<&str> = words[1..].to_vec();
+                    let text = hos.system.gpu.debug_command(&hos.mem, &rest);
+                    eprint!("{text}");
+                }
                 "mods" => {
                     for (i, (base, size)) in hos.modules.iter().enumerate() {
                         eprintln!("  m{i}: {base:#x}..{:#x}", base + size);

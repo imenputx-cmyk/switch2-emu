@@ -35,6 +35,58 @@ fn real_main() -> ExitCode {
     if let Some(p) = args.iter().find_map(|a| a.strip_prefix("--gpu-dump=")) {
         *emu_gpu::dump::DUMP_PATH.lock().unwrap() = Some(p.into());
     }
+    // --gpu-trace=PATH[,LIMIT]: stream every GPU method, macro call and
+    // macro write to a file (names from the register tables).
+    // --gpu-trace-macro=1,7[,calls=N]: also trace those 3D macros step by
+    // step (cN for compute macros); the ring is kept for the debugger.
+    {
+        let mut cfg = emu_gpu::debug::Config {
+            trace_limit: 2_000_000,
+            macro_calls: 3,
+            ..Default::default()
+        };
+        let mut any = false;
+        if let Some(v) = args.iter().find_map(|a| a.strip_prefix("--gpu-trace=")) {
+            let mut it = v.rsplitn(2, ',');
+            let last = it.next().unwrap_or("");
+            match (it.next(), last.parse::<usize>()) {
+                (Some(path), Ok(n)) => {
+                    cfg.trace_path = Some(path.into());
+                    cfg.trace_limit = n;
+                }
+                _ => cfg.trace_path = Some(v.into()),
+            }
+            any = true;
+        }
+        if let Some(v) = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--gpu-trace-macro="))
+        {
+            for part in v.split(',') {
+                if let Some(n) = part.strip_prefix("calls=") {
+                    cfg.macro_calls = n.parse().unwrap_or(3);
+                } else if let Some(c) = part.strip_prefix('c') {
+                    cfg.macros
+                        .extend(c.parse::<usize>().ok().map(|i| i | 0x1000));
+                } else {
+                    cfg.macros
+                        .extend(part.trim_start_matches('m').parse::<usize>());
+                }
+            }
+            any = true;
+        }
+        if args
+            .iter()
+            .any(|a| a == "--debug" || a.starts_with("--debug="))
+            || args.iter().any(|a| a.starts_with("--gpu-dump="))
+        {
+            cfg.ring = true;
+            any = true;
+        }
+        if any {
+            *emu_gpu::debug::CONFIG.lock().unwrap() = Some(cfg);
+        }
+    }
     if args.iter().any(|a| a == "--cpu=interp") {
         emu_run::USE_JIT.store(false, std::sync::atomic::Ordering::Relaxed);
     }

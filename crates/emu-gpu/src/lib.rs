@@ -14,11 +14,13 @@
 
 pub mod backend;
 pub mod blocklinear;
+pub mod debug;
 pub mod draw;
 pub mod dump;
 pub mod engines;
 pub mod mmu;
 pub mod pipeline;
+pub mod regnames;
 pub mod shader;
 pub mod surface;
 pub mod texture;
@@ -185,6 +187,7 @@ impl Default for Gpu {
             shared_maps: Vec::new(),
             mme: engines::mme64::Shared {
                 log: dump::Recorder::from_host().map(|_| Vec::new()),
+                trace: debug::Trace::from_host(),
                 ..Default::default()
             },
             recorder: dump::Recorder::from_host(),
@@ -579,6 +582,20 @@ impl Gpu {
                 _ => None,
             };
         }
+        if ctx.mme.trace.on && method * 4 < engines::compute::reg::MACRO_CALLS {
+            let class = slot.as_ref().map_or(0, Engine::class);
+            ctx.mme.trace.context = (channel, subchannel);
+            ctx.mme.trace.push(debug::Event::Method {
+                channel,
+                sub: subchannel,
+                class,
+                offset: method * 4,
+                value,
+                source: debug::Source::Pushbuffer,
+            });
+        } else if ctx.mme.trace.on {
+            ctx.mme.trace.context = (channel, subchannel);
+        }
         let handled = match slot.as_mut() {
             Some(Engine::ThreeD(e)) => e.write(method, value, last, &mut ctx, &mut from_macros),
             Some(Engine::Copy(e, _)) => e.write(method, value, &mut ctx),
@@ -938,6 +955,78 @@ mod tests {
         assert_eq!(e.reg(0x0d84), 7);
         assert_eq!(e.reg(0x0d80), 42);
         assert_eq!(e.macro_calls, 1);
+    }
+
+    #[test]
+    fn debugger_traces_macros_and_answers_commands() {
+        use engines::mme64::asm::{inst, Lane, LOAD0, NOP, ZERO};
+        let (mut gpu, mut mem) = setup();
+        gpu.mme.trace.on = true;
+        gpu.mme.trace.step_macros.insert(0);
+        gpu.mme.trace.step_calls.insert(0, 1);
+        let mut first = inst(
+            false,
+            0,
+            0,
+            [
+                Lane {
+                    op: 0,
+                    dst: 0,
+                    src_a: LOAD0,
+                    src_b: LOAD0 + 1,
+                    imm: 0,
+                    out_method: 6,
+                    out_emit: 1,
+                },
+                Lane {
+                    imm: 0x0d80 / 4,
+                    ..NOP
+                },
+            ],
+        );
+        first[2] |= 1;
+        let second = inst(false, 0, 0, [NOP, Lane { dst: ZERO, ..NOP }]);
+        let mut words = vec![incr(0, 0, 1), class::AMPERE_THREED];
+        words.extend([incr(0, 0x114, 1), 0, (3 << 29) | (6 << 16) | (0x118 / 4)]);
+        words.extend(first);
+        words.extend(second);
+        words.extend([incr(0, 0x11C, 2), 0, 0]);
+        words.extend([incr(0, 0x3800, 2), 40, 2]);
+        run(&mut gpu, &mut mem, &words);
+        let trace = gpu.debug_command(&mem, &["trace", "100"]);
+        assert!(
+            trace.contains("CALL macro 0 at 0x0 (2 params): [0x28, 0x2]"),
+            "{trace}"
+        );
+        assert!(
+            trace.contains("0x0d80") && trace.contains("= 0x2a  <- macro 0"),
+            "{trace}"
+        );
+        assert!(trace.contains("EMIT 0xd80 = 0x2a"), "{trace}");
+        assert!(
+            trace.contains("mme_instruction_ram") || trace.contains("load_mme"),
+            "{trace}"
+        );
+        let macros = gpu.debug_command(&mem, &["macros"]);
+        assert!(
+            macros.contains("m0") && macros.contains("calls 1"),
+            "{macros}"
+        );
+        let dis = gpu.debug_command(&mem, &["dis", "m0", "2"]);
+        assert!(dis.contains("add(load0,load1)"), "{dis}");
+        let reg = gpu.debug_command(&mem, &["reg", "0xd80"]);
+        assert!(
+            reg.contains("= 0x2a") && reg.contains("written 1 times"),
+            "{reg}"
+        );
+        let status = gpu.debug_command(&mem, &[]);
+        assert!(
+            status.contains("channel 0") && status.contains("0xc797"),
+            "{status}"
+        );
+        assert!(gpu
+            .debug_command(&mem, &["bogus"])
+            .contains("unknown GPU command"));
     }
 
     #[test]

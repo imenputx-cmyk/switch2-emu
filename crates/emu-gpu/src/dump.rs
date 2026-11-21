@@ -79,7 +79,7 @@ impl Gpu {
         }
     }
 
-    fn dump_text(&mut self) -> String {
+    pub(crate) fn dump_text(&mut self) -> String {
         self.mme.end_run();
         let mut s = String::from("# switch2-emu GPU dump\n\n## Faults so far\n");
         for f in self.faults.iter().rev().take(40).rev() {
@@ -157,10 +157,33 @@ impl Gpu {
                     );
                     for (i, &v) in e.regs().iter().enumerate() {
                         if v != 0 {
-                            let _ = writeln!(s, "{:#06x}: {v:#x}", i * 4);
+                            let _ = writeln!(
+                                s,
+                                "{:#06x} {} = {v:#x}",
+                                i * 4,
+                                crate::regnames::name(false, i as u32 * 4)
+                            );
                         }
                     }
                 }
+            }
+        }
+        if self.mme.trace.on {
+            s += "\n## Trace tail (last 400 events; macro steps included when traced)\n";
+            let ring = &self.mme.trace.ring;
+            for (seq, ev) in ring.iter().skip(ring.len().saturating_sub(400)) {
+                let _ = writeln!(s, "{}", crate::debug::format(*seq, ev));
+            }
+            s += "\n## Most written registers\n";
+            let mut w: Vec<_> = self.mme.trace.writes.iter().collect();
+            w.sort_by_key(|&(_, &c)| std::cmp::Reverse(c));
+            for (&(compute, o), &c) in w.into_iter().take(40) {
+                let _ = writeln!(
+                    s,
+                    "{c:>10}  {o:#06x} {}{}",
+                    crate::regnames::name(compute, o),
+                    if compute { " (compute)" } else { "" }
+                );
             }
         }
         s += "\n## Recent command buffers (channel, GPU address, words)\n";

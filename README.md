@@ -127,6 +127,13 @@ registers, the last 64 macro calls with their parameters and the last
 command buffers. It contains no keys; it does hold the game's GPU commands,
 so share it only where you would share a log.
 
+### GPU debugger
+
+* `--gpu-trace=PATH[,LIMIT]` streams every GPU method, macro call and macro-emitted write (with register names) to a file.
+* `--gpu-trace-macro=1,7,c2,calls=3` traces those macros instruction by instruction (`cN` = compute macro).
+* In the `--debug` console, `gpu help` lists: `status`, `trace`, `step`, `calls`, `macros`, `dis`, `regs`, `reg`, `writes`, `dram`, `faults`, `mem`, `dump`.
+* `--gpu-dump` now also contains register names, the trace tail and the most written registers.
+
 ## Controls (window front end)
 
 | Switch | Keyboard | Xbox-style controller (XInput) |
