@@ -993,7 +993,7 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 if dim == 6 {
                     return err("texture dimension 6");
                 }
-                if i.bits(76, 4) != 0 || i.bits(81, 3) != 7 || i.on(59) || mask == 0 {
+                if i.bits(76, 3) != 0 || i.bits(81, 3) != 7 || i.on(59) || mask == 0 {
                     return err("texture offsets, depth compare, FP16 or predicate");
                 }
                 // Level modes: 0 auto, 1 zero (LZ), 2 bias (LB), 3 level
@@ -1015,8 +1015,35 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                     (s, _) => s,
                 };
                 let (ra, rb) = (i.reg(24), i.reg(32));
+                // Bit 79: FP16 results. The components land in Rd.. as f32
+                // and are then packed in pairs: (c0, c1) into Rd, (c2, c3)
+                // into the second destination or Rd + 1 (Lichii).
+                let fp16 = i.on(79);
+                let finish =
+                    |res: Result<Vec<Inst>, DecodeError>| -> Result<Vec<Inst>, DecodeError> {
+                        let mut out = res?;
+                        if fp16 && dst != RZ {
+                            let n = mask.count_ones();
+                            let at = |r: u8, k: u8| if r == RZ { RZ } else { r.wrapping_add(k) };
+                            let pack = |target: u8, low: u8, high: u8| Inst {
+                                pred,
+                                op: Op::F2fp {
+                                    dst: target,
+                                    a: Operand::Reg(high),
+                                    b: Operand::Reg(low),
+                                    merge: false,
+                                },
+                            };
+                            out.push(pack(dst, dst, if n > 1 { at(dst, 1) } else { RZ }));
+                            if n > 2 {
+                                let target = if second == RZ { at(dst, 1) } else { second };
+                                out.push(pack(target, dst1, if n > 3 { at(dst1, 1) } else { RZ }));
+                            }
+                        }
+                        Ok(out)
+                    };
                 if dim == 1 && !has_lod {
-                    return one(if fetch {
+                    return finish(one(if fetch {
                         Op::Tld {
                             dst0: dst,
                             dst1,
@@ -1035,7 +1062,7 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                             comps: mask,
                             lz: lod == 1,
                         }
-                    });
+                    }));
                 }
                 // The operand list (array layer first, coordinates, then
                 // the level) packs into Ra.. and Rb.. (Lichii general_tex).
@@ -1056,7 +1083,7 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 for (k, slot) in c.iter_mut().enumerate().take(coords as usize) {
                     *slot = value(first + k as u32);
                 }
-                one(Op::TexN {
+                finish(one(Op::TexN {
                     dst0: dst,
                     dst1,
                     dim: dim as u8,
@@ -1066,7 +1093,7 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                     comps: mask,
                     fetch,
                     auto_lod: !fetch && lod == 0,
-                })
+                }))
             }
             // S2R / S2UR: the special register at 72..80.
             0x919 | 0x9C3 => {
