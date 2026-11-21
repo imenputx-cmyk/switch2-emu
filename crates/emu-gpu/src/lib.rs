@@ -18,6 +18,7 @@ pub mod debug;
 pub mod draw;
 pub mod dump;
 pub mod engines;
+pub mod framedebug;
 pub mod mmu;
 pub mod pipeline;
 pub mod regnames;

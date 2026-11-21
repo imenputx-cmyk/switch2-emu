@@ -35,6 +35,9 @@ fn real_main() -> ExitCode {
     if let Some(p) = args.iter().find_map(|a| a.strip_prefix("--gpu-dump=")) {
         *emu_gpu::dump::DUMP_PATH.lock().unwrap() = Some(p.into());
     }
+    if let Some(v) = args.iter().find_map(|a| a.strip_prefix("--gpu-frames=")) {
+        *emu_gpu::framedebug::FRAMES.lock().unwrap() = Some(emu_gpu::framedebug::parse(v));
+    }
     // --gpu-trace=PATH[,LIMIT]: stream every GPU method, macro call and
     // macro write to a file (names from the register tables).
     // --gpu-trace-macro=1,7[,calls=N]: also trace those 3D macros step by

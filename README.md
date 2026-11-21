@@ -147,3 +147,10 @@ so share it only where you would share a log.
 ## License
 
 GPL-3.0-or-later (see `LICENSE`), so that code from GPL emulators (Eden, yuzu) can be used directly. Parts taken from permissively licensed projects (deko3d: zlib, envytools and open-gpu-doc: MIT, libnx: ISC) keep their original notices; those licenses are compatible with the GPL.
+
+### Frame debugger (bit level)
+
+`--gpu-frames=DIR[,skip=N][,count=N]` writes, for each selected draw, `draw-NNNNNN.txt`
+(state, raw shader words in hex and binary, shader IR, constant buffers, index and vertex
+data in hex/binary/u32/f32) and `draw-NNNNNN-rt0.png` (render target after the draw), plus
+`present-NNNNN.png` for presented frames. Files hold GPU data but no keys.

@@ -842,6 +842,7 @@ impl Service for Vi2 {
                     let (image, shown, flags) = (ctx.in_u32(12), ctx.in_u32(20), ctx.in_u32(24));
                     match composite(ctx, image, shown, flags) {
                         Some(frame) => {
+                            emu_gpu::framedebug::present(frame.width, frame.height, &frame.rgba);
                             if self.presents <= 3 || self.presents.is_multiple_of(600) {
                                 let lit = frame
                                     .rgba
