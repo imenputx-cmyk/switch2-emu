@@ -136,6 +136,9 @@ pub struct HomebrewResult {
 #[cfg(feature = "window")]
 pub mod window;
 
+#[cfg(feature = "audio")]
+pub mod audio;
+
 pub mod console;
 pub mod gdb;
 
@@ -320,6 +323,14 @@ pub fn run_program_presenting(
 ) -> Result<HomebrewResult, RunError> {
     let mut hos = emu_horizon::Horizon::new();
     hos.system.on_present = on_present;
+    // Host audio (with the window front end); muted for test runs.
+    #[cfg(feature = "audio")]
+    let _audio = hos
+        .system
+        .on_present
+        .is_some()
+        .then(|| audio::start(hos.system.audio_out.clone()))
+        .flatten();
     if config.gpu_backend == emu_horizon::services::GpuBackend::Vulkan {
         match emu_gpu_vk::VulkanBackend::new() {
             Ok(vk) => {

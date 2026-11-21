@@ -1,7 +1,7 @@
 //! Audio: `aud:u` (Switch 2's entry point), `audren:u` (the audio
-//! renderer) and `audout:u`. Nothing is played yet: renderer updates are
-//! answered with well-formed output so the game's audio thread keeps
-//! running, and audio-out buffers are released as soon as they are queued.
+//! renderer) and `audout:u`. Renderer voices are decoded and mixed to
+//! stereo on each update (see [`super::audren`]); audio-out buffers are
+//! played as they are queued. Both go to `System::audio_out`.
 //!
 //! Layouts follow Eden's audio_core (`renderer/behavior/info_updater`,
 //! `renderer/system.cpp`; GPL-3.0-or-later) and Lichii's
@@ -64,7 +64,12 @@ fn revision_number(tag: u32) -> u32 {
 /// Builds RequestUpdate's output for `input` (UpdateDataHeader, then
 /// memory pools, voices, effects, sinks, performance, behavior errors and
 /// render info, as Eden's System::Update writes them).
-pub fn update_output(p: &RendererParams, input: &[u8], frames: u64) -> Vec<u8> {
+pub fn update_output(
+    p: &RendererParams,
+    input: &[u8],
+    frames: u64,
+    voice_status: Option<&[u8]>,
+) -> Vec<u8> {
     let word = |o: usize| {
         input
             .get(o..o + 4)
@@ -95,8 +100,13 @@ pub fn update_output(p: &RendererParams, input: &[u8], frames: u64) -> Vec<u8> {
         out.extend_from_slice(&status);
     }
     sizes[2] = (pool_count * 0x10) as u32;
-    // Voices: nothing played yet.
-    out.extend(std::iter::repeat_n(0, p.voices as usize * 0x10));
+    // Voices: their statuses.
+    let mut voices = vec![0u8; p.voices as usize * 0x10];
+    if let Some(v) = voice_status {
+        let n = v.len().min(voices.len());
+        voices[..n].copy_from_slice(&v[..n]);
+    }
+    out.extend(voices);
     sizes[3] = p.voices * 0x10;
     // Effects: version 2 statuses (0x90) from revision 9 on.
     let effect_size = if revision_number(tag) >= 9 {
@@ -183,6 +193,7 @@ pub struct AudioRenderer {
     running: bool,
     frames: u64,
     event: Option<usize>,
+    voices: super::audren::Voices,
 }
 
 impl AudioRenderer {
@@ -192,7 +203,37 @@ impl AudioRenderer {
             running: false,
             frames: 0,
             event: None,
+            voices: super::audren::Voices::new(params.voices),
         }
+    }
+
+    /// Applies an update's voice sections and renders one frame; the
+    /// voices' output statuses.
+    fn render(&mut self, input: &[u8], ctx: &mut Ctx) -> Vec<u8> {
+        let word = |o: usize| {
+            input
+                .get(o..o + 4)
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())) as usize
+        };
+        // Input order: behaviour, memory pools, channel resources, voices.
+        let resources_at = 0x40 + word(4) + word(8);
+        let voices_at = resources_at + word(0x10);
+        let section = |at: usize, len: usize| input.get(at..at + len).unwrap_or(&[]);
+        let status = self.voices.update(
+            section(resources_at, word(0x10)),
+            section(voices_at, word(0x0C)),
+        );
+        if self.running {
+            let mem = &*ctx.mem;
+            let read = |a: u64, b: &mut [u8]| mem.read(a, b).is_ok();
+            let mixed = self.voices.render(
+                self.params.sample_count as usize,
+                self.params.sample_rate,
+                &read,
+            );
+            ctx.system.audio_out.push(&mixed, self.params.sample_rate);
+        }
+        status
     }
 }
 
@@ -214,7 +255,8 @@ impl Service for AudioRenderer {
                 if self.running {
                     self.frames += 1;
                 }
-                let out = update_output(&self.params, &input, self.frames);
+                let status = self.render(&input, ctx);
+                let out = update_output(&self.params, &input, self.frames, Some(&status));
                 ctx.write_out_buffer(0, &out)?;
                 if let Some(b) = ctx.out_buffer(1) {
                     ctx.write_out_buffer(1, &vec![0; b.size as usize])?;
@@ -346,8 +388,25 @@ impl Service for AudioOut {
             0 => ctx.push_u32(u32::from(!self.running)), // GetAudioOutState
             1 => self.running = true,
             2 => self.running = false,
-            // AppendAudioOutBuffer(Auto)(tag; buffer).
+            // AppendAudioOutBuffer(Auto)(tag; buffer): AudioOutBuffer
+            // {next, samples, capacity, size, offset}, PCM16 stereo.
             3 | 7 => {
+                let b = ctx.read_in_buffer(0)?;
+                let field = |o: usize| {
+                    b.get(o..o + 8)
+                        .map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap()))
+                };
+                let (addr, size, offset) = (field(8), field(0x18), field(0x20));
+                if self.running && addr != 0 && size > 0 && size < 1 << 22 {
+                    let mut pcm = vec![0u8; size as usize];
+                    if ctx.mem.read(addr + offset, &mut pcm).is_ok() {
+                        let samples: Vec<f32> = pcm
+                            .chunks_exact(2)
+                            .map(|s| f32::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0)
+                            .collect();
+                        ctx.system.audio_out.push(&samples, 48_000);
+                    }
+                }
                 self.released.push(ctx.in_u64(0));
             }
             4 => ctx.push_event(&mut self.event, false), // RegisterBufferEvent
@@ -400,7 +459,7 @@ mod tests {
         input[4..8].copy_from_slice(&0x10u32.to_le_bytes());
         input[8..12].copy_from_slice(&((pools * 0x20) as u32).to_le_bytes());
         input[0x50 + 0x10..0x50 + 0x14].copy_from_slice(&4u32.to_le_bytes());
-        let out = update_output(&p, &input, 7);
+        let out = update_output(&p, &input, 7, None);
         let w = |o: usize| u32::from_le_bytes(out[o..o + 4].try_into().unwrap());
         assert_eq!(w(0), u32::from_le_bytes(input[..4].try_into().unwrap()));
         assert_eq!(w(8), (pools * 0x10) as u32);

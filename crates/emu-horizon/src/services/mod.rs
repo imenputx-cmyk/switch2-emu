@@ -8,6 +8,7 @@ pub mod account;
 pub mod am;
 pub mod apm;
 pub mod audio;
+pub mod audren;
 pub mod fs;
 pub mod generic;
 pub mod hid;
@@ -81,6 +82,56 @@ pub struct Frame {
 /// Receives presented frames; returns false to stop the emulation.
 pub type Presenter = Box<dyn FnMut(&Frame, &mut hid::InputState) -> bool>;
 
+/// Audio waiting to be played on the host: interleaved stereo f32 at
+/// 48 kHz. The front end drains it; a queue longer than a quarter
+/// second drops its oldest samples (the guest runs ahead).
+#[derive(Clone, Default)]
+pub struct AudioOutput(pub std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>);
+
+impl AudioOutput {
+    /// Host sample rate.
+    pub const RATE: u32 = 48_000;
+    const MAX: usize = 2 * 12_000;
+
+    /// Queues interleaved stereo `samples` at `rate` Hz (linearly
+    /// resampled to 48 kHz).
+    pub fn push(&self, samples: &[f32], rate: u32) {
+        let Ok(mut q) = self.0.lock() else {
+            return;
+        };
+        if rate == Self::RATE || rate == 0 {
+            q.extend(samples);
+        } else {
+            let frames = samples.len() / 2;
+            let out = frames * Self::RATE as usize / rate as usize;
+            for i in 0..out {
+                let pos = i as f64 * f64::from(rate) / f64::from(Self::RATE);
+                let k = pos.floor() as usize;
+                let f = (pos - pos.floor()) as f32;
+                for c in 0..2 {
+                    let a = samples[(2 * k + c).min(samples.len() - 1)];
+                    let b = samples[(2 * (k + 1) + c).min(samples.len() - 1)];
+                    q.push_back(a + (b - a) * f);
+                }
+            }
+        }
+        let excess = q.len().saturating_sub(Self::MAX);
+        q.drain(..excess);
+    }
+
+    /// Takes up to `n` samples (interleaved).
+    pub fn pop(&self, out: &mut [f32]) -> usize {
+        let Ok(mut q) = self.0.lock() else {
+            return 0;
+        };
+        let n = out.len().min(q.len());
+        for (o, s) in out.iter_mut().zip(q.drain(..n)) {
+            *o = s;
+        }
+        n
+    }
+}
+
 /// State shared between services.
 #[derive(Default)]
 pub struct System {
@@ -114,6 +165,9 @@ pub struct System {
     /// Events signalled every audio frame (5 ms of guest time): the audio
     /// renderers' system events.
     pub audio_events: Vec<usize>,
+    /// Rendered audio for the host: 48 kHz stereo, shared with the
+    /// front end's output stream.
+    pub audio_out: AudioOutput,
     /// Switch 2 GPU memory (nx2:gpu and its sub-sessions share it).
     pub nx2_gpu: nx2::GpuMemory,
     /// nx2:syncpt slot requests: (syncpoint, value, event) signalled

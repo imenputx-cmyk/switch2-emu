@@ -14,6 +14,8 @@ emu-gpu-vk = { path = "../emu-gpu-vk" }
 png = "0.17"
 minifb = { version = "0.28", optional = true }
 ctrlc = "3"
+# Host audio output (with the window front end).
+cpal = { version = "0.18", optional = true }
 
 # XInput controllers in the window front end (Windows).
 [target.'cfg(windows)'.dependencies]
@@ -22,6 +24,8 @@ windows-sys = { version = "0.61", features = ["Win32_UI_Input_XboxController"], 
 [features]
 # Show presented frames in a window (minifb). Off by default so headless
 # builds (CI, servers) need no windowing libraries.
-window = ["dep:minifb", "dep:windows-sys"]
+window = ["dep:minifb", "dep:windows-sys", "audio"]
+# Play the guest's audio on the default output device (cpal).
+audio = ["dep:cpal"]
 # Use the dynarmic JIT by default (see emu-jit).
 jit = ["emu-horizon/jit"]
