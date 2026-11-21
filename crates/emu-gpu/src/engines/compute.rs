@@ -46,6 +46,10 @@ pub struct Compute {
     /// Grids run, and grids skipped (too large or failed to decode).
     pub dispatches: u64,
     pub skipped: u64,
+    /// Grids the backend ran on the GPU.
+    pub gpu_dispatches: u64,
+    /// Programs the backend could not run (interpreted from then on).
+    gpu_failed: std::collections::HashSet<u64>,
 }
 
 impl Default for Compute {
@@ -60,6 +64,8 @@ impl Default for Compute {
             failed_programs: HashMap::new(),
             dispatches: 0,
             skipped: 0,
+            gpu_dispatches: 0,
+            gpu_failed: Default::default(),
         }
     }
 }
@@ -220,15 +226,6 @@ impl Compute {
         if invocations == 0 {
             return true;
         }
-        if invocations > MAX_INVOCATIONS {
-            self.skipped += 1;
-            if self.skipped <= 4 {
-                ctx.faults.push(format!(
-                    "compute grid {grid:?} x {block:?} too large for the interpreter; skipped"
-                ));
-            }
-            return true;
-        }
         let address = u64::from(q[48]) | u64::from(q[49] & 0x1_FFFF) << 32;
         let program = match self.program(address, &ctx.guest) {
             Ok(p) => p,
@@ -250,6 +247,39 @@ impl Compute {
             if ctx.guest.read(va, &mut data).is_ok() {
                 *cbuf = data;
             }
+        }
+        // The backend first (Vulkan compute); the interpreter otherwise.
+        if !self.gpu_failed.contains(&address) {
+            let d = crate::backend::Dispatch {
+                address,
+                program: &program,
+                grid,
+                block,
+                shared_bytes: q[17] & 0x3_FFFF,
+                cbufs: &cbufs,
+            };
+            match ctx.backend.dispatch(&mut ctx.guest, &d) {
+                Ok(true) => {
+                    self.dispatches += 1;
+                    self.gpu_dispatches += 1;
+                    return true;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    self.gpu_failed.insert(address);
+                    ctx.faults
+                        .push(format!("compute on the GPU: {e}; using the interpreter"));
+                }
+            }
+        }
+        if invocations > MAX_INVOCATIONS {
+            self.skipped += 1;
+            if self.skipped <= 4 {
+                ctx.faults.push(format!(
+                    "compute grid {grid:?} x {block:?} too large for the interpreter; skipped"
+                ));
+            }
+            return true;
         }
         let shared_size = (q[17] & 0x3_FFFF) as usize;
         let threads = (block[0] * block[1] * block[2]) as usize;

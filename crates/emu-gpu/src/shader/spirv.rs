@@ -17,8 +17,8 @@
 //! can fall back to the software renderer.
 
 use super::decode::{
-    Bop, FCmp, HalfOp, HalfSrc, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op, Operand,
-    Pred, Round, Space, XmadMode, PT, RZ,
+    AtomOp, Bop, FCmp, HalfOp, HalfSrc, ICmp, Inst, IntFunc, IpaMode, LopOp, Mods, MufuOp, Op,
+    Operand, Pred, Round, Space, XmadMode, PT, RZ,
 };
 use super::interp::{SSY_DEPTH, STEP_LIMIT};
 use super::{attr, Header, Stage};
@@ -107,6 +107,19 @@ mod op {
     pub const BIT_REVERSE: u16 = 204;
     pub const BIT_COUNT: u16 = 205;
     pub const I_ADD_CARRY: u16 = 149;
+    pub const I_SUB_BORROW: u16 = 150;
+    pub const TYPE_RUNTIME_ARRAY: u16 = 29;
+    pub const ARRAY_LENGTH: u16 = 68;
+    pub const ATOMIC_EXCHANGE: u16 = 229;
+    pub const ATOMIC_I_ADD: u16 = 234;
+    pub const ATOMIC_S_MIN: u16 = 236;
+    pub const ATOMIC_U_MIN: u16 = 237;
+    pub const ATOMIC_S_MAX: u16 = 238;
+    pub const ATOMIC_U_MAX: u16 = 239;
+    pub const ATOMIC_AND: u16 = 240;
+    pub const ATOMIC_OR: u16 = 241;
+    pub const ATOMIC_XOR: u16 = 242;
+    pub const CONTROL_BARRIER: u16 = 224;
     pub const U_MUL_EXTENDED: u16 = 151;
     pub const S_MUL_EXTENDED: u16 = 152;
     pub const IMAGE_GATHER: u16 = 96;
@@ -255,6 +268,74 @@ pub fn texture_binding(stage: Stage, i: u32) -> u32 {
     }
 }
 
+/// Most storage buffers (guest memory reached by LDG/STG) a stage binds.
+pub const MAX_STORAGE: usize = 8;
+
+/// Descriptor binding of the `i`-th storage buffer of a stage.
+pub fn storage_binding(stage: Stage, i: u32) -> u32 {
+    match stage {
+        Stage::Pixel => 100 + MAX_STORAGE as u32 + i,
+        _ => 100 + i,
+    }
+}
+
+/// A storage buffer a shader reaches: guest memory at the 64-bit
+/// pointer in constant buffer `cbuf` at byte `offset` (Lichii
+/// global_memory_to_storage_buffer_pass), bound from the pointer rounded
+/// down to 4 bytes; its size word follows the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StorageBuffer {
+    pub cbuf: u8,
+    pub offset: u32,
+}
+
+/// The constant buffer words a program reads that may hold storage
+/// buffer pointers: 8-byte aligned, the NVN range (bank 0, 0x100..0x700,
+/// Lichii's bias) first.
+fn storage_candidates(program: &[Inst]) -> Vec<StorageBuffer> {
+    let mut found = BTreeSet::new();
+    let mut note = |o: Operand| {
+        if let Operand::Cbuf { index, offset } = o {
+            if offset.is_multiple_of(8) {
+                found.insert((index, offset));
+            }
+        }
+    };
+    let mut global = false;
+    for i in program {
+        match i.op {
+            Op::Ldc {
+                index,
+                base,
+                offset,
+                ..
+            } if base == RZ => note(Operand::Cbuf { index, offset }),
+            Op::Mov { src, .. } => note(src),
+            Op::Iadd3 { b, c, .. } => {
+                note(b);
+                note(c);
+            }
+            Op::Iscadd { b, .. } | Op::Lea { b, .. } => note(b),
+            Op::Ldg { .. } | Op::Stg { .. } => global = true,
+            Op::Atom {
+                space: Space::Global,
+                ..
+            } => global = true,
+            _ => {}
+        }
+    }
+    if !global {
+        return Vec::new();
+    }
+    let biased = |&(b, o): &(u8, u32)| b == 0 && (0x100..0x700).contains(&o) && o % 16 == 0;
+    let mut list: Vec<(u8, u32)> = found.iter().copied().filter(biased).collect();
+    list.extend(found.iter().copied().filter(|c| !biased(c)));
+    list.truncate(MAX_STORAGE);
+    list.into_iter()
+        .map(|(cbuf, offset)| StorageBuffer { cbuf, offset })
+        .collect()
+}
+
 /// The image view a sampled texture binding needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TexKind {
@@ -302,6 +383,10 @@ pub struct Translated {
     pub textures: Vec<u32>,
     /// The image view kind of each texture binding.
     pub texture_kinds: Vec<TexKind>,
+    /// Storage buffers, the `i`-th at [`storage_binding`]`(stage, i)`.
+    pub storage: Vec<StorageBuffer>,
+    /// The shader writes guest memory (results must be written back).
+    pub storage_written: bool,
 }
 
 struct Translator {
@@ -320,6 +405,18 @@ struct Translator {
     image_types: BTreeMap<u8, (u32, u32, u32)>,
     vec3: Option<u32>,
     uvec3: Option<u32>,
+    /// Storage buffer candidates and, once declared, their variables
+    /// and the pointer type to their words.
+    storage_slots: Vec<StorageBuffer>,
+    storage_vars: Vec<u32>,
+    p_storage_uint: u32,
+    storage_written: bool,
+    /// Compute: built-in input variables by BuiltIn number, the shared
+    /// memory array and its size in words.
+    builtins: BTreeMap<u32, u32>,
+    shared: Option<u32>,
+    shared_words: u32,
+    shared_p_word: u32,
     stage: Stage,
     /// Local memory (LDL/STL): a private array of words.
     local: Option<u32>,
@@ -840,6 +937,253 @@ impl Translator {
 
     fn texture_var(&mut self, handle: u32) -> Result<u32, String> {
         self.texture_var_of(handle, TexKind::D2)
+    }
+
+    /// A uvec3 built-in input (compute ids), component `k` as a uint.
+    fn builtin_component(&mut self, builtin: u32, k: u32) -> u32 {
+        let var = match self.builtins.get(&builtin) {
+            Some(&v) => v,
+            None => {
+                let ty = self.uvec3();
+                let (ptr, v) = (self.m.id(), self.m.id());
+                inst(&mut self.m.globals, op::TYPE_POINTER, &[ptr, INPUT, ty]);
+                inst(&mut self.m.globals, op::VARIABLE, &[ptr, v, INPUT]);
+                inst(
+                    &mut self.m.annotations,
+                    op::DECORATE,
+                    &[v, BUILTIN, builtin],
+                );
+                self.builtins.insert(builtin, v);
+                v
+            }
+        };
+        let ty = self.uvec3();
+        let vec = self.load(ty, var);
+        self.extract(self.c.uint, vec, k)
+    }
+
+    /// The shared memory array (Workgroup words).
+    fn shared_var(&mut self) -> Result<u32, String> {
+        if let Some(v) = self.shared {
+            return Ok(v);
+        }
+        if self.shared_words == 0 {
+            return Err("shared memory without a size".into());
+        }
+        const WORKGROUP: u32 = 4;
+        let (len, arr, ptr, v) = (self.m.id(), self.m.id(), self.m.id(), self.m.id());
+        let p_word = self.m.id();
+        let g = &mut self.m.globals;
+        inst(g, op::CONSTANT, &[self.c.uint, len, self.shared_words]);
+        inst(g, op::TYPE_ARRAY, &[arr, self.c.uint, len]);
+        inst(g, op::TYPE_POINTER, &[ptr, WORKGROUP, arr]);
+        inst(g, op::TYPE_POINTER, &[p_word, WORKGROUP, self.c.uint]);
+        inst(g, op::VARIABLE, &[ptr, v, WORKGROUP]);
+        self.shared = Some(v);
+        self.shared_p_word = p_word;
+        Ok(v)
+    }
+
+    /// Pointer to shared word `index` (clamped into the array).
+    fn shared_word(&mut self, index: u32) -> Result<u32, String> {
+        let var = self.shared_var()?;
+        let last = self.constant_u(self.shared_words - 1);
+        let i = self.glsl(self.c.uint, GLSL_UMIN, &[index, last]);
+        let p = self.m.id();
+        inst(
+            &mut self.m.body,
+            op::ACCESS_CHAIN,
+            &[self.shared_p_word, p, var, i],
+        );
+        Ok(p)
+    }
+
+    /// The byte address of a shared access.
+    fn shared_address(&mut self, addr: u8, uaddr: u8, offset: i32) -> u32 {
+        let uint = self.c.uint;
+        let a = self.load_reg(addr);
+        let u = self.load_reg(uaddr);
+        let o = self.constant_u(offset as u32);
+        let at = self.op2(op::I_ADD, uint, a, u);
+        self.op2(op::I_ADD, uint, at, o)
+    }
+
+    /// Declares the storage buffer variables (once).
+    fn storage_vars(&mut self) -> Result<(), String> {
+        if !self.storage_vars.is_empty() {
+            return Ok(());
+        }
+        if self.storage_slots.is_empty() {
+            return Err("global memory without a constant buffer pointer".into());
+        }
+        const STORAGE_BUFFER: u32 = 12;
+        let (rta, block, p_block, p_uint) = (self.m.id(), self.m.id(), self.m.id(), self.m.id());
+        let g = &mut self.m.globals;
+        inst(g, op::TYPE_RUNTIME_ARRAY, &[rta, self.c.uint]);
+        inst(g, op::TYPE_STRUCT, &[block, rta]);
+        inst(g, op::TYPE_POINTER, &[p_block, STORAGE_BUFFER, block]);
+        inst(g, op::TYPE_POINTER, &[p_uint, STORAGE_BUFFER, self.c.uint]);
+        let a = &mut self.m.annotations;
+        inst(a, op::DECORATE, &[rta, 6, 4]); // ArrayStride 4
+        inst(a, op::DECORATE, &[block, 2]); // Block
+        inst(a, op::MEMBER_DECORATE, &[block, 0, 35, 0]); // Offset 0
+        self.p_storage_uint = p_uint;
+        for i in 0..self.storage_slots.len() {
+            let v = self.m.id();
+            inst(
+                &mut self.m.globals,
+                op::VARIABLE,
+                &[p_block, v, STORAGE_BUFFER],
+            );
+            let binding = storage_binding(self.stage, i as u32);
+            inst(
+                &mut self.m.annotations,
+                op::DECORATE,
+                &[v, DESCRIPTOR_SET, 0],
+            );
+            inst(
+                &mut self.m.annotations,
+                op::DECORATE,
+                &[v, BINDING, binding],
+            );
+            self.storage_vars.push(v);
+        }
+        Ok(())
+    }
+
+    /// 64-bit add: (lo, hi) + (b_lo, b_hi).
+    fn add64(&mut self, lo: u32, hi: u32, b_lo: u32, b_hi: u32) -> (u32, u32) {
+        let uint = self.c.uint;
+        let r = self.m.id();
+        inst(
+            &mut self.m.body,
+            op::I_ADD_CARRY,
+            &[self.c.uint_pair, r, lo, b_lo],
+        );
+        let sum = self.extract(uint, r, 0);
+        let carry = self.extract(uint, r, 1);
+        let h = self.op2(op::I_ADD, uint, hi, b_hi);
+        let h = self.op2(op::I_ADD, uint, h, carry);
+        (sum, h)
+    }
+
+    /// The 64-bit address of a global access.
+    fn global_address(&mut self, addr: u8, wide: bool, uaddr: u8, offset: i32) -> (u32, u32) {
+        let lo = self.load_reg(addr);
+        let hi = if wide && addr != RZ {
+            self.load_reg(addr + 1)
+        } else {
+            self.c.zero_u
+        };
+        let (mut lo, mut hi) = (lo, hi);
+        if uaddr != RZ {
+            let (ul, uh) = (self.load_reg(uaddr), self.load_reg(uaddr + 1));
+            (lo, hi) = self.add64(lo, hi, ul, uh);
+        }
+        if offset != 0 {
+            let ol = self.constant_u(offset as u32);
+            let oh = self.constant_u(if offset < 0 { u32::MAX } else { 0 });
+            (lo, hi) = self.add64(lo, hi, ol, oh);
+        }
+        (lo, hi)
+    }
+
+    /// For each storage buffer: whether the word at (lo, hi) is inside
+    /// it, and a pointer to that word (clamped into the buffer).
+    fn global_word(&mut self, lo: u32, hi: u32) -> Result<Vec<(u32, u32)>, String> {
+        self.storage_vars()?;
+        let (uint, bool_t) = (self.c.uint, self.c.bool_t);
+        let mut out = Vec::new();
+        for i in 0..self.storage_slots.len() {
+            let sb = self.storage_slots[i];
+            let var = self.storage_vars[i];
+            let base_lo = self.operand_uint(Operand::Cbuf {
+                index: sb.cbuf,
+                offset: sb.offset,
+            })?;
+            let base_hi = self.operand_uint(Operand::Cbuf {
+                index: sb.cbuf,
+                offset: sb.offset + 4,
+            })?;
+            let mask = self.constant_u(!3);
+            let base_lo = self.op2(op::BITWISE_AND, uint, base_lo, mask);
+            let r = self.m.id();
+            inst(
+                &mut self.m.body,
+                op::I_SUB_BORROW,
+                &[self.c.uint_pair, r, lo, base_lo],
+            );
+            let off = self.extract(uint, r, 0);
+            let borrow = self.extract(uint, r, 1);
+            let oh = self.op2(op::I_SUB, uint, hi, base_hi);
+            let oh = self.op2(op::I_SUB, uint, oh, borrow);
+            let len = self.m.id();
+            inst(&mut self.m.body, op::ARRAY_LENGTH, &[uint, len, var, 0]);
+            let two = self.constant_u(2);
+            let idx = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, off, two);
+            let high_ok = self.op2(op::I_EQUAL, bool_t, oh, self.c.zero_u);
+            let in_len = self.op2(op::U_LESS_THAN, bool_t, idx, len);
+            let ok = self.op2(op::LOGICAL_AND, bool_t, high_ok, in_len);
+            let one = self.c.component[1];
+            let last = self.op2(op::I_SUB, uint, len, one);
+            let idx = self.glsl(uint, GLSL_UMIN, &[idx, last]);
+            let p = self.m.id();
+            inst(
+                &mut self.m.body,
+                op::ACCESS_CHAIN,
+                &[self.p_storage_uint, p, var, self.c.zero_u, idx],
+            );
+            out.push((ok, p));
+        }
+        Ok(out)
+    }
+
+    /// Loads the word at (lo, hi) (0 outside every storage buffer).
+    fn global_load_word(&mut self, lo: u32, hi: u32) -> Result<u32, String> {
+        let uint = self.c.uint;
+        let mut v = self.c.zero_u;
+        for (ok, p) in self.global_word(lo, hi)? {
+            let w = self.load(uint, p);
+            v = self.select(uint, ok, w, v);
+        }
+        Ok(v)
+    }
+
+    /// Runs `f(pointer)` for the storage buffer holding (lo, hi).
+    fn global_at(
+        &mut self,
+        lo: u32,
+        hi: u32,
+        mut f: impl FnMut(&mut Self, u32) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for (ok, p) in self.global_word(lo, hi)? {
+            let (then, merge) = (self.m.id(), self.m.id());
+            inst(&mut self.m.body, op::SELECTION_MERGE, &[merge, 0]);
+            inst(&mut self.m.body, op::BRANCH_CONDITIONAL, &[ok, then, merge]);
+            self.label(then);
+            f(self, p)?;
+            self.branch(merge);
+            self.label(merge);
+        }
+        Ok(())
+    }
+
+    /// An atomic on a storage buffer word: the old value.
+    fn atomic(&mut self, opcode: u16, p: u32, v: u32) -> u32 {
+        self.atomic_scoped(opcode, p, v, 1)
+    }
+
+    /// An atomic with a memory scope (1 device, 2 workgroup).
+    fn atomic_scoped(&mut self, opcode: u16, p: u32, v: u32, scope: u32) -> u32 {
+        let scope = self.constant_u(scope);
+        let relaxed = self.c.zero_u;
+        let r = self.m.id();
+        inst(
+            &mut self.m.body,
+            opcode,
+            &[self.c.uint, r, p, scope, relaxed, v],
+        );
+        r
     }
 
     /// OpImageSample{Implicit,Explicit}Lod (explicit: level 0) into
@@ -1854,11 +2198,142 @@ impl Translator {
                     }
                 }
             }
+            Op::S2r { dst, sr } if self.stage == Stage::Compute => {
+                use super::decode::sr as s;
+                // LocalInvocationId 27, WorkgroupId 26.
+                let v = match sr {
+                    s::TID_X | s::TID_Y | s::TID_Z => {
+                        self.builtin_component(27, u32::from(sr - s::TID_X))
+                    }
+                    s::CTAID_X | s::CTAID_Y | s::CTAID_Z => {
+                        self.builtin_component(26, u32::from(sr - s::CTAID_X))
+                    }
+                    // SR_TID packed: x | y << 16 | z << 26.
+                    32 => {
+                        let x = self.builtin_component(27, 0);
+                        let y = self.builtin_component(27, 1);
+                        let z = self.builtin_component(27, 2);
+                        let (s16, s26) = (self.constant_u(16), self.constant_u(26));
+                        let y = self.op2(op::SHIFT_LEFT_LOGICAL, uint, y, s16);
+                        let z = self.op2(op::SHIFT_LEFT_LOGICAL, uint, z, s26);
+                        let xy = self.op2(op::BITWISE_OR, uint, x, y);
+                        self.op2(op::BITWISE_OR, uint, xy, z)
+                    }
+                    _ => {
+                        let v = s::constant(sr).unwrap_or(0);
+                        self.constant_u(v)
+                    }
+                };
+                self.store_reg(dst, v);
+            }
             Op::S2r { dst, sr } => {
                 // One invocation of a graphics stage: ids are zero.
                 let v = super::decode::sr::constant(sr).unwrap_or(0);
                 let v = self.constant_u(v);
                 self.store_reg(dst, v);
+            }
+            Op::Lds {
+                space: Space::Shared,
+                dst,
+                addr,
+                uaddr,
+                offset,
+                size,
+            } => {
+                let at = self.shared_address(addr, uaddr, offset);
+                let two = self.constant_u(2);
+                let base = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, at, two);
+                let bytes = super::interp::access_bytes(size) as u32;
+                if bytes >= 4 {
+                    for k in 0..bytes / 4 {
+                        let kk = self.constant_u(k);
+                        let i = self.op2(op::I_ADD, uint, base, kk);
+                        let p = self.shared_word(i)?;
+                        let v = self.load(uint, p);
+                        if dst != RZ {
+                            self.store_reg(dst + k as u8, v);
+                        }
+                    }
+                } else {
+                    let p = self.shared_word(base)?;
+                    let w = self.load(uint, p);
+                    let three = self.constant_u(3);
+                    let b = self.op2(op::BITWISE_AND, uint, at, three);
+                    let eight = self.constant_u(8);
+                    let shift = self.op2(op::I_MUL, uint, b, eight);
+                    let count = self.constant_u(bytes * 8);
+                    let opcode = if size == 1 || size == 3 {
+                        op::BIT_FIELD_S_EXTRACT
+                    } else {
+                        op::BIT_FIELD_U_EXTRACT
+                    };
+                    let r = self.m.id();
+                    inst(&mut self.m.body, opcode, &[uint, r, w, shift, count]);
+                    self.store_reg(dst, r);
+                }
+            }
+            Op::Sts {
+                space: Space::Shared,
+                src,
+                addr,
+                uaddr,
+                offset,
+                size,
+            } => {
+                let at = self.shared_address(addr, uaddr, offset);
+                let two = self.constant_u(2);
+                let base = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, at, two);
+                let bytes = super::interp::access_bytes(size) as u32;
+                if bytes >= 4 {
+                    for k in 0..bytes / 4 {
+                        let kk = self.constant_u(k);
+                        let i = self.op2(op::I_ADD, uint, base, kk);
+                        let p = self.shared_word(i)?;
+                        let r = if src == RZ { RZ } else { src + k as u8 };
+                        let v = self.load_reg(r);
+                        self.store(p, v);
+                    }
+                } else {
+                    let v = self.load_reg(src);
+                    let three = self.constant_u(3);
+                    let b = self.op2(op::BITWISE_AND, uint, at, three);
+                    let eight = self.constant_u(8);
+                    let shift = self.op2(op::I_MUL, uint, b, eight);
+                    let field = self.constant_u(if bytes == 1 { 0xFF } else { 0xFFFF });
+                    let mask = self.op2(op::SHIFT_LEFT_LOGICAL, uint, field, shift);
+                    let keep = self.op1(op::NOT, uint, mask);
+                    let v = self.op2(op::BITWISE_AND, uint, v, field);
+                    let v = self.op2(op::SHIFT_LEFT_LOGICAL, uint, v, shift);
+                    let p = self.shared_word(base)?;
+                    self.atomic_scoped(op::ATOMIC_AND, p, keep, 2);
+                    self.atomic_scoped(op::ATOMIC_OR, p, v, 2);
+                }
+            }
+            Op::Atom {
+                space: Space::Shared,
+                dst,
+                addr,
+                uaddr,
+                offset,
+                src,
+                op: aop,
+                signed,
+                ..
+            } => {
+                let opcode = atomic_opcode(aop, signed)?;
+                let at = self.shared_address(addr, uaddr, offset);
+                let two = self.constant_u(2);
+                let i = self.op2(op::SHIFT_RIGHT_LOGICAL, uint, at, two);
+                let p = self.shared_word(i)?;
+                let v = self.load_reg(src);
+                let r = self.atomic_scoped(opcode, p, v, 2);
+                self.store_reg(dst, r);
+            }
+            Op::Bar if self.stage == Stage::Compute => {
+                // Workgroup execution and memory barrier
+                // (AcquireRelease | WorkgroupMemory).
+                let (wg, sem) = (self.constant_u(2), self.constant_u(0x108));
+                inst(&mut self.m.body, op::CONTROL_BARRIER, &[wg, wg, sem]);
             }
             Op::Ldc {
                 dst,
@@ -1934,8 +2409,14 @@ impl Translator {
                     self.store(p, v);
                 }
             }
-            Op::Lds { .. } | Op::Sts { .. } | Op::Atom { .. } | Op::Bar => {
-                return Err("shared memory, atomics and barriers are not translated yet".into());
+            Op::Lds { .. }
+            | Op::Sts { .. }
+            | Op::Bar
+            | Op::Atom {
+                space: Space::Local,
+                ..
+            } => {
+                return Err("this memory access or barrier is not translated in this stage".into());
             }
             Op::Half2 {
                 dst,
@@ -2098,8 +2579,117 @@ impl Translator {
                     self.store_float(super::interp::texs_dst(dst0, dst1, k), t[c], false);
                 }
             }
-            Op::Ldg { .. } | Op::Stg { .. } => {
-                return Err("global memory access is not translated yet".into());
+            Op::Ldg {
+                dst,
+                addr,
+                wide,
+                uaddr,
+                offset,
+                size,
+            } => {
+                let (lo, hi) = self.global_address(addr, wide, uaddr, offset);
+                let bytes = super::interp::access_bytes(size) as u32;
+                if bytes >= 4 {
+                    for k in 0..bytes / 4 {
+                        let kk = self.constant_u(4 * k);
+                        let (l, h) = self.add64(lo, hi, kk, self.c.zero_u);
+                        let v = self.global_load_word(l, h)?;
+                        if dst != RZ {
+                            self.store_reg(dst + k as u8, v);
+                        }
+                    }
+                } else {
+                    let w = self.global_load_word(lo, hi)?;
+                    let three = self.constant_u(3);
+                    let b = self.op2(op::BITWISE_AND, uint, lo, three);
+                    let eight = self.constant_u(8);
+                    let shift = self.op2(op::I_MUL, uint, b, eight);
+                    let count = self.constant_u(bytes * 8);
+                    let signed = size == 1 || size == 3;
+                    let v = if signed {
+                        let r = self.m.id();
+                        inst(
+                            &mut self.m.body,
+                            op::BIT_FIELD_S_EXTRACT,
+                            &[uint, r, w, shift, count],
+                        );
+                        r
+                    } else {
+                        let r = self.m.id();
+                        inst(
+                            &mut self.m.body,
+                            op::BIT_FIELD_U_EXTRACT,
+                            &[uint, r, w, shift, count],
+                        );
+                        r
+                    };
+                    self.store_reg(dst, v);
+                }
+            }
+            Op::Stg {
+                src,
+                addr,
+                wide,
+                uaddr,
+                offset,
+                size,
+            } => {
+                self.storage_written = true;
+                let (lo, hi) = self.global_address(addr, wide, uaddr, offset);
+                let bytes = super::interp::access_bytes(size) as u32;
+                if bytes >= 4 {
+                    for k in 0..bytes / 4 {
+                        let kk = self.constant_u(4 * k);
+                        let (l, h) = self.add64(lo, hi, kk, self.c.zero_u);
+                        let r = if src == RZ { RZ } else { src + k as u8 };
+                        let v = self.load_reg(r);
+                        self.global_at(l, h, |t, p| {
+                            t.store(p, v);
+                            Ok(())
+                        })?;
+                    }
+                } else {
+                    // Sub-word: clear the bytes, then OR the value in.
+                    let v = self.load_reg(src);
+                    let three = self.constant_u(3);
+                    let b = self.op2(op::BITWISE_AND, uint, lo, three);
+                    let eight = self.constant_u(8);
+                    let shift = self.op2(op::I_MUL, uint, b, eight);
+                    let field = self.constant_u(if bytes == 1 { 0xFF } else { 0xFFFF });
+                    let mask = self.op2(op::SHIFT_LEFT_LOGICAL, uint, field, shift);
+                    let keep = self.op1(op::NOT, uint, mask);
+                    let v = self.op2(op::BITWISE_AND, uint, v, field);
+                    let v = self.op2(op::SHIFT_LEFT_LOGICAL, uint, v, shift);
+                    self.global_at(lo, hi, |t, p| {
+                        t.atomic(op::ATOMIC_AND, p, keep);
+                        t.atomic(op::ATOMIC_OR, p, v);
+                        Ok(())
+                    })?;
+                }
+            }
+            Op::Atom {
+                space: Space::Global,
+                dst,
+                addr,
+                wide,
+                uaddr,
+                offset,
+                src,
+                op: aop,
+                signed,
+            } => {
+                let opcode = atomic_opcode(aop, signed)?;
+                self.storage_written = true;
+                let (lo, hi) = self.global_address(addr, wide, uaddr, offset);
+                let v = self.load_reg(src);
+                let old = self.private_var(self.c.p_private_uint, self.c.zero_u);
+                self.global_at(lo, hi, |t, p| {
+                    let r = t.atomic(opcode, p, v);
+                    t.store(old, r);
+                    Ok(())
+                })?;
+                let r = self.load(uint, old);
+                self.store_reg(dst, r);
             }
             Op::Plop3 {
                 dst,
@@ -2414,6 +3004,9 @@ impl Translator {
                         open = false;
                         break;
                     }
+                    Op::Kil if self.stage == Stage::Compute => {
+                        return Err("KIL in a compute program".into());
+                    }
                     Op::Kil => {
                         if p == PT {
                             inst(&mut self.m.body, op::KILL, &[]);
@@ -2483,16 +3076,53 @@ impl Translator {
     }
 }
 
+/// The SPIR-V atomic for an ATOM operation.
+fn atomic_opcode(aop: AtomOp, signed: bool) -> Result<u16, String> {
+    Ok(match (aop, signed) {
+        (AtomOp::Add, _) => op::ATOMIC_I_ADD,
+        (AtomOp::Min, true) => op::ATOMIC_S_MIN,
+        (AtomOp::Min, false) => op::ATOMIC_U_MIN,
+        (AtomOp::Max, true) => op::ATOMIC_S_MAX,
+        (AtomOp::Max, false) => op::ATOMIC_U_MAX,
+        (AtomOp::And, _) => op::ATOMIC_AND,
+        (AtomOp::Or, _) => op::ATOMIC_OR,
+        (AtomOp::Xor, _) => op::ATOMIC_XOR,
+        (AtomOp::Exch, _) => op::ATOMIC_EXCHANGE,
+        (AtomOp::Inc | AtomOp::Dec, _) => {
+            return Err("atomic INC/DEC are not translated yet".into())
+        }
+    })
+}
+
 /// Block number meaning "the program has ended".
 const EXIT: u32 = u32::MAX;
 
 /// Translates a vertex or pixel program to a SPIR-V module with entry
 /// point "main".
 pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String> {
-    let stage = header.stage;
+    translate_stage(program, header.stage, Some(header), None)
+}
+
+/// Translates a compute program for workgroups of `block` invocations
+/// with `shared_bytes` of shared memory (entry point "main").
+pub fn translate_compute(
+    program: &[Inst],
+    block: [u32; 3],
+    shared_bytes: u32,
+) -> Result<Translated, String> {
+    translate_stage(program, Stage::Compute, None, Some((block, shared_bytes)))
+}
+
+fn translate_stage(
+    program: &[Inst],
+    stage: Stage,
+    header: Option<&Header>,
+    compute: Option<([u32; 3], u32)>,
+) -> Result<Translated, String> {
     let model = match stage {
         Stage::Vertex => 0,
         Stage::Pixel => 4,
+        Stage::Compute => 5,
         Stage::Other(n) => return Err(format!("shader stage {n} not translated")),
     };
     let mut m = Module::default();
@@ -2598,6 +3228,14 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         image_types: BTreeMap::new(),
         vec3: None,
         uvec3: None,
+        storage_slots: storage_candidates(program),
+        storage_vars: Vec::new(),
+        p_storage_uint: 0,
+        storage_written: false,
+        builtins: BTreeMap::new(),
+        shared: None,
+        shared_words: compute.map_or(0, |(_, b)| b.div_ceil(4)),
+        shared_p_word: 0,
         local: None,
         stage,
     };
@@ -2609,7 +3247,7 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     // next registers (r0, r1, ... across targets in order), at the
     // target's location.
     let mut color_out = Vec::new();
-    if stage == Stage::Pixel {
+    if let (Stage::Pixel, Some(header)) = (stage, header) {
         let mut next = 0u8;
         for (k, &mask) in header.omap_targets.iter().enumerate() {
             if mask == 0 {
@@ -2664,9 +3302,18 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
     entry.extend(string("main"));
     entry.extend(t.inputs.values().chain(t.outputs.values()).copied());
     entry.extend(color_out);
+    entry.extend(t.builtins.values().copied());
     inst(&mut words, op::ENTRY_POINT, &entry);
     if stage == Stage::Pixel {
         inst(&mut words, op::EXECUTION_MODE, &[main, 7]); // OriginUpperLeft
+    }
+    if let Some((block, _)) = compute {
+        // LocalSize.
+        inst(
+            &mut words,
+            op::EXECUTION_MODE,
+            &[main, 17, block[0].max(1), block[1].max(1), block[2].max(1)],
+        );
     }
     let mut name = vec![main];
     name.extend(string("main"));
@@ -2685,6 +3332,12 @@ pub fn translate(program: &[Inst], header: &Header) -> Result<Translated, String
         cbufs: t.cbufs.keys().fold(0, |m, &i| m | 1 << i),
         textures: t.textures.iter().map(|t| t.0).collect(),
         texture_kinds: t.textures.iter().map(|t| t.2).collect(),
+        storage: if t.storage_vars.is_empty() {
+            Vec::new()
+        } else {
+            t.storage_slots.clone()
+        },
+        storage_written: t.storage_written,
     })
 }
 
@@ -2958,6 +3611,147 @@ mod tests {
         let p =
             crate::shader::sm86::decode_program(&code[crate::shader::sm86::HEADER_SIZE..]).unwrap();
         let t = translate(&p, &h).unwrap();
+        validate(&t.words);
+    }
+
+    #[test]
+    fn compute_validates() {
+        use super::super::decode::sr;
+        let p = vec![
+            Inst::always(Op::S2r {
+                dst: 0,
+                sr: sr::TID_X,
+            }),
+            Inst::always(Op::S2r {
+                dst: 1,
+                sr: sr::CTAID_Y,
+            }),
+            Inst::always(Op::S2r { dst: 6, sr: 32 }),
+            Inst::always(Op::Sts {
+                space: Space::Shared,
+                src: 1,
+                addr: 0,
+                uaddr: RZ,
+                offset: 0,
+                size: 4,
+            }),
+            Inst::always(Op::Sts {
+                space: Space::Shared,
+                src: 1,
+                addr: 0,
+                uaddr: RZ,
+                offset: 1,
+                size: 0,
+            }),
+            Inst::always(Op::Bar),
+            Inst::always(Op::Lds {
+                space: Space::Shared,
+                dst: 2,
+                addr: 0,
+                uaddr: RZ,
+                offset: 4,
+                size: 5,
+            }),
+            Inst::always(Op::Atom {
+                space: Space::Shared,
+                dst: 4,
+                addr: 0,
+                wide: false,
+                uaddr: RZ,
+                offset: 0,
+                src: 1,
+                op: AtomOp::Max,
+                signed: true,
+            }),
+            Inst::always(Op::Ldc {
+                dst: 8,
+                index: 0,
+                base: RZ,
+                offset: 0x120,
+                wide: true,
+            }),
+            Inst::always(Op::Stg {
+                src: 2,
+                addr: 8,
+                wide: true,
+                uaddr: RZ,
+                offset: 0,
+                size: 4,
+            }),
+            Inst::always(Op::Exit),
+        ];
+        let t = translate_compute(&p, [64, 2, 1], 1024).unwrap();
+        assert_eq!(t.storage.len(), 1);
+        validate(&t.words);
+    }
+
+    #[test]
+    fn global_memory_validates() {
+        let p = vec![
+            Inst::always(Op::Ldc {
+                dst: 2,
+                index: 0,
+                base: RZ,
+                offset: 0x110,
+                wide: true,
+            }),
+            Inst::always(Op::Ldg {
+                dst: 4,
+                addr: 2,
+                wide: true,
+                uaddr: RZ,
+                offset: 8,
+                size: 6,
+            }),
+            Inst::always(Op::Ldg {
+                dst: 8,
+                addr: 2,
+                wide: true,
+                uaddr: RZ,
+                offset: -3,
+                size: 1,
+            }),
+            Inst::always(Op::Stg {
+                src: 4,
+                addr: 2,
+                wide: true,
+                uaddr: RZ,
+                offset: 0,
+                size: 5,
+            }),
+            Inst::always(Op::Stg {
+                src: 4,
+                addr: 2,
+                wide: true,
+                uaddr: RZ,
+                offset: 2,
+                size: 2,
+            }),
+            Inst::always(Op::Atom {
+                space: Space::Global,
+                dst: 9,
+                addr: 2,
+                wide: true,
+                uaddr: RZ,
+                offset: 0,
+                src: 4,
+                op: AtomOp::Add,
+                signed: false,
+            }),
+            Inst::always(Op::Exit),
+        ];
+        let mut code = vec![0u8; 0x50];
+        code.copy_from_slice(&vertex_header());
+        let h = super::super::Header::parse(&code);
+        let t = translate(&p, &h).unwrap();
+        assert_eq!(
+            t.storage,
+            [StorageBuffer {
+                cbuf: 0,
+                offset: 0x110
+            }]
+        );
+        assert!(t.storage_written);
         validate(&t.words);
     }
 

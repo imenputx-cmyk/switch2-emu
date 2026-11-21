@@ -33,6 +33,8 @@ pub mod attr {
 pub enum Stage {
     Vertex,
     Pixel,
+    /// A compute program (QMD launched; no program header).
+    Compute,
     Other(u32),
 }
 

@@ -316,6 +316,72 @@ fn color_shaders(second_target: bool) -> (Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+fn stencil_test() {
+    let (vs, ps) = color_shaders(false);
+    let zt = GPU_VA + 0x5_0000;
+    let extra = [
+        // Z24S8 depth/stencil buffer, 96x64: depth 1.0, stencil 0x10.
+        incr(0, 0xFE0, 5),
+        (zt >> 32) as u32,
+        zt as u32,
+        0x16,
+        2 << 4,
+        0,
+        incr(0, 0x1228, 3),
+        96,
+        64,
+        1,
+        incr(0, 0x1538, 1),
+        1,
+        incr(0, 0xD90, 1),
+        1.0f32.to_bits(),
+        incr(0, 0xDA0, 1),
+        0x10,
+        incr(0, 0x19D0, 1),
+        3,
+        // Depth LESS with writes.
+        incr(0, 0x12CC, 1),
+        1,
+        incr(0, 0x12E8, 1),
+        1,
+        incr(0, 0x130C, 1),
+        2,
+        // Stencil: pass where it equals 0x10, then increment; zero on a
+        // depth failure. The strip overlapping the triangle fails.
+        incr(0, 0x1380, 2),
+        1,
+        1, // fail: keep
+        incr(0, 0x1388, 3),
+        2, // zfail: zero
+        7, // zpass: increment (wrap)
+        3, // func: equal
+        incr(0, 0x1394, 3),
+        0x10,
+        0xFF,
+        0xFF,
+    ];
+    let Some((soft, hard)) = shaded_draw(vs, ps, 16, &extra) else {
+        return;
+    };
+    // Stencil bytes (the top byte of each Z24S8 pixel) must match.
+    let at = 0x5_0000 - 0x1_0000;
+    let size = emu_gpu::blocklinear::size(96 * 4, 64, 2);
+    let stencil = |m: &[u8]| -> Vec<u8> { m[at..at + size].chunks(4).map(|p| p[3]).collect() };
+    let (a, b) = (stencil(&soft), stencil(&hard));
+    let differ: Vec<(usize, u8, u8)> = (0..a.len())
+        .filter(|&i| a[i] != b[i])
+        .map(|i| (i, a[i], b[i]))
+        .collect();
+    // Edge pixels may rasterize differently (as with colors).
+    assert!(
+        differ.len() <= 8,
+        "stencil values differ: {:?}",
+        &differ[..8]
+    );
+    assert!(a.contains(&0x11), "nothing passed the stencil test");
+}
+
+#[test]
 fn culled_draws() {
     // Clockwise front faces: these triangles are back faces in
     // framebuffer space, so front culling keeps them, and so does back
@@ -380,6 +446,13 @@ fn texture_setup(mem: &mut Memory) {
         .flat_map(|h| h.to_le_bytes())
         .collect();
     mem.write(GUEST + 0x3_7000, &handles).unwrap();
+    // A storage buffer pointer and size in PS constant buffer 0 at 0x110
+    // (the NVN range), naming 16 bytes with 0.5 at offset 8.
+    let sb = GPU_VA + 0x3_7200;
+    let mut words = sb.to_le_bytes().to_vec();
+    words.extend(16u32.to_le_bytes());
+    mem.write(GUEST + 0x3_7110, &words).unwrap();
+    mem.write(GUEST + 0x3_7208, &0.5f32.to_le_bytes()).unwrap();
     // Checkerboard: colors chosen away from unorm rounding ties.
     let mut checker = Vec::new();
     for y in 0..8 {
@@ -522,7 +595,7 @@ fn shaded_draw_on(
         incr(0, 0x2608, 1),
         0,
         incr(0, 0x2380, 3),
-        256,
+        0x200,
         (handles >> 32) as u32,
         handles as u32,
         incr(0, 0x2410 + 4 * 32, 1),
@@ -825,6 +898,83 @@ fn switch2_sm86_shaders() {
 }
 
 #[test]
+fn switch2_global_memory() {
+    use emu_gpu::shader::asm::{pixel_header, vertex_header};
+    use emu_gpu::shader::sm86::asm::{exit, inst, program};
+    let with_header = |header: &[u8], insts: &[emu_gpu::shader::sm86::Instruction]| {
+        let mut p = program(insts);
+        p[..header.len()].copy_from_slice(header);
+        p
+    };
+    let vs = with_header(
+        &vertex_header(),
+        &[
+            inst(
+                0x321,
+                0,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x80), (74, 2, 3)],
+            ),
+            inst(
+                0x321,
+                4,
+                &[(24, 8, 255), (32, 8, 255), (40, 10, 0x90), (74, 2, 3)],
+            ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 0),
+                    (40, 10, 0x70),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            inst(
+                0x322,
+                0,
+                &[
+                    (24, 8, 255),
+                    (32, 8, 4),
+                    (40, 10, 0x80),
+                    (64, 8, 255),
+                    (74, 2, 3),
+                ],
+            ),
+            exit(),
+        ],
+    );
+    // PS: color from IPA; blue loaded from guest memory through the
+    // pointer in c[0][0x110] (LDC.64, then LDG.E.32 [R4.64 + 8]).
+    let ps = with_header(
+        &pixel_header(),
+        &[
+            inst(0x326, 0, &[(32, 8, 255), (64, 8, 0x20), (81, 3, 7)]),
+            inst(0x326, 1, &[(32, 8, 255), (64, 8, 0x21), (81, 3, 7)]),
+            inst(
+                0xB82,
+                4,
+                &[(24, 8, 255), (38, 16, 0x110), (54, 5, 0), (73, 3, 5)],
+            ),
+            inst(0x381, 2, &[(24, 8, 4), (40, 24, 8), (73, 3, 4), (90, 1, 1)]),
+            inst(0x802, 3, &[(32, 32, 1.0f32.to_bits()), (72, 4, 15)]),
+            exit(),
+        ],
+    );
+    let Some((soft, _)) = shaded_draw_on(vs, ps, 8, &[], true) else {
+        return;
+    };
+    // Blue is 0.5 (128 or 127) wherever the strip or triangle drew.
+    let rt = 0x4_0000 - 0x1_0000;
+    let size = emu_gpu::blocklinear::size(96 * 4, 64, 2);
+    let half = soft[rt..rt + size]
+        .chunks(4)
+        .filter(|p| p[2] == 128 || p[2] == 127)
+        .count();
+    assert!(half > 500, "only {half} pixels read the storage buffer");
+}
+
+#[test]
 fn switch2_uniforms_and_root_tables() {
     use emu_gpu::shader::asm::{pixel_header, vertex_header};
     use emu_gpu::shader::sm86::asm::{exit, inst, program};
@@ -1014,4 +1164,94 @@ fn switch2_textures() {
         ],
     );
     shaded_draw_on(vs, ps, 64, &[], true);
+}
+
+#[test]
+fn compute_runs_on_vulkan() {
+    use emu_gpu::shader::sm86::asm::{exit, inst};
+    let Some(vk) = vulkan() else {
+        return;
+    };
+    // out[ctaid * 4 + tid] = shared[3 - tid] = 3 - tid, through shared
+    // memory and a barrier; then an atomic add on a counter word.
+    let program = [
+        inst(0x919, 0, &[(72, 8, 33)]),
+        inst(0x919, 1, &[(72, 8, 37)]),
+        inst(
+            0x211,
+            5,
+            &[(24, 8, 0), (32, 8, 255), (75, 5, 2), (81, 3, 7)],
+        ),
+        inst(0x388, 0, &[(24, 8, 5), (32, 8, 0), (73, 3, 4)]),
+        inst(0xB1D, 0, &[]),
+        inst(
+            0x810,
+            6,
+            &[
+                (24, 8, 5),
+                (32, 32, 12),
+                (64, 8, 255),
+                (72, 1, 1),
+                (81, 3, 7),
+                (84, 3, 7),
+            ],
+        ),
+        inst(0x984, 4, &[(24, 8, 6), (73, 3, 4)]),
+        inst(0x211, 7, &[(24, 8, 1), (32, 8, 0), (75, 5, 2), (81, 3, 7)]),
+        inst(
+            0xA11,
+            2,
+            &[(24, 8, 7), (38, 16, 0), (54, 5, 0), (75, 5, 2), (81, 3, 7)],
+        ),
+        inst(0xA02, 3, &[(38, 16, 4), (54, 5, 0), (72, 4, 15)]),
+        inst(0x386, 0, &[(24, 8, 2), (32, 8, 4), (72, 1, 1), (73, 3, 4)]),
+        exit(),
+    ];
+    let setup = move |mem: &mut Memory| {
+        let code: Vec<u8> = program
+            .iter()
+            .flat_map(|i| i.0)
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        mem.write(GUEST + 0x6_0000, &code).unwrap();
+        // Constant buffer 0: the output pointer and its size.
+        let mut cb = (GPU_VA + 0x6_2000).to_le_bytes().to_vec();
+        cb.extend(32u32.to_le_bytes());
+        cb.extend([0u8; 4]);
+        mem.write(GUEST + 0x6_1000, &cb).unwrap();
+        let mut q = [0u32; 64];
+        q[12] = 2; // grid 2 x 1 x 1
+        q[13] = 1;
+        q[14] = 1;
+        q[17] = 16; // shared memory bytes
+        q[18] = 0x30 | 4 << 16; // QMD 3.0, block x = 4
+        q[19] = 1 | 1 << 16;
+        q[20] = 1; // constant buffer 0 valid
+        q[32] = (GPU_VA + 0x6_1000) as u32;
+        q[33] = 1 << 19; // 16 bytes
+        q[48] = (GPU_VA + 0x6_0000) as u32;
+        let qb: Vec<u8> = q.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write(GUEST + 0x6_3000, &qb).unwrap();
+    };
+    let w = [
+        incr(1, 0, 1),
+        class::AMPERE_COMPUTE,
+        incr(1, 0x2B4, 1),
+        ((GPU_VA + 0x6_3000) >> 8) as u32,
+        incr(1, 0x2C0, 1),
+        3,
+    ];
+    let (soft, _) = run_with(Box::new(emu_gpu::backend::SoftwareBackend), &w, setup);
+    let (hard, backend) = run_with(vk, &w, setup);
+    let vkb = backend.as_any().downcast_ref::<VulkanBackend>().unwrap();
+    assert_eq!(vkb.gpu_dispatches, 1, "the grid must run on the GPU");
+    let at = 0x6_2000 - 0x1_0000;
+    let words = |m: &[u8]| -> Vec<u32> {
+        m[at..at + 32]
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect()
+    };
+    assert_eq!(words(&soft), [3, 2, 1, 0, 3, 2, 1, 0]);
+    assert_eq!(words(&hard), words(&soft));
 }

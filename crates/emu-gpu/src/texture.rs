@@ -446,28 +446,59 @@ fn convert(tic: &Tic, linear: &[u8]) -> Vec<[f32; 4]> {
             .map(|t| swizzle(tic, components(tic, t)))
             .collect();
     }
-    let cols = tic.width.div_ceil(bw);
+    let cols = tic.width.div_ceil(bw) as usize;
     let (w, h) = (tic.width as usize, tic.height as usize);
     let mut texels = vec![[0f32; 4]; w * h];
-    let mut block = vec![0u32; (bw * bh) as usize];
-    for (i, data) in linear.chunks_exact(bpp as usize).enumerate() {
-        let (bx, by) = (i as u32 % cols, i as u32 / cols);
-        decode_block(tic.format, bw, bh, data, &mut block);
-        for (k, &p) in block.iter().enumerate() {
-            let (x, y) = (
-                (bx * bw) as usize + k % bw as usize,
-                (by * bh) as usize + k / bw as usize,
-            );
-            if x < w && y < h {
-                let [b, gr, r, a] = p.to_le_bytes();
-                let mut c = [r, gr, b, a].map(|v| f32::from(v) / 255.0);
-                if tic.srgb {
-                    for v in &mut c[..3] {
-                        *v = srgb_to_linear(*v);
+    let block_row = cols * bpp as usize;
+    // One block row: its blocks decoded into `out` (bh texel rows).
+    let decode_row = |data: &[u8], out: &mut [[f32; 4]]| {
+        let mut block = vec![0u32; (bw * bh) as usize];
+        let rows = out.len() / w.max(1);
+        for (bx, data) in data.chunks_exact(bpp as usize).enumerate() {
+            decode_block(tic.format, bw, bh, data, &mut block);
+            for (k, &p) in block.iter().enumerate() {
+                let (x, y) = (bx * bw as usize + k % bw as usize, k / bw as usize);
+                if x < w && y < rows {
+                    let [b, gr, r, a] = p.to_le_bytes();
+                    let mut c = [r, gr, b, a].map(|v| f32::from(v) / 255.0);
+                    if tic.srgb {
+                        for v in &mut c[..3] {
+                            *v = srgb_to_linear(*v);
+                        }
                     }
+                    out[y * w + x] = swizzle(tic, c);
                 }
-                texels[y * w + x] = swizzle(tic, c);
             }
+        }
+    };
+    type Row<'a> = (&'a [u8], &'a mut [[f32; 4]]);
+    let pairs: Vec<Row> = linear
+        .chunks(block_row.max(1))
+        .zip(texels.chunks_mut(w * bh as usize))
+        .collect();
+    // Block-compressed decoding (ASTC especially) is the costly part of
+    // a texture upload: large textures use every host core.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads > 1 && w * h >= 256 * 256 {
+        let per = pairs.len().div_ceil(threads);
+        let mut groups: Vec<Vec<Row>> = Vec::new();
+        let mut it = pairs.into_iter().peekable();
+        while it.peek().is_some() {
+            groups.push(it.by_ref().take(per).collect());
+        }
+        std::thread::scope(|s| {
+            for group in groups {
+                let decode_row = &decode_row;
+                s.spawn(move || {
+                    for (data, out) in group {
+                        decode_row(data, out);
+                    }
+                });
+            }
+        });
+    } else {
+        for (data, out) in pairs {
+            decode_row(data, out);
         }
     }
     texels

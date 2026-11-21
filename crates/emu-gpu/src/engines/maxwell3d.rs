@@ -791,6 +791,7 @@ impl Maxwell3D {
                     Stage::Vertex => vs = Some(insts),
                     Stage::Pixel => ps = Some((h, insts)),
                     Stage::Other(t) => return Err(format!("shader stage {t} not supported")),
+                    Stage::Compute => return Err("compute program in a graphics slot".into()),
                 }
             }
         }

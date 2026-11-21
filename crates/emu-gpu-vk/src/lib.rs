@@ -11,6 +11,9 @@
 //! pipelines (cached by their shaders and state); anything not
 //! translated yet falls back to the software renderer.
 //!
+//! Compute grids run as Vulkan compute pipelines when their programs
+//! translate (guest memory through storage buffers, as for draws).
+//!
 //! Requires Vulkan 1.3 (dynamic rendering).
 
 use ash::vk;
@@ -69,9 +72,96 @@ fn depth_format(f: DepthFormat) -> Option<vk::Format> {
     match f {
         DepthFormat::Z32Float => Some(vk::Format::D32_SFLOAT),
         DepthFormat::Z16Unorm => Some(vk::Format::D16_UNORM),
-        // The packed stencil/depth layout differs from Vulkan's copies.
-        DepthFormat::S8Z24Unorm | DepthFormat::Z24S8Unorm | DepthFormat::Z32FloatX24S8 => None,
+        // Packed depth/stencil: a float depth plane and a stencil plane,
+        // converted on upload and write-back (D32S8 is supported widely,
+        // D24S8 is not).
+        DepthFormat::S8Z24Unorm | DepthFormat::Z24S8Unorm | DepthFormat::Z32FloatX24S8 => {
+            Some(vk::Format::D32_SFLOAT_S8_UINT)
+        }
     }
+}
+
+/// The aspects of a depth buffer's image.
+fn depth_aspects(f: DepthFormat) -> vk::ImageAspectFlags {
+    if f.stencil_byte().is_some() {
+        vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+    } else {
+        vk::ImageAspectFlags::DEPTH
+    }
+}
+
+/// Guest depth buffer bytes in the staging layout Vulkan copies use: as
+/// is, or for packed formats a plane of f32 depth then a plane of
+/// stencil bytes.
+fn depth_to_vulkan(f: DepthFormat, linear: &[u8]) -> Vec<u8> {
+    let Some(sb) = f.stencil_byte() else {
+        return linear.to_vec();
+    };
+    let bpp = f.bytes_per_pixel() as usize;
+    let n = linear.len() / bpp;
+    let mut out = vec![0u8; n * 5];
+    let (depth, stencil) = out.split_at_mut(n * 4);
+    for (i, p) in linear.chunks_exact(bpp).enumerate() {
+        depth[4 * i..4 * i + 4].copy_from_slice(&f.decode(p).to_le_bytes());
+        stencil[i] = p[sb];
+    }
+    out
+}
+
+/// The inverse of [`depth_to_vulkan`]: back to guest layout (`linear` is
+/// the previous guest contents, for the bits Vulkan does not keep).
+fn depth_from_vulkan(f: DepthFormat, staging: &[u8], linear: &mut [u8]) {
+    let Some(sb) = f.stencil_byte() else {
+        let n = linear.len().min(staging.len());
+        linear[..n].copy_from_slice(&staging[..n]);
+        return;
+    };
+    let bpp = f.bytes_per_pixel() as usize;
+    let n = linear.len() / bpp;
+    if staging.len() < n * 5 {
+        return;
+    }
+    let (depth, stencil) = staging.split_at(n * 4);
+    for (i, p) in linear.chunks_exact_mut(bpp).enumerate() {
+        let z = f32::from_le_bytes(depth[4 * i..4 * i + 4].try_into().unwrap());
+        f.encode(z, p);
+        p[sb] = stencil[i];
+    }
+}
+
+/// Bytes of a depth buffer's staging copy.
+fn depth_staging_size(s: &DepthSurface) -> usize {
+    let n = (s.width * s.height) as usize;
+    if s.format.stencil_byte().is_some() {
+        n * 5
+    } else {
+        n * s.format.bytes_per_pixel() as usize
+    }
+}
+
+fn stencil_op(o: emu_gpu::pipeline::StencilOp) -> vk::StencilOp {
+    use emu_gpu::pipeline::StencilOp as S;
+    match o {
+        S::Keep => vk::StencilOp::KEEP,
+        S::Zero => vk::StencilOp::ZERO,
+        S::Replace => vk::StencilOp::REPLACE,
+        S::IncrSaturate => vk::StencilOp::INCREMENT_AND_CLAMP,
+        S::DecrSaturate => vk::StencilOp::DECREMENT_AND_CLAMP,
+        S::Invert => vk::StencilOp::INVERT,
+        S::IncrWrap => vk::StencilOp::INCREMENT_AND_WRAP,
+        S::DecrWrap => vk::StencilOp::DECREMENT_AND_WRAP,
+    }
+}
+
+fn stencil_face(f: &emu_gpu::pipeline::StencilFace) -> vk::StencilOpState {
+    vk::StencilOpState::default()
+        .fail_op(stencil_op(f.fail))
+        .depth_fail_op(stencil_op(f.zfail))
+        .pass_op(stencil_op(f.zpass))
+        .compare_op(compare_op(f.func))
+        .compare_mask(u32::from(f.func_mask))
+        .write_mask(u32::from(f.write_mask))
+        .reference(u32::from(f.reference))
 }
 
 fn compare_op(c: Compare) -> vk::CompareOp {
@@ -149,6 +239,18 @@ struct TexImage {
     sampler: vk::Sampler,
 }
 
+/// Descriptor layouts by (VS cbufs, PS cbufs, VS textures, PS textures,
+/// VS storage buffers, PS storage buffers).
+type LayoutKey = (u32, u32, usize, usize, usize, usize);
+
+struct ComputePipeline {
+    pipeline: vk::Pipeline,
+    module: vk::ShaderModule,
+    dsl: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    t: spirv::Translated,
+}
+
 /// Uploaded textures are cached by header, view kind and mip count.
 type TexKey = (usize, texture::Tic, spirv::TexKind, u32);
 
@@ -209,19 +311,28 @@ pub struct VulkanBackend {
     /// Descriptor set and pipeline layouts by the constant buffers the
     /// vertex and pixel shaders read (bit masks).
     /// (and how many textures each samples).
-    layouts: HashMap<(u32, u32, usize, usize), (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    layouts: HashMap<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    /// Storage buffers shaders wrote this batch: (guest address, index
+    /// in `transient`, bytes), copied back at the flush.
+    writebacks: Vec<(u64, usize, usize)>,
     /// Textures of the current batch, freed at flush.
     textures: Vec<TexImage>,
     /// Can RGBA32F textures be filtered linearly?
     linear_f32: bool,
+    limits: vk::PhysicalDeviceLimits,
     /// Descriptor sets of the current batch come from here; reset at flush.
     descriptor_pool: vk::DescriptorPool,
     /// Pipelines by a hash of their shaders and fixed state.
     pipelines: HashMap<u64, (vk::Pipeline, [vk::ShaderModule; 2])>,
+    /// Compute pipelines by (program address, block, shared bytes,
+    /// length): pipeline, module, set layout, layout, translation.
+    compute: HashMap<(u64, [u32; 3], u32, usize), ComputePipeline>,
     /// Vertex buffers of the current batch, freed at flush.
     transient: Vec<Buffer>,
     /// Draws done on the GPU / in the software fallback (for tests).
     pub gpu_draws: u64,
+    /// Compute grids run on the GPU.
+    pub gpu_dispatches: u64,
     pub fallback_draws: u64,
 }
 
@@ -286,7 +397,9 @@ impl VulkanBackend {
         let depth_clamp = supported.depth_clamp != 0;
         let features = vk::PhysicalDeviceFeatures::default()
             .depth_clamp(depth_clamp)
-            .image_cube_array(supported.image_cube_array != 0);
+            .image_cube_array(supported.image_cube_array != 0)
+            .vertex_pipeline_stores_and_atomics(supported.vertex_pipeline_stores_and_atomics != 0)
+            .fragment_stores_and_atomics(supported.fragment_stores_and_atomics != 0);
         let device = instance
             .create_device(
                 pd,
@@ -325,6 +438,10 @@ impl VulkanBackend {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 descriptor_count: 4096,
             },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 4096,
+            },
         ];
         let linear_f32 = instance
             .get_physical_device_format_properties(pd, vk::Format::R32G32B32A32_SFLOAT)
@@ -338,6 +455,7 @@ impl VulkanBackend {
                 None,
             )
             .map_err(err("descriptor pool"))?;
+        let limits = instance.get_physical_device_properties(pd).limits;
         Ok(VulkanBackend {
             memory_props: instance.get_physical_device_memory_properties(pd),
             _entry: entry,
@@ -357,12 +475,16 @@ impl VulkanBackend {
             depth_clamp,
             software: SoftwareBackend,
             layouts: HashMap::new(),
+            writebacks: Vec::new(),
             textures: Vec::new(),
             linear_f32,
+            limits,
             descriptor_pool,
             pipelines: HashMap::new(),
+            compute: HashMap::new(),
             transient: Vec::new(),
             gpu_draws: 0,
+            gpu_dispatches: 0,
             fallback_draws: 0,
         })
     }
@@ -646,16 +768,17 @@ impl VulkanBackend {
             if content_hash(&linear) == hash {
                 self.barrier_aspect(
                     img.image,
-                    vk::ImageAspectFlags::DEPTH,
+                    depth_aspects(s.format),
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 );
             } else {
-                let n = linear.len().min(img.staging.size);
-                std::ptr::copy_nonoverlapping(linear.as_ptr(), img.staging.ptr, n);
+                let data = depth_to_vulkan(s.format, &linear);
+                let n = data.len().min(img.staging.size);
+                std::ptr::copy_nonoverlapping(data.as_ptr(), img.staging.ptr, n);
                 self.barrier_aspect(
                     img.image,
-                    vk::ImageAspectFlags::DEPTH,
+                    depth_aspects(s.format),
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 );
@@ -664,11 +787,11 @@ impl VulkanBackend {
                     img.staging.buffer,
                     img.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[depth_copy_region(s)],
+                    &depth_copy_regions(s),
                 );
                 self.barrier_aspect(
                     img.image,
-                    vk::ImageAspectFlags::DEPTH,
+                    depth_aspects(s.format),
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 );
@@ -724,7 +847,7 @@ impl VulkanBackend {
                     .format(format)
                     .subresource_range(
                         vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .aspect_mask(depth_aspects(s.format))
                             .level_count(1)
                             .layer_count(1),
                     ),
@@ -732,12 +855,13 @@ impl VulkanBackend {
             )
             .map_err(err("depth view"))?;
         let linear = s.read_linear(g)?;
-        let staging = self.create_buffer(linear.len())?;
-        std::ptr::copy_nonoverlapping(linear.as_ptr(), staging.ptr, linear.len());
+        let data = depth_to_vulkan(s.format, &linear);
+        let staging = self.create_buffer(depth_staging_size(s).max(data.len()))?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), staging.ptr, data.len());
         self.begin()?;
         self.barrier_aspect(
             image,
-            vk::ImageAspectFlags::DEPTH,
+            depth_aspects(s.format),
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
@@ -746,11 +870,11 @@ impl VulkanBackend {
             staging.buffer,
             image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[depth_copy_region(s)],
+            &depth_copy_regions(s),
         );
         self.barrier_aspect(
             image,
-            vk::ImageAspectFlags::DEPTH,
+            depth_aspects(s.format),
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         );
@@ -813,7 +937,7 @@ impl VulkanBackend {
             let img = &self.depth_images[key];
             self.barrier_aspect(
                 img.image,
-                vk::ImageAspectFlags::DEPTH,
+                depth_aspects(key.1.format),
                 vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
@@ -822,7 +946,7 @@ impl VulkanBackend {
                 img.image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 img.staging.buffer,
-                &[depth_copy_region(&key.1)],
+                &depth_copy_regions(&key.1),
             );
         }
         let mb = vk::MemoryBarrier2::default()
@@ -856,6 +980,14 @@ impl VulkanBackend {
         self.device
             .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
             .map_err(err("reset"))?;
+        let mut storage_result = Ok(());
+        for (addr, i, len) in std::mem::take(&mut self.writebacks) {
+            let b = &self.transient[i];
+            let data = std::slice::from_raw_parts(b.ptr, len.min(b.size));
+            if let Err(f) = g.write(addr, data) {
+                storage_result = Err(format!("writing a storage buffer back: {f:?}"));
+            }
+        }
         for b in std::mem::take(&mut self.transient) {
             self.device.destroy_buffer(b.buffer, None);
             self.device.free_memory(b.memory, None);
@@ -871,7 +1003,7 @@ impl VulkanBackend {
         self.device
             .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
             .map_err(err("reset descriptor pool"))?;
-        let mut result = Ok(());
+        let mut result = storage_result;
         for key in keys {
             let img = self.images.remove(&key).unwrap();
             let data = std::slice::from_raw_parts(img.staging.ptr, img.staging.size);
@@ -893,7 +1025,9 @@ impl VulkanBackend {
             let img = self.depth_images.remove(&key).unwrap();
             let data = std::slice::from_raw_parts(img.staging.ptr, img.staging.size);
             if key.0 == g.asid {
-                let data = data.to_vec();
+                let mut linear = key.1.read_linear(g).unwrap_or_default();
+                depth_from_vulkan(key.1.format, data, &mut linear);
+                let data = linear;
                 if let Err(e) = key.1.write_linear(g, &data) {
                     result = Err(format!("writing depth buffer back: {e}"));
                     self.destroy_image(img);
@@ -933,8 +1067,10 @@ struct Plan {
     /// (stream, stride)
     bindings: Vec<(u32, u32)>,
     viewport: vk::Viewport,
-    /// Depth buffer format, if the depth test is on.
+    /// Depth buffer format, if the depth or stencil test is on.
     depth: Option<vk::Format>,
+    /// The stencil test runs (the buffer has stencil bits).
+    stencil: bool,
 }
 
 fn vertex_format(widths: u32, kind: u32) -> Option<vk::Format> {
@@ -1013,15 +1149,11 @@ fn plan(d: &Draw) -> Result<Plan, String> {
         min_depth: near,
         max_depth: far,
     };
-    if d.depth.stencil.enabled
+    let stencil = d.depth.stencil.enabled
         && d.depth
             .target
-            .is_some_and(|t| t.format.stencil_byte().is_some())
-    {
-        // Packed depth/stencil layouts are not copied to Vulkan yet.
-        return Err("stencil test".into());
-    }
-    let depth = match (&d.depth.target, d.depth.test) {
+            .is_some_and(|t| t.format.stencil_byte().is_some());
+    let depth = match (&d.depth.target, d.depth.test || stencil) {
         (Some(t), true) => Some(depth_format(t.format).ok_or("depth format")?),
         _ => None,
     };
@@ -1033,6 +1165,7 @@ fn plan(d: &Draw) -> Result<Plan, String> {
         bindings,
         viewport,
         depth,
+        stencil,
     })
 }
 
@@ -1050,8 +1183,9 @@ impl VulkanBackend {
         ps: u32,
         vs_textures: usize,
         ps_textures: usize,
+        (vs_storage, ps_storage): (usize, usize),
     ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), String> {
-        let key = (vs, ps, vs_textures, ps_textures);
+        let key = (vs, ps, vs_textures, ps_textures, vs_storage, ps_storage);
         if let Some(&l) = self.layouts.get(&key) {
             return Ok(l);
         }
@@ -1091,6 +1225,20 @@ impl VulkanBackend {
                         .stage_flags(flags),
                 );
             }
+            let storage = if flags == vk::ShaderStageFlags::VERTEX {
+                vs_storage
+            } else {
+                ps_storage
+            };
+            for i in 0..storage as u32 {
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(spirv::storage_binding(stage, i))
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(flags),
+                );
+            }
         }
         let dsl = self
             .device
@@ -1124,6 +1272,202 @@ impl VulkanBackend {
         Ok(buffer)
     }
 
+    /// The compute pipeline for a grid's program (translated once).
+    unsafe fn compute_pipeline(
+        &mut self,
+        d: &emu_gpu::backend::Dispatch,
+    ) -> Result<&ComputePipeline, String> {
+        let key = (d.address, d.block, d.shared_bytes, d.program.len());
+        if !self.compute.contains_key(&key) {
+            let t = spirv::translate_compute(d.program, d.block, d.shared_bytes)?;
+            if !t.textures.is_empty() {
+                return Err("textures in compute programs".into());
+            }
+            let flags = vk::ShaderStageFlags::COMPUTE;
+            let stage = emu_gpu::shader::Stage::Compute;
+            let mut bindings = Vec::new();
+            for i in (0..32u32).filter(|i| t.cbufs & (1 << i) != 0) {
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(spirv::cbuf_binding(stage, i))
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(flags),
+                );
+            }
+            for i in 0..t.storage.len() as u32 {
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(spirv::storage_binding(stage, i))
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(flags),
+                );
+            }
+            let dsl = self
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .map_err(err("compute set layout"))?;
+            let sets = [dsl];
+            let layout = self
+                .device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets),
+                    None,
+                )
+                .map_err(err("compute layout"))?;
+            let module = self.shader_module(&t.words)?;
+            let name = c"main";
+            let info = vk::ComputePipelineCreateInfo::default()
+                .stage(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(flags)
+                        .module(module)
+                        .name(name),
+                )
+                .layout(layout);
+            let pipeline = self
+                .device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .map_err(|(_, e)| format!("compute pipeline: {e}"))?[0];
+            self.compute.insert(
+                key,
+                ComputePipeline {
+                    pipeline,
+                    module,
+                    dsl,
+                    layout,
+                    t,
+                },
+            );
+        }
+        Ok(&self.compute[&key])
+    }
+
+    /// Runs a grid: earlier work is flushed, then the dispatch is
+    /// submitted and waited for, and guest memory it wrote is written
+    /// back.
+    unsafe fn dispatch_gpu(
+        &mut self,
+        g: &mut GuestMemory,
+        d: &emu_gpu::backend::Dispatch,
+    ) -> Result<(), String> {
+        if d.grid.contains(&0) {
+            return Ok(());
+        }
+        let limits = self.limits.max_compute_work_group_count;
+        if d.grid.iter().zip(&limits).any(|(g, l)| g > l) {
+            return Err(format!("grid {:?} over the device limits", d.grid));
+        }
+        let (pipeline, dsl, layout, cbufs, storage, written) = {
+            let c = self.compute_pipeline(d)?;
+            (
+                c.pipeline,
+                c.dsl,
+                c.layout,
+                c.t.cbufs,
+                c.t.storage.clone(),
+                c.t.storage_written,
+            )
+        };
+        self.flush(g)?;
+        self.begin()?;
+        let stage = emu_gpu::shader::Stage::Compute;
+        let mut buffers = Vec::new();
+        let empty = Vec::new();
+        for i in (0..32u32).filter(|i| cbufs & (1 << i) != 0) {
+            let mut data = d.cbufs.get(i as usize).unwrap_or(&empty).clone();
+            data.truncate(0x1_0000);
+            data.resize(data.len().next_multiple_of(16).max(16), 0);
+            let b = self.transient_buffer(&data, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+            buffers.push((
+                spirv::cbuf_binding(stage, i),
+                vk::DescriptorType::UNIFORM_BUFFER,
+                b,
+                data.len() as u64,
+            ));
+        }
+        for (i, sb) in storage.iter().enumerate() {
+            let cb = d.cbufs.get(sb.cbuf as usize).unwrap_or(&empty);
+            let word = |o: u32| {
+                cb.get(o as usize..o as usize + 4)
+                    .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+            };
+            let ptr = u64::from(word(sb.offset)) | u64::from(word(sb.offset + 4)) << 32;
+            let addr = ptr & !3;
+            let size = match word(sb.offset + 8) {
+                0 => 0x1_0000,
+                n => (u64::from(n) + (ptr & 3)).min(64 << 20),
+            } as usize;
+            let mut data = vec![0u8; size.max(16)];
+            let got = if addr == 0 {
+                0
+            } else {
+                g.read_prefix(addr, &mut data).unwrap_or(0)
+            };
+            let len = got.max(16);
+            let b = self.transient_buffer(&data[..len], vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            if written && got > 0 {
+                self.writebacks.push((addr, self.transient.len() - 1, got));
+            }
+            buffers.push((
+                spirv::storage_binding(stage, i as u32),
+                vk::DescriptorType::STORAGE_BUFFER,
+                b,
+                len as u64,
+            ));
+        }
+        if !buffers.is_empty() {
+            let layouts = [dsl];
+            let set = self
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(self.descriptor_pool)
+                        .set_layouts(&layouts),
+                )
+                .map_err(err("compute descriptor set"))?[0];
+            let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
+                .iter()
+                .map(|&(_, _, buffer, range)| {
+                    [vk::DescriptorBufferInfo {
+                        buffer,
+                        offset: 0,
+                        range,
+                    }]
+                })
+                .collect();
+            let writes: Vec<_> = buffers
+                .iter()
+                .zip(&infos)
+                .map(|(&(binding, ty, ..), info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(binding)
+                        .descriptor_type(ty)
+                        .buffer_info(info)
+                })
+                .collect();
+            self.device.update_descriptor_sets(&writes, &[]);
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[set],
+                &[],
+            );
+        }
+        self.device
+            .cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        self.device
+            .cmd_dispatch(self.cmd, d.grid[0], d.grid[1], d.grid[2]);
+        self.flush(g)
+    }
+
     unsafe fn pipeline(
         &mut self,
         p: &Plan,
@@ -1137,8 +1481,10 @@ impl VulkanBackend {
             p.topology.as_raw(),
             formats.iter().map(|f| f.as_raw()).collect::<Vec<_>>(),
             p.depth.map(|f| f.as_raw()),
+            d.depth.test,
             d.depth.write,
             d.depth.func,
+            p.stencil.then_some(d.depth.stencil),
             d.blend,
             d.cull,
         )
@@ -1153,6 +1499,7 @@ impl VulkanBackend {
             p.ps.cbufs,
             p.vs.textures.len(),
             p.ps.textures.len(),
+            (p.vs.storage.len(), p.ps.storage.len()),
         )?;
         if let Some((pipe, _)) = self.pipelines.get(&key) {
             return Ok(*pipe);
@@ -1228,10 +1575,14 @@ impl VulkanBackend {
             .collect();
         let blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let depth_on = p.depth.is_some() && d.depth.test;
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(p.depth.is_some())
-            .depth_write_enable(p.depth.is_some() && d.depth.write)
-            .depth_compare_op(compare_op(d.depth.func));
+            .depth_test_enable(depth_on)
+            .depth_write_enable(depth_on && d.depth.write)
+            .depth_compare_op(compare_op(d.depth.func))
+            .stencil_test_enable(p.stencil)
+            .front(stencil_face(&d.depth.stencil.front))
+            .back(stencil_face(&d.depth.stencil.back));
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
@@ -1240,7 +1591,11 @@ impl VulkanBackend {
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(formats)
-            .depth_attachment_format(p.depth.unwrap_or(vk::Format::UNDEFINED));
+            .depth_attachment_format(p.depth.unwrap_or(vk::Format::UNDEFINED))
+            .stencil_attachment_format(match p.depth {
+                Some(f) if f == vk::Format::D32_SFLOAT_S8_UINT => f,
+                _ => vk::Format::UNDEFINED,
+            });
         let info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
@@ -1344,6 +1699,7 @@ impl VulkanBackend {
             p.ps.cbufs,
             p.vs.textures.len(),
             p.ps.textures.len(),
+            (p.vs.storage.len(), p.ps.storage.len()),
         )?;
         let mut writes = Vec::new();
         for (mask, bound, stage) in [
@@ -1362,64 +1718,123 @@ impl VulkanBackend {
                 writes.push((spirv::cbuf_binding(stage, i), buffer, data.len() as u64));
             }
         }
-        let set = if writes.is_empty() && tex_writes.is_empty() {
-            None
-        } else {
-            let layouts = [dsl];
-            let set = self
-                .device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(self.descriptor_pool)
-                        .set_layouts(&layouts),
-                )
-                .map_err(err("descriptor set"))?[0];
-            let infos: Vec<[vk::DescriptorBufferInfo; 1]> = writes
-                .iter()
-                .map(|&(_, buffer, range)| {
-                    [vk::DescriptorBufferInfo {
-                        buffer,
-                        offset: 0,
-                        range,
-                    }]
-                })
-                .collect();
-            let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = tex_writes
-                .iter()
-                .map(|&(_, view, sampler)| {
-                    [vk::DescriptorImageInfo {
-                        sampler,
-                        image_view: view,
-                        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    }]
-                })
-                .collect();
-            let mut w: Vec<_> = writes
-                .iter()
-                .zip(&infos)
-                .map(|(&(binding, ..), info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(binding)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .buffer_info(info)
-                })
-                .collect();
-            w.extend(
-                tex_writes
+        // Storage buffers: the guest memory each pointer names, copied in
+        // (and back at the flush if the shader writes).
+        let mut storage_writes = Vec::new();
+        for (t, bound, stage) in [
+            (&p.vs, &d.vs_cbufs, emu_gpu::shader::Stage::Vertex),
+            (&p.ps, &d.ps_cbufs, emu_gpu::shader::Stage::Pixel),
+        ] {
+            for (i, sb) in t.storage.iter().enumerate() {
+                let cb = emu_gpu::draw::cbuf_bytes(
+                    g,
+                    bound.get(sb.cbuf as usize).copied().flatten(),
+                    sb.cbuf as usize,
+                    d.root_tables.as_deref(),
+                )?;
+                let word = |o: u32| {
+                    cb.get(o as usize..o as usize + 4)
+                        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+                };
+                let ptr = u64::from(word(sb.offset)) | u64::from(word(sb.offset + 4)) << 32;
+                let addr = ptr & !3;
+                let size = match word(sb.offset + 8) {
+                    0 => 0x1_0000,
+                    n => (u64::from(n) + (ptr & 3)).min(64 << 20),
+                } as usize;
+                let mut data = vec![0u8; size.max(16)];
+                let got = if addr == 0 {
+                    0
+                } else {
+                    g.read_prefix(addr, &mut data).unwrap_or(0)
+                };
+                let len = got.max(16);
+                let buffer =
+                    self.transient_buffer(&data[..len], vk::BufferUsageFlags::STORAGE_BUFFER)?;
+                if t.storage_written && got > 0 {
+                    self.writebacks.push((addr, self.transient.len() - 1, got));
+                }
+                storage_writes.push((spirv::storage_binding(stage, i as u32), buffer, len as u64));
+            }
+        }
+        let set =
+            if writes.is_empty() && tex_writes.is_empty() && storage_writes.is_empty() {
+                None
+            } else {
+                let layouts = [dsl];
+                let set = self
+                    .device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(self.descriptor_pool)
+                            .set_layouts(&layouts),
+                    )
+                    .map_err(err("descriptor set"))?[0];
+                let infos: Vec<[vk::DescriptorBufferInfo; 1]> = writes
                     .iter()
-                    .zip(&image_infos)
+                    .map(|&(_, buffer, range)| {
+                        [vk::DescriptorBufferInfo {
+                            buffer,
+                            offset: 0,
+                            range,
+                        }]
+                    })
+                    .collect();
+                let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = tex_writes
+                    .iter()
+                    .map(|&(_, view, sampler)| {
+                        [vk::DescriptorImageInfo {
+                            sampler,
+                            image_view: view,
+                            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        }]
+                    })
+                    .collect();
+                let mut w: Vec<_> = writes
+                    .iter()
+                    .zip(&infos)
                     .map(|(&(binding, ..), info)| {
                         vk::WriteDescriptorSet::default()
                             .dst_set(set)
                             .dst_binding(binding)
-                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .image_info(info)
-                    }),
-            );
-            self.device.update_descriptor_sets(&w, &[]);
-            Some(set)
-        };
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .buffer_info(info)
+                    })
+                    .collect();
+                w.extend(
+                    tex_writes
+                        .iter()
+                        .zip(&image_infos)
+                        .map(|(&(binding, ..), info)| {
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(set)
+                                .dst_binding(binding)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(info)
+                        }),
+                );
+                let storage_infos: Vec<[vk::DescriptorBufferInfo; 1]> = storage_writes
+                    .iter()
+                    .map(|&(_, buffer, range)| {
+                        [vk::DescriptorBufferInfo {
+                            buffer,
+                            offset: 0,
+                            range,
+                        }]
+                    })
+                    .collect();
+                w.extend(storage_writes.iter().zip(&storage_infos).map(
+                    |(&(binding, ..), info)| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(binding)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(info)
+                    },
+                ));
+                self.device.update_descriptor_sets(&w, &[]);
+                Some(set)
+            };
         self.begin()?;
         let attachments: Vec<_> = views
             .iter()
@@ -1459,6 +1874,9 @@ impl VulkanBackend {
             .color_attachments(&attachments);
         if let Some(da) = &depth_attachment {
             info = info.depth_attachment(da);
+            if p.depth == Some(vk::Format::D32_SFLOAT_S8_UINT) {
+                info = info.stencil_attachment(da);
+            }
         }
         self.device.cmd_begin_rendering(self.cmd, &info);
         self.device
@@ -1513,18 +1931,31 @@ impl VulkanBackend {
     }
 }
 
-fn depth_copy_region(s: &DepthSurface) -> vk::BufferImageCopy {
-    vk::BufferImageCopy::default()
-        .image_subresource(
-            vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                .layer_count(1),
-        )
-        .image_extent(vk::Extent3D {
-            width: s.width,
-            height: s.height,
-            depth: 1,
-        })
+/// Copies between a depth buffer's image and its staging buffer: the
+/// depth plane, then for packed formats the stencil plane.
+fn depth_copy_regions(s: &DepthSurface) -> Vec<vk::BufferImageCopy> {
+    let region = |aspect, offset| {
+        vk::BufferImageCopy::default()
+            .buffer_offset(offset)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(aspect)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: s.width,
+                height: s.height,
+                depth: 1,
+            })
+    };
+    let mut r = vec![region(vk::ImageAspectFlags::DEPTH, 0)];
+    if s.format.stencil_byte().is_some() {
+        r.push(region(
+            vk::ImageAspectFlags::STENCIL,
+            u64::from(s.width * s.height) * 4,
+        ));
+    }
+    r
 }
 
 /// Vulkan's fixed border colors; others are not supported.
@@ -1979,9 +2410,20 @@ impl Backend for VulkanBackend {
         emu_gpu::backend::clear_stencil_software(g, t, r, s)
     }
 
+    fn dispatch(
+        &mut self,
+        g: &mut GuestMemory,
+        d: &emu_gpu::backend::Dispatch,
+    ) -> Result<bool, String> {
+        // SAFETY: see `clear`.
+        unsafe { self.dispatch_gpu(g, d) }?;
+        self.gpu_dispatches += 1;
+        Ok(true)
+    }
+
     fn draw(&mut self, g: &mut GuestMemory, d: &Draw) -> Result<(), String> {
         // Color targets the pixel shader writes, or a depth-only draw.
-        let depth_only = d.depth.test && d.depth.target.is_some();
+        let depth_only = (d.depth.test || d.depth.stencil.enabled) && d.depth.target.is_some();
         if d.color_targets().is_empty() && !depth_only {
             return Ok(());
         }
@@ -2005,7 +2447,13 @@ impl Backend for VulkanBackend {
             }
         };
         // SAFETY: see `clear`.
+        let writes_memory = plan.vs.storage_written || plan.ps.storage_written;
         unsafe { self.draw_gpu(g, d, plan, textures) }?;
+        if writes_memory {
+            // Guest memory the shader wrote is needed by whatever reads
+            // it next (the CPU, a copy, another draw).
+            self.flush(g)?;
+        }
         self.gpu_draws += 1;
         Ok(())
     }
@@ -2042,6 +2490,12 @@ impl Drop for VulkanBackend {
             }
             for (_, (t, _)) in std::mem::take(&mut self.tex_cache) {
                 self.destroy_texture(t);
+            }
+            for (_, c) in std::mem::take(&mut self.compute) {
+                self.device.destroy_pipeline(c.pipeline, None);
+                self.device.destroy_shader_module(c.module, None);
+                self.device.destroy_pipeline_layout(c.layout, None);
+                self.device.destroy_descriptor_set_layout(c.dsl, None);
             }
             for (_, (pipe, modules)) in std::mem::take(&mut self.pipelines) {
                 self.device.destroy_pipeline(pipe, None);

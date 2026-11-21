@@ -151,6 +151,9 @@ pub struct Voices {
     /// Destination ids of each splitter.
     splitters: Vec<Vec<u32>>,
     destinations: Vec<Destination>,
+    effects: Vec<super::audfx::Effect>,
+    /// Output sample rate (for effects).
+    rate: u32,
 }
 
 fn u32_at(b: &[u8], o: usize) -> u32 {
@@ -181,6 +184,31 @@ impl Voices {
             mixes: Vec::new(),
             splitters: Vec::new(),
             destinations: Vec::new(),
+            effects: Vec::new(),
+            rate: 48_000,
+        }
+    }
+
+    /// Applies the effect section (0xC0 bytes per effect).
+    pub fn update_effects(&mut self, data: &[u8], count: u32) {
+        let count = count as usize;
+        if self.effects.len() < count {
+            self.effects.resize_with(count, super::audfx::Effect::new);
+        }
+        for (e, p) in self.effects.iter_mut().zip(data.chunks_exact(0xC0)) {
+            e.update(p);
+        }
+    }
+
+    /// Runs mix `m`'s effects on its buffers, in process order.
+    fn apply_effects(&mut self, m: usize, bufs: &mut [Vec<f32>]) {
+        let mut order: Vec<usize> = (0..self.effects.len())
+            .filter(|&i| self.effects[i].mix_id as usize == m)
+            .collect();
+        order.sort_by_key(|&i| self.effects[i].order);
+        let rate = self.rate;
+        for i in order {
+            self.effects[i].apply(bufs, rate);
         }
     }
 
@@ -441,6 +469,7 @@ impl Voices {
 
     /// Renders `frames` stereo frames at `rate` Hz (interleaved L, R).
     pub fn render(&mut self, frames: usize, rate: u32, read: &ReadFn) -> Vec<f32> {
+        self.rate = rate;
         let mixing = self.mixes.get(FINAL_MIX).is_some_and(|m| m.in_use);
         // Each mix's buffers (Eden mix buffers, kept per mix).
         let mut bufs: Vec<Vec<Vec<f32>>> = self
@@ -516,7 +545,8 @@ impl Voices {
         order.sort_by_key(|&m| std::cmp::Reverse(self.distance(m)));
         for m in order {
             let mix = self.mixes[m].clone();
-            let src = std::mem::take(&mut bufs[m]);
+            let mut src = std::mem::take(&mut bufs[m]);
+            self.apply_effects(m, &mut src);
             if (mix.dest_mix as usize) < self.mixes.len() {
                 let dm = mix.dest_mix as usize;
                 for (i, s) in src.iter().enumerate() {
@@ -549,6 +579,9 @@ impl Voices {
             }
         }
         // The final mix to stereo: FL, FR, FC, LFE, RL, RR.
+        let mut fb = std::mem::take(&mut bufs[FINAL_MIX]);
+        self.apply_effects(FINAL_MIX, &mut fb);
+        bufs[FINAL_MIX] = fb;
         let fin = &self.mixes[FINAL_MIX];
         let b = &bufs[FINAL_MIX];
         let ch = |k: usize, f: usize| b.get(k).map_or(0.0, |x| x[f]);

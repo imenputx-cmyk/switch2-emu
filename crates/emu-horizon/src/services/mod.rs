@@ -7,6 +7,7 @@
 pub mod account;
 pub mod am;
 pub mod apm;
+pub mod audfx;
 pub mod audio;
 pub mod audren;
 pub mod fs;

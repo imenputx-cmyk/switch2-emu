@@ -195,6 +195,12 @@ pub trait Backend {
         clear_stencil_software(g, target, rect, s)
     }
 
+    /// Runs a compute grid; `Ok(false)` leaves it to the interpreter.
+    fn dispatch(&mut self, g: &mut GuestMemory, d: &Dispatch) -> Result<bool, String> {
+        let _ = (g, d);
+        Ok(false)
+    }
+
     /// Executes a draw.
     fn draw(&mut self, g: &mut GuestMemory, d: &crate::draw::Draw) -> Result<(), String>;
 
@@ -237,6 +243,18 @@ pub fn clear_stencil_software(
         }
     }
     t.write_linear(g, &data)
+}
+
+/// A compute grid (from a QMD) for a backend.
+pub struct Dispatch<'a> {
+    /// Program address (with the block size, identifies the program).
+    pub address: u64,
+    pub program: &'a [crate::shader::decode::Inst],
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_bytes: u32,
+    /// Constant buffer contents by slot (empty: not bound).
+    pub cbufs: &'a [Vec<u8>],
 }
 
 /// The reference backend: works directly on guest memory.

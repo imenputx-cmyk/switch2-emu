@@ -224,6 +224,9 @@ impl AudioRenderer {
             section(voices_at, word(0x0C)),
         );
         // Then effects, splitters, mixes.
+        let effects_at = voices_at + word(0x0C);
+        self.voices
+            .update_effects(section(effects_at, word(0x14)), self.params.effects);
         let splitters_at = voices_at + word(0x0C) + word(0x14);
         let mixes_at = splitters_at + word(0x24);
         self.voices
