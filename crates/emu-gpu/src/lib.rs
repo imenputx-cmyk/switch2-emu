@@ -15,6 +15,7 @@
 pub mod backend;
 pub mod blocklinear;
 pub mod draw;
+pub mod dump;
 pub mod engines;
 pub mod mmu;
 pub mod pipeline;
@@ -167,6 +168,8 @@ pub struct Gpu {
     /// every address space (also ones created later), in order:
     /// (GPU address, guest address or None to unmap, size).
     pub shared_maps: Vec<(u64, Option<u64>, u64)>,
+    /// Records for a GPU dump (`--gpu-dump`).
+    pub recorder: Option<dump::Recorder>,
 }
 
 impl Default for Gpu {
@@ -180,7 +183,11 @@ impl Default for Gpu {
             trace: false,
             backend: Box::new(backend::SoftwareBackend),
             shared_maps: Vec::new(),
-            mme: Default::default(),
+            mme: engines::mme64::Shared {
+                log: dump::Recorder::from_host().map(|_| Vec::new()),
+                ..Default::default()
+            },
+            recorder: dump::Recorder::from_host(),
         }
     }
 }
@@ -324,6 +331,7 @@ impl Gpu {
             let Some(work) = self.channels[channel].queue.pop_front() else {
                 // A split method resumes within the work that split it.
                 self.channels[channel].parked.clear();
+                self.maybe_dump();
                 return;
             };
             let (va, words) = match work {
@@ -352,6 +360,9 @@ impl Gpu {
                 self.faults
                     .push(format!("pushbuffer fetch at {va:#x}: {f:?}"));
                 continue;
+            }
+            if let Some(rec) = self.recorder.as_mut() {
+                rec.entry(channel, va, &raw);
             }
             for (i, w) in raw.chunks_exact(4).enumerate() {
                 self.process_word(channel, u32::from_le_bytes(w.try_into().unwrap()), mem);
@@ -553,8 +564,8 @@ impl Gpu {
         let mut from_macros = Vec::new();
         // NVN2 writes inline-to-memory methods on subchannel 2 without
         // binding a class first (Lichii NX2_NOTES row 49).
-        let switch2 = subchannels.iter().flatten().any(|e| e.class() >> 8 >= 0xC5)
-            || channels_ampere;
+        let switch2 =
+            subchannels.iter().flatten().any(|e| e.class() >> 8 >= 0xC5) || channels_ampere;
         let slot = &mut subchannels[subchannel];
         if slot.is_none() {
             // Switch 2 channels start with NVK's subchannel layout: NVN2
@@ -927,6 +938,60 @@ mod tests {
         assert_eq!(e.reg(0x0d84), 7);
         assert_eq!(e.reg(0x0d80), 42);
         assert_eq!(e.macro_calls, 1);
+    }
+
+    #[test]
+    fn failing_macro_writes_a_dump() {
+        use engines::mme64::asm::{inst, Lane, NOP};
+        let (mut gpu, mut mem) = setup();
+        let path = std::env::temp_dir().join(format!("gpu-dump-{}.txt", std::process::id()));
+        gpu.recorder = Some(dump::Recorder::new(path.clone()));
+        gpu.mme.log = Some(Vec::new());
+        // r0 = r5 + 0: r5 was never written.
+        let mut first = inst(
+            false,
+            0,
+            0,
+            [
+                Lane {
+                    op: 0,
+                    dst: 0,
+                    src_a: 5,
+                    src_b: 24,
+                    ..NOP
+                },
+                NOP,
+            ],
+        );
+        first[2] |= 1;
+        let second = inst(false, 0, 0, [NOP, NOP]);
+        let mut words = vec![incr(0, 0, 1), class::AMPERE_THREED];
+        words.extend([incr(0, 0x114, 1), 0, (3 << 29) | (6 << 16) | (0x118 / 4)]);
+        words.extend(first);
+        words.extend(second);
+        words.extend([incr(0, 0x11C, 2), 0, 0]);
+        words.extend([incr(0, 0x3800, 1), 1]);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write(0x100_0000, &bytes).unwrap();
+        gpu.submit(
+            0,
+            &[0x1000_0000u64 | ((words.len() as u64) << 42)],
+            0,
+            &mut mem,
+        );
+        assert!(
+            gpu.faults
+                .iter()
+                .any(|f| f.contains("uninitialized register read")),
+            "{:?}",
+            gpu.faults
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(text.contains("start[0] = 0x0"), "{text}");
+        assert!(text.contains("upload 6 words at word 0x0"), "{text}");
+        assert!(text.contains("r0=add(r5,0)"), "{text}");
+        assert!(text.contains("macro 0x0 at 0x0: [1]"), "{text}");
     }
 
     #[test]

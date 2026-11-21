@@ -257,6 +257,11 @@ impl Maxwell3D {
             .collect()
     }
 
+    /// Every register (by word index).
+    pub fn regs(&self) -> &[u32] {
+        &self.regs
+    }
+
     /// A register by byte offset.
     pub fn reg(&self, offset: u32) -> u32 {
         self.regs.get(offset as usize / 4).copied().unwrap_or(0)
@@ -311,6 +316,7 @@ impl Maxwell3D {
             ctx.faults.push(format!("macro {index} out of range"));
             return;
         };
+        ctx.mme.record_call(index, start, &params);
         let code = std::mem::take(&mut ctx.mme.code);
         let mut target = Target64 {
             engine: self,
@@ -323,6 +329,7 @@ impl Maxwell3D {
         } = target;
         unhandled.extend(u);
         if let Err(e) = result {
+            ctx.mme.failed = true;
             // The details of a macro's first failure.
             let detail = if self.failed_macros.insert(index) && !e.detail.is_empty() {
                 format!("\n{}", e.detail)

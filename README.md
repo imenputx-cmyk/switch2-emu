@@ -120,6 +120,13 @@ writes, software breakpoints, single steps, continue, Ctrl+C and the
 guest's threads work. With breakpoints set, the guest runs on the
 interpreter one instruction at a time.
 
+`--gpu-dump=PATH` writes a GPU debugging dump to a text file when a GPU
+macro (MME64) first fails: the macro start table and its upload history,
+the whole macro RAM disassembled, each channel's MME data RAM and 3D
+registers, the last 64 macro calls with their parameters and the last
+command buffers. It contains no keys; it does hold the game's GPU commands,
+so share it only where you would share a log.
+
 ## Controls (window front end)
 
 | Switch | Keyboard | Xbox-style controller (XInput) |

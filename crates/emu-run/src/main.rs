@@ -30,6 +30,11 @@ fn main() -> ExitCode {
 fn real_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let trace = args.iter().any(|a| a == "--trace-svc");
+    // --gpu-dump=PATH: write a GPU debugging dump (macro RAM, starts,
+    // data RAM, registers, recent commands) when a GPU macro first fails.
+    if let Some(p) = args.iter().find_map(|a| a.strip_prefix("--gpu-dump=")) {
+        *emu_gpu::dump::DUMP_PATH.lock().unwrap() = Some(p.into());
+    }
     if args.iter().any(|a| a == "--cpu=interp") {
         emu_run::USE_JIT.store(false, std::sync::atomic::Ordering::Relaxed);
     }

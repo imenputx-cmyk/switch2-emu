@@ -349,6 +349,7 @@ dependencies = [
  "cpal",
  "ctrlc",
  "emu-cpu",
+ "emu-gpu",
  "emu-gpu-vk",
  "emu-horizon",
  "emu-loader",

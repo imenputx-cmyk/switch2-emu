@@ -42,6 +42,14 @@ pub struct Shared {
     pub write: usize,
     pub starts: Vec<u32>,
     pub start_pointer: usize,
+    /// For GPU dumps (Some while recording): uploads and binds, in order.
+    pub log: Option<Vec<String>>,
+    /// Recent calls (macro index, start, parameters), while recording.
+    pub calls: std::collections::VecDeque<(usize, u32, Vec<u32>)>,
+    /// A macro failed since the last dump.
+    pub failed: bool,
+    /// Words uploaded since the last pointer write (for the log).
+    pub(crate) run: (usize, usize),
 }
 
 impl Default for Shared {
@@ -51,6 +59,10 @@ impl Default for Shared {
             write: 0,
             starts: vec![0; 0x100],
             start_pointer: 0,
+            log: None,
+            calls: Default::default(),
+            failed: false,
+            run: (0, 0),
         }
     }
 }
@@ -58,11 +70,48 @@ impl Default for Shared {
 impl Shared {
     /// MME_INSTRUCTION_RAM_POINTER (instructions).
     pub fn set_pointer(&mut self, value: u32) {
+        self.end_run();
         self.write = (value as usize * 3).min(self.code.len());
+        self.run = (self.write, 0);
+    }
+
+    fn note(&mut self, line: String) {
+        if let Some(log) = self.log.as_mut() {
+            if log.len() < 20000 {
+                log.push(line);
+            }
+        }
+    }
+
+    /// Logs the words uploaded since the last pointer write.
+    pub fn end_run(&mut self) {
+        let (at, n) = std::mem::take(&mut self.run);
+        if n > 0 {
+            self.note(format!(
+                "upload {n} words at word {at:#x} (instruction {:#x}{})",
+                at / 3,
+                if at % 3 != 0 { ", unaligned" } else { "" }
+            ));
+        }
+    }
+
+    /// Records a call (while recording).
+    pub fn record_call(&mut self, index: usize, start: u32, params: &[u32]) {
+        if self.log.is_some() {
+            if self.calls.len() == 64 {
+                self.calls.pop_front();
+            }
+            self.calls
+                .push_back((index, start, params[..params.len().min(64)].to_vec()));
+        }
     }
 
     /// MME_INSTRUCTION_RAM: the next code word.
     pub fn upload(&mut self, value: u32) {
+        if self.run.1 == 0 {
+            self.run.0 = self.write;
+        }
+        self.run.1 += 1;
         if let Some(slot) = self.code.get_mut(self.write) {
             *slot = value;
             self.write += 1;
@@ -71,11 +120,13 @@ impl Shared {
 
     /// MME_START_ADDRESS_RAM_POINTER.
     pub fn set_start_pointer(&mut self, value: u32) {
+        self.end_run();
         self.start_pointer = value as usize;
     }
 
     /// MME_START_ADDRESS_RAM: the next macro's start.
     pub fn bind(&mut self, value: u32) {
+        self.note(format!("start[{}] = {value:#x}", self.start_pointer));
         if let Some(slot) = self.starts.get_mut(self.start_pointer) {
             *slot = value;
         }
@@ -167,6 +218,81 @@ fn decode(bits: [u32; 3]) -> Decoded {
     d
 }
 
+/// One instruction as text, for dumps and failure details.
+pub fn disassemble(code: &[u32], pc: u32) -> String {
+    let base = pc as usize * 3;
+    let Some(w) = code.get(base..base + 3) else {
+        return "?".into();
+    };
+    let d = decode([w[2], w[1], w[0]]);
+    const OPS: [&str; 32] = [
+        "add", "addc", "sub", "subb", "mul", "mulh", "mulu", "?7", "clz", "sll", "srl", "sra",
+        "and", "nand", "or", "xor", "merge", "slt", "sltu", "sle", "sleu", "seq", "state", "loop",
+        "jal", "blt", "bltu", "ble", "bleu", "beq", "dread", "dwrite",
+    ];
+    let src = |r: u32, lane: usize| -> String {
+        match r {
+            0..=23 => format!("r{r}"),
+            24 => "0".into(),
+            25 => format!("#{:#x}", d.imm[lane] as u16 as i16),
+            26 => format!("#{:#x}", d.imm[1 - lane] as u16 as i16),
+            27 => format!("#{:#x}", (d.imm[0] << 16) | d.imm[1]),
+            28 => "load0".into(),
+            29 => "load1".into(),
+            _ => format!("?{r}"),
+        }
+    };
+    let sel = |x: u32| -> &'static str {
+        match x {
+            1 => "alu0",
+            2 => "alu1",
+            3 => "load0",
+            4 => "load1",
+            5 => "imm0",
+            6 => "imm1",
+            8 => "imm0>>12",
+            9 => "imm1>>12",
+            10 => "imm32",
+            _ => "?",
+        }
+    };
+    let mut s = format!("{:08x}{:08x}{:08x} ", w[0], w[1], w[2]);
+    if d.pred_mode != 0 {
+        s += &format!(
+            "[{} {}] ",
+            src(d.pred_reg, 0),
+            PREDICATES[d.pred_mode as usize]
+                .iter()
+                .map(|&c| c as char)
+                .collect::<String>()
+        );
+    }
+    for lane in 0..2 {
+        let dst = match d.dst[lane] {
+            24 => "_".to_string(),
+            r => format!("r{r}"),
+        };
+        s += &format!(
+            "{dst}={}({},{}) imm {:#x}",
+            OPS[d.op[lane] as usize],
+            src(d.src_a[lane], lane),
+            src(d.src_b[lane], lane),
+            d.imm[lane]
+        );
+        if d.out_method[lane] != 0 {
+            s += &format!(" method<-{}", sel(d.out_method[lane]));
+        }
+        if d.out_emit[lane] != 0 {
+            s += &format!(" emit<-{}", sel(d.out_emit[lane]));
+        }
+        s += if lane == 0 { " | " } else { "" };
+    }
+    if d.end {
+        s += " END";
+    }
+    s
+}
+
 /// Steps kept for failure details.
 const RING: usize = 32;
 
@@ -220,7 +346,12 @@ fn describe(
         s.push('\n');
     }
     // The macro's code from its start, to disassemble offline.
-    let last = ring.iter().filter(|st| st.valid).map(|st| st.pc).max().unwrap_or(start);
+    let last = ring
+        .iter()
+        .filter(|st| st.valid)
+        .map(|st| st.pc)
+        .max()
+        .unwrap_or(start);
     let end = (last.max(start) + 8).min(start + 160) as usize * 3;
     s += &format!("  code from {start:#x}:");
     for (i, w) in code
@@ -232,7 +363,12 @@ fn describe(
         if i % 4 == 0 {
             s += "\n   ";
         }
-        s += &format!(" {:08x}{:08x}{:08x}", w[0], w.get(1).unwrap_or(&0), w.get(2).unwrap_or(&0));
+        s += &format!(
+            " {:08x}{:08x}{:08x}",
+            w[0],
+            w.get(1).unwrap_or(&0),
+            w.get(2).unwrap_or(&0)
+        );
     }
     s.push('\n');
     s
@@ -247,6 +383,8 @@ pub fn execute(
     target: &mut impl Mme64Target,
 ) -> Result<(), Mme64Error> {
     let mut regs = [0u32; 24];
+    // Registers written so far: reading another is an error (Lichii).
+    let mut initialized = 0u32;
     let mut carry = 0u32;
     let (mut method, mut increment) = (0u32, 0u32);
     let mut pc = start;
@@ -258,14 +396,18 @@ pub fn execute(
     let mut read_note: Option<(u32, u32)> = None;
 
     for step in 0..STEP_LIMIT {
-        let err = |message| Mme64Error {
-            pc,
-            message,
-            detail: String::new(),
-        };
+        macro_rules! fail {
+            ($message:expr) => {
+                return Err(Mme64Error {
+                    pc,
+                    message: $message,
+                    detail: describe(&ring, step as usize, params, consumed, code, start),
+                })
+            };
+        }
         let base = pc as usize * 3;
         if base + 2 >= code.len() {
-            return Err(err("instruction outside uploaded RAM"));
+            fail!("instruction outside uploaded RAM");
         }
         let d = decode([code[base + 2], code[base + 1], code[base]]);
 
@@ -285,6 +427,9 @@ pub fn execute(
         }
         let get = |reg: u32, lane: usize| -> Result<u32, &'static str> {
             Ok(match reg {
+                0..=23 if initialized & (1 << reg) == 0 => {
+                    return Err("uninitialized register read")
+                }
                 0..=23 => regs[reg as usize],
                 24 => 0,
                 25 => d.imm[lane] as u16 as i16 as i32 as u32,
@@ -299,7 +444,7 @@ pub fn execute(
             match get(d.pred_reg, 0) {
                 Ok(0) => d.mask_false,
                 Ok(_) => d.mask_true,
-                Err(e) => return Err(err(e)),
+                Err(e) => fail!(e),
             }
         } else {
             15
@@ -309,8 +454,14 @@ pub fn execute(
         let mut ys = [0u32; 2];
         for lane in 0..2 {
             if mask & (1 << lane) != 0 {
-                xs[lane] = get(d.src_a[lane], lane).map_err(err)?;
-                ys[lane] = get(d.src_b[lane], lane).map_err(err)?;
+                xs[lane] = match get(d.src_a[lane], lane) {
+                    Ok(v) => v,
+                    Err(e) => fail!(e),
+                };
+                ys[lane] = match get(d.src_b[lane], lane) {
+                    Ok(v) => v,
+                    Err(e) => fail!(e),
+                };
             }
         }
 
@@ -357,7 +508,7 @@ pub fn execute(
                 // EXTENDED: only the load barrier (x = 0x1000), a no-op here.
                 7 => {
                     if x != 0x1000 {
-                        return Err(err("unsupported extended operation"));
+                        fail!("unsupported extended operation");
                     }
                 }
                 8 => value = x.leading_zeros(),
@@ -374,7 +525,7 @@ pub fn execute(
                     let count = (imm >> 5) & 31;
                     let source = imm & 31;
                     if dest >= 32 {
-                        return Err(err("invalid merge destination"));
+                        fail!("invalid merge destination");
                     }
                     let bits = (1u32 << count).wrapping_sub(1);
                     value = (x & !(bits << dest)) | (((y >> source) & bits) << dest);
@@ -386,7 +537,7 @@ pub fn execute(
                 }
                 23 => {
                     if loop_count != 0 || imm < 2 {
-                        return Err(err("invalid loop"));
+                        fail!("invalid loop");
                     }
                     // NVN emits zero-count loops around FIFO reads; they
                     // skip the body.
@@ -413,19 +564,22 @@ pub fn execute(
                 }
                 30 => match target.data_ram().get(x as usize) {
                     Some(&v) => value = v,
-                    None => return Err(err("data RAM read out of bounds")),
+                    None => fail!("data RAM read out of bounds"),
                 },
                 31 => match target.data_ram().get_mut(x as usize) {
                     Some(slot) => *slot = y,
-                    None => return Err(err("data RAM write out of bounds")),
+                    None => fail!("data RAM write out of bounds"),
                 },
                 _ => unreachable!("5-bit opcode"),
             }
             alu[lane] = value;
             match d.dst[lane] {
-                r @ 0..=23 => regs[r as usize] = value,
+                r @ 0..=23 => {
+                    regs[r as usize] = value;
+                    initialized |= 1 << r;
+                }
                 24 => {}
-                _ => return Err(err("invalid destination register")),
+                _ => fail!("invalid destination register"),
             }
         }
 
@@ -451,19 +605,19 @@ pub fn execute(
             }
             if d.out_method[lane] != 0 {
                 let Some(address) = output(d.out_method[lane]) else {
-                    return Err(err("invalid output selector"));
+                    fail!("invalid output selector");
                 };
                 method = address & 0xFFF;
                 increment = (address >> 12) & 15;
             }
             if d.out_emit[lane] != 0 {
                 let Some(value) = output(d.out_emit[lane]) else {
-                    return Err(err("invalid output selector"));
+                    fail!("invalid output selector");
                 };
                 emits[emit_count as usize] = (method, value);
                 emit_count += 1;
                 if !target.emit(method, value, params) {
-                    return Err(err("unsupported emitted method"));
+                    fail!("unsupported emitted method");
                 }
                 method = method.wrapping_add(increment);
             }

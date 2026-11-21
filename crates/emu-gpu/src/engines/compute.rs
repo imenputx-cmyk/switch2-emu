@@ -117,11 +117,13 @@ impl Compute {
                         .push(format!("compute macro {index} out of range"));
                     return true;
                 };
+                ctx.mme.record_call(index | 0x1000, start, &params);
                 let code = std::mem::take(&mut ctx.mme.code);
                 let mut target = Target { engine: self, ctx };
                 let result = mme64::execute(&code, start, &mut params, &mut target);
                 let Target { ctx, .. } = target;
                 if let Err(e) = result {
+                    ctx.mme.failed = true;
                     ctx.faults.push(format!(
                         "compute MME64 macro {index}: {} (pc {:#x})",
                         e.message, e.pc
