@@ -1152,6 +1152,10 @@ impl Machine<'_> {
                 let lo = u32::from(f32_to_f16(f32::from_bits(self.operand(b))));
                 self.regs.set(dst, hi << 16 | lo);
             }
+            Op::H2f { dst, src } => {
+                let v = half_lanes(self.operand(src.src), &src)[0];
+                self.regs.set(dst, v.to_bits());
+            }
             Op::F2h { dst, src, mods } => {
                 let v = self.float(src, mods);
                 self.regs.set(dst, u32::from(f32_to_f16(v)));

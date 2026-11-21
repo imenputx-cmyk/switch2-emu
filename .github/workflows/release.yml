@@ -26,13 +26,13 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $dir = "switch2-emu-windows"
+          $dir = "imenput-emu-windows"
           New-Item -ItemType Directory -Path "$dir/tests/programs" | Out-Null
           Copy-Item target/release/emu-run.exe $dir/
           Copy-Item README.md, LICENSE $dir/
           Copy-Item tests/programs/*.nro "$dir/tests/programs/"
           Copy-Item tests/programs/LICENSE-libnx.md "$dir/tests/programs/"
-          Compress-Archive -Path $dir -DestinationPath switch2-emu-windows.zip
+          Compress-Archive -Path $dir -DestinationPath imenput-emu-windows.zip
       - name: Publish
         shell: pwsh
         env:
@@ -40,4 +40,4 @@ jobs:
         run: |
           $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } elseif ("${{ inputs.tag }}" -ne "") { "${{ inputs.tag }}" } else { "nightly" }
           if ($tag -eq "nightly") { gh release delete $tag --yes --cleanup-tag 2>$null; $global:LASTEXITCODE = 0 }
-          gh release create $tag switch2-emu-windows.zip --target ${{ github.sha }} --title "switch2-emu $tag" --notes "Windows build (emu-run.exe with the window front end) and test programs. Run from a terminal, e.g.: ``emu-run.exe --gpu=vulkan tests/programs/hb_triangle.nro``. Games need your own console's keys in %USERPROFILE%\.switch\prod.keys."
+          gh release create $tag imenput-emu-windows.zip --target ${{ github.sha }} --title "imenput-emu $tag" --notes "Windows build (emu-run.exe with the window front end) and test programs. Run from a terminal, e.g.: ``emu-run.exe --gpu=vulkan tests/programs/hb_triangle.nro``. Games need your own console's keys in %USERPROFILE%\.switch\prod.keys."

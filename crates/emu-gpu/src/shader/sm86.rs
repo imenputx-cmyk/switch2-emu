@@ -765,6 +765,21 @@ pub fn decode(i: Instruction, index: usize) -> Result<Vec<Inst>, DecodeError> {
                 half_source(&i, index, 1)?
             };
             match low {
+                0x030
+                    if i.on(78)
+                        && !i.on(76)
+                        && !i.on(77)
+                        && !i.on(79)
+                        && !i.on(80)
+                        && matches!(a.src, Operand::Reg(255))
+                        && a.neg
+                        && !a.abs
+                        && a.swizzle == 0
+                        && second.swizzle >= 2 =>
+                {
+                    // -RZ + half: the half converted to f32.
+                    one(Op::H2f { dst, src: second })
+                }
                 0x030 | 0x032 => {
                     if i.on(76) || i.on(78) || i.on(79) {
                         return err("half add/multiply mode");

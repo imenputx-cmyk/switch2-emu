@@ -1,4 +1,4 @@
-# switch2-emu
+# imenput-emu
 
 A learning-first, from-scratch emulator project for the Nintendo Switch 2 hardware architecture, written in Rust.
 

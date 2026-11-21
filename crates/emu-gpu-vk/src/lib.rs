@@ -348,7 +348,7 @@ impl VulkanBackend {
     unsafe fn create() -> Result<VulkanBackend, String> {
         let entry = ash::Entry::load().map_err(|e| format!("no Vulkan loader: {e}"))?;
         let app = vk::ApplicationInfo::default()
-            .application_name(c"switch2-emu")
+            .application_name(c"imenput-emu")
             .api_version(vk::API_VERSION_1_3);
         let instance = entry
             .create_instance(

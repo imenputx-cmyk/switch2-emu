@@ -81,7 +81,7 @@ impl Gpu {
 
     pub(crate) fn dump_text(&mut self) -> String {
         self.mme.end_run();
-        let mut s = String::from("# switch2-emu GPU dump\n\n## Faults so far\n");
+        let mut s = String::from("# imenput-emu GPU dump\n\n## Faults so far\n");
         for f in self.faults.iter().rev().take(40).rev() {
             let _ = writeln!(s, "{}", f.lines().next().unwrap_or(""));
         }

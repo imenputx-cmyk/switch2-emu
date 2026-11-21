@@ -640,6 +640,11 @@ pub enum Op {
         b: Operand,
         merge: bool,
     },
+    /// HADD2 with float output: the selected half of `src` as an f32.
+    H2f {
+        dst: u8,
+        src: HalfSrc,
+    },
     /// F2F.F16.F32: the half of an f32 in the low 16 bits.
     F2h {
         dst: u8,

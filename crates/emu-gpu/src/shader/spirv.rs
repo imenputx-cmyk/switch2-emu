@@ -2552,6 +2552,12 @@ impl Translator {
                 };
                 self.store_reg(dst, v);
             }
+            Op::H2f { dst, src } => {
+                let f = self.half_lanes(src)?[0];
+                let uint = self.c.uint;
+                let v = self.bitcast(uint, f);
+                self.store_reg(dst, v);
+            }
             Op::F2h { dst, src, mods } => {
                 let f = self.operand_float(src, mods)?;
                 let v = self.pack_halves(f, self.c.zero_f);
